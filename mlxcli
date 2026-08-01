@@ -9,7 +9,7 @@ Usage:
   mlxcli [model] [-p "custom system prompt"]
 
 Commands:
-  /paste <file>  /model  /models  /mem  /tokens  /save [file]  /clear  /help  /exit
+  /paste <file>  /convert  /model  /models  /mem  /tokens  /save [file]  /clear  /help  /exit
 """
 import difflib
 import json
@@ -27,6 +27,7 @@ MAX_TOOL_STEPS = 8
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
+CONVERT_MODES = {"auto", "all", "off"}
 
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac. "
@@ -55,6 +56,7 @@ TOOLS = [
 
 HELP = """Commands:
   /paste <file>   inject a file into context (text/md directly; docx/pdf via markitdown)
+  /convert MODE   set paste conversion: auto, all, or off
   /model          switch models (picker; history kept)
   /models         list models the server offers
   /mem            show RAM status, Metal cap, and top memory users
@@ -206,6 +208,23 @@ def exec_tool(name, args):
 
 # ---------- commands ----------
 
+def convert_file(path, mode="auto"):
+    if mode not in CONVERT_MODES:
+        raise ValueError(f"mode must be one of: {', '.join(sorted(CONVERT_MODES))}")
+    p = pathlib.Path(path).expanduser()
+    should_convert = mode == "all" or (mode == "auto" and p.suffix.lower() in CONVERTIBLE)
+    if should_convert:
+        conv = subprocess.run(["markitdown", str(p)], capture_output=True, text=True)
+        if conv.returncode != 0 or not conv.stdout.strip():
+            raise RuntimeError("markitdown couldn't convert "
+                               f"{p.name} — install it with: pip install markitdown")
+        return conv.stdout, f"{p.name} (converted to markdown)"
+    try:
+        return p.read_text(errors="replace"), p.name
+    except Exception as e:
+        raise RuntimeError(f"couldn't read {p}: {e}") from e
+
+
 def do_mem():
     def sysctl(name):
         try:
@@ -264,7 +283,7 @@ def do_mem():
         print(f"(ps unavailable: {e})")
 
 
-def do_paste(arg, messages):
+def do_paste(arg, messages, convert_mode):
     raw = arg.strip().strip('"').strip("'")
     if not raw:
         print("usage: /paste <path-to-file>")
@@ -276,21 +295,11 @@ def do_paste(arg, messages):
         for h in hits[:5]:
             print(f"  did you mean: {h}")
         return
-    if p.suffix.lower() in CONVERTIBLE:
-        conv = subprocess.run(["markitdown", str(p)], capture_output=True, text=True)
-        if conv.returncode != 0 or not conv.stdout.strip():
-            print(f"(markitdown couldn't convert {p.name} — install it with: "
-                  f"pip install markitdown)")
-            return
-        text = conv.stdout
-        label = f"{p.name} (converted to markdown)"
-    else:
-        try:
-            text = p.read_text(errors="replace")
-        except Exception as e:
-            print(f"(couldn't read {p}: {e})")
-            return
-        label = p.name
+    try:
+        text, label = convert_file(p, convert_mode)
+    except RuntimeError as e:
+        print(f"({e})")
+        return
     clipped = text[:MAX_FILE_CHARS]
     note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
     messages.append({"role": "user",
@@ -458,6 +467,7 @@ def main():
     print(f"mlxcli — model: {model} — /help for commands")
     messages = [{"role": "system", "content": system}]
     totals = {"in": 0, "out": 0}
+    convert_mode = "auto"
     while True:
         try:
             user = input("\n> ").strip()
@@ -478,6 +488,17 @@ def main():
         if user == "/tokens":
             print_tokens("session", totals["in"], totals["out"])
             continue
+        if user == "/convert":
+            print(f"(paste conversion: {convert_mode}; modes: auto, all, off)")
+            continue
+        if user.startswith("/convert "):
+            mode = user.split(None, 1)[1].strip().lower()
+            if mode not in CONVERT_MODES:
+                print("usage: /convert auto|all|off")
+                continue
+            convert_mode = mode
+            print(f"(paste conversion: {convert_mode})")
+            continue
         if user == "/mem":
             do_mem()
             continue
@@ -493,7 +514,7 @@ def main():
             do_save(user[5:], messages, model)
             continue
         if user.startswith("/paste"):
-            do_paste(user[6:], messages)
+            do_paste(user[6:], messages, convert_mode)
             continue
         messages.append({"role": "user", "content": user})
         messages = trim(messages)

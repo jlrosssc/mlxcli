@@ -13,6 +13,13 @@ cp mlxcli ~/bin/mlxcli
 chmod +x ~/bin/mlxcli
 ```
 
+Optional lightweight GUI:
+
+```bash
+cp mlxgui.py ~/bin/mlxgui
+chmod +x ~/bin/mlxgui
+```
+
 `mlxcli` reads the oMLX API key from `~/.omlx/settings.json` by default. You can
 override the server with `OMLX_URL` and the key with `OMLX_API_KEY`.
 
@@ -31,6 +38,7 @@ server to come up. It does not launch the companion dashboard viewer.
 
 ```text
 /paste <file>   inject a file into context
+/convert MODE   set paste conversion: auto, all, or off
 /model          switch models
 /models         list server models
 /mem            show local memory status and top memory users
@@ -41,8 +49,26 @@ server to come up. It does not launch the companion dashboard viewer.
 /exit           quit
 ```
 
-Supported `/paste` conversions: `.docx`, `.pdf`, `.pptx`, `.xlsx`, and `.doc`
-when `markitdown` is installed.
+## Markdown Import
+
+`/paste` can normalize documents to Markdown before they enter the model
+context. The conversion mode is controlled with:
+
+```text
+/convert auto
+/convert all
+/convert off
+```
+
+`auto` is the default. It converts `.docx`, `.pdf`, `.pptx`, `.xlsx`, and `.doc`
+through `markitdown`, then reads ordinary text files directly. `all` sends every
+imported file through `markitdown` first. `off` reads files as plain text only.
+
+Install the optional converter:
+
+```bash
+pip install markitdown
+```
 
 ## Token Display
 
@@ -60,6 +86,22 @@ for the current CLI session.
 These per-turn numbers are meant as an early warning gauge. If input tokens
 start drifting into large counts as a session ages, use `/clear` before context
 pressure becomes a failure.
+
+## Lightweight GUI
+
+`mlxgui.py` is a small Tkinter interface for the same local oMLX chat flow. It
+does not embed a browser and does not use WebKit. It provides model selection,
+streamed replies, token totals, clear, and multi-file import with `auto`, `all`,
+or `off` Markdown conversion.
+
+Run it:
+
+```bash
+python3 mlxgui.py
+```
+
+The GUI is intentionally separate from the CLI. It gives you file picker import
+and a transcript window without changing the terminal workflow.
 
 ## Companion: omlxpanel
 
