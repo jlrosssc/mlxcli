@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -83,11 +84,26 @@ def convert_file(path, mode):
     p = pathlib.Path(path).expanduser()
     should_convert = mode == "all" or (mode == "auto" and p.suffix.lower() in CONVERTIBLE)
     if should_convert:
-        conv = subprocess.run(["markitdown", str(p)], capture_output=True, text=True)
+        markitdown = find_markitdown()
+        conv = subprocess.run([markitdown, str(p)], capture_output=True, text=True)
         if conv.returncode != 0 or not conv.stdout.strip():
-            raise RuntimeError(f"markitdown could not convert {p.name}")
+            detail = (conv.stderr or conv.stdout or "no output").strip()
+            raise RuntimeError(f"markitdown could not convert {p.name}:\n{detail}")
         return conv.stdout, f"{p.name} (converted to markdown)"
     return p.read_text(errors="replace"), p.name
+
+
+def find_markitdown():
+    found = shutil.which("markitdown")
+    if found:
+        return found
+    for candidate in ("/usr/local/bin/markitdown", "/opt/homebrew/bin/markitdown"):
+        if pathlib.Path(candidate).exists():
+            return candidate
+    raise RuntimeError(
+        "markitdown is not available to the GUI. Install it with "
+        "pip install markitdown, or run mlxgui from a shell that has markitdown on PATH."
+    )
 
 
 def usage_counts(usage):
