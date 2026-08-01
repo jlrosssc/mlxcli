@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""mlxcli v5 — a minimal local agent CLI for oMLX.
+
+Stdlib only (markitdown used via subprocess if installed, for docx/pdf paste).
+Zero-overhead design: ~60-token system prompt, streaming output, bounded
+history, approval-gated tools with diff preview.
+
+Usage:
+  mlxcli [model] [-p "custom system prompt"]
+
+Commands:
+  /paste <file>  /model  /models  /mem  /save [file]  /clear  /help  /exit
+"""
+import difflib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
+MAX_TOOL_STEPS = 8
+MAX_FILE_CHARS = 8000
+MAX_HISTORY_TURNS = 12
+CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
+
+DEFAULT_SYSTEM = (
+    "You are a concise assistant running locally on the user's Mac. "
+    "Use tools only when the task requires reading/writing files or running "
+    "commands. Work in small steps. Keep answers brief and practical."
+)
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "run_command",
+        "description": "Run a shell command; returns stdout+stderr (truncated).",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a text file (truncated to 8000 chars).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Write content to a file (shows a diff and asks first).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"}}, "required": ["path", "content"]}}},
+]
+
+HELP = """Commands:
+  /paste <file>   inject a file into context (text/md directly; docx/pdf via markitdown)
+  /model          switch models (picker; history kept)
+  /models         list models the server offers
+  /mem            show RAM status, Metal cap, and top memory users
+  /save [file]    save the transcript as markdown (default: ~/mlxcli-<timestamp>.md)
+  /clear          wipe conversation history
+  /help           this text
+  /exit           quit"""
+
+
+# ---------- config / server ----------
+
+def load_cfg():
+    url = os.environ.get("OMLX_URL", "http://localhost:8000")
+    key = os.environ.get("OMLX_API_KEY", "")
+    if not key and SETTINGS.exists():
+        try:
+            s = json.loads(SETTINGS.read_text())
+            key = s.get("auth", {}).get("api_key", "")
+            port = s.get("server", {}).get("port", 8000)
+            if "OMLX_URL" not in os.environ:
+                url = f"http://localhost:{port}"
+        except Exception:
+            pass
+    return url, key
+
+
+def request(url, key, path, payload=None):
+    return urllib.request.Request(
+        url + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+
+
+def api(url, key, path, payload=None):
+    with urllib.request.urlopen(request(url, key, path, payload), timeout=900) as r:
+        return json.load(r)
+
+
+def server_up(url, key):
+    try:
+        api(url, key, "/v1/models")
+        return True
+    except Exception:
+        return False
+
+
+def ensure_server(url, key):
+    if server_up(url, key):
+        return
+    print("oMLX not running — launching it...")
+    r = subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("Couldn't find the oMLX app in /Applications — start it manually.")
+    waited = 0
+    while waited < 60:
+        time.sleep(2)
+        waited += 2
+        if server_up(url, key):
+            print("oMLX is up.")
+            return
+    sys.exit("oMLX launched but the server didn't come up in 60s — check the menu bar icon.")
+
+
+def list_models(url, key):
+    try:
+        data = api(url, key, "/v1/models")
+    except Exception as e:
+        sys.exit(f"Cannot reach oMLX at {url} ({e}). Is the server running?")
+    ids = [m["id"] for m in data.get("data", [])]
+    if not ids:
+        sys.exit("oMLX reports no models — check the admin panel.")
+    return ids
+
+
+def pick_model(url, key):
+    ids = list_models(url, key)
+    if len(ids) == 1:
+        return ids[0]
+    print("Available local models:")
+    for i, mid in enumerate(ids, 1):
+        print(f"  {i}) {mid}")
+    choice = input(f"Select model [1-{len(ids)}, Enter for 1]: ").strip()
+    try:
+        return ids[int(choice) - 1] if choice else ids[0]
+    except (ValueError, IndexError):
+        print("(invalid selection — keeping first model)")
+        return ids[0]
+
+
+# ---------- tools ----------
+
+def approve(desc):
+    return input(f"  approve: {desc} [y/N] ").strip().lower() == "y"
+
+
+def exec_tool(name, args):
+    if name == "run_command":
+        cmd = args.get("command", "")
+        if not approve(f"run: {cmd}"):
+            return "User declined."
+        try:
+            p = subprocess.run(cmd, shell=True, capture_output=True,
+                               text=True, timeout=180)
+            out = (p.stdout + p.stderr).strip()
+            return out[:MAX_FILE_CHARS] if out else "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Command timed out."
+    if name == "read_file":
+        try:
+            text = pathlib.Path(args["path"]).expanduser().read_text()
+            note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
+            print(f"  read: {args['path']} ({len(text)} chars)")
+            return text[:MAX_FILE_CHARS] + note
+        except Exception as e:
+            return f"Error: {e}"
+    if name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        target = pathlib.Path(path).expanduser()
+        old = ""
+        if target.exists():
+            try:
+                old = target.read_text(errors="replace")
+            except Exception:
+                old = ""
+        diff = list(difflib.unified_diff(
+            old.splitlines(), content.splitlines(),
+            fromfile=f"{path} (current)", tofile=f"{path} (proposed)",
+            lineterm=""))
+        if diff:
+            print("  --- proposed change ---")
+            for line in diff[:80]:
+                print(f"  {line}")
+            if len(diff) > 80:
+                print(f"  ... ({len(diff) - 80} more diff lines)")
+        else:
+            print("  (no textual change)")
+        if not approve(f"write {len(content)} chars to {path}"):
+            return "User declined."
+        try:
+            target.write_text(content)
+            return "Written."
+        except Exception as e:
+            return f"Error: {e}"
+    return "Unknown tool."
+
+
+# ---------- commands ----------
+
+def do_mem():
+    def sysctl(name):
+        try:
+            out = subprocess.run(["sysctl", "-n", name], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+            return int(out)
+        except Exception:
+            return None
+
+    total = sysctl("hw.memsize")
+    cap = sysctl("iogpu.wired_limit_mb")
+    if total:
+        print(f"Total RAM:      {total / 2**30:.1f} GB")
+    if cap:
+        print(f"Metal cap:      {cap / 1024:.1f} GB (iogpu.wired_limit_mb)")
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                            timeout=5).stdout
+        m = re.search(r"page size of (\d+)", vm)
+        page = int(m.group(1)) if m else 16384
+        def pages(label):
+            mm = re.search(label + r":\s+(\d+)", vm)
+            return int(mm.group(1)) * page if mm else 0
+        free = pages("Pages free")
+        reclaim = free + pages("Pages inactive") + pages("Pages purgeable")
+        print(f"Free now:       {free / 2**30:.1f} GB")
+        print(f"Reclaimable:    {reclaim / 2**30:.1f} GB (free + inactive + purgeable)")
+    except Exception as e:
+        print(f"(vm_stat unavailable: {e})")
+    try:
+        ps = subprocess.run(["ps", "axo", "rss=,comm="], capture_output=True,
+                            text=True, timeout=5).stdout.splitlines()
+        rows = []
+        for line in ps:
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                rows.append((int(parts[0]), parts[1]))
+        rows.sort(reverse=True)
+        print("Top memory users:")
+        shown = 0
+        for rss, comm in rows:
+            mb = rss // 1024
+            if mb < 300 or shown >= 10:
+                break
+            if ".app/" in comm:
+                seg = comm.split("/Applications/")[-1]
+                name = seg.split(".app/")[0] if ".app/" in seg else comm.rsplit("/", 1)[-1]
+            else:
+                name = comm.rsplit("/", 1)[-1]
+            tag = "  <- oMLX" if "omlx" in comm.lower() else ""
+            print(f"  {mb:>6} MB  {name}{tag}")
+            shown += 1
+        if shown == 0:
+            print("  (nothing over 300 MB)")
+    except Exception as e:
+        print(f"(ps unavailable: {e})")
+
+
+def do_paste(arg, messages):
+    raw = arg.strip().strip('"').strip("'")
+    if not raw:
+        print("usage: /paste <path-to-file>")
+        return
+    p = pathlib.Path(raw).expanduser()
+    if not p.exists():
+        print(f"(file not found: {p})")
+        hits = list(p.parent.glob(p.name + "*")) if p.parent.exists() else []
+        for h in hits[:5]:
+            print(f"  did you mean: {h}")
+        return
+    if p.suffix.lower() in CONVERTIBLE:
+        conv = subprocess.run(["markitdown", str(p)], capture_output=True, text=True)
+        if conv.returncode != 0 or not conv.stdout.strip():
+            print(f"(markitdown couldn't convert {p.name} — install it with: "
+                  f"pip install markitdown)")
+            return
+        text = conv.stdout
+        label = f"{p.name} (converted to markdown)"
+    else:
+        try:
+            text = p.read_text(errors="replace")
+        except Exception as e:
+            print(f"(couldn't read {p}: {e})")
+            return
+        label = p.name
+    clipped = text[:MAX_FILE_CHARS]
+    note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+    messages.append({"role": "user",
+                     "content": f"Contents of {label}:\n\n{clipped}"})
+    print(f"(pasted {label}: {len(clipped)} chars into context{note} — now ask about it)")
+
+
+def do_save(arg, messages, model):
+    raw = arg.strip().strip('"')
+    if raw:
+        out = pathlib.Path(raw).expanduser()
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        out = pathlib.Path.home() / f"mlxcli-{stamp}.md"
+    lines = [f"# mlxcli session — {time.strftime('%Y-%m-%d %H:%M')} — model: {model}\n"]
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role == "system" or not content:
+            continue
+        title = {"user": "You", "assistant": "Model", "tool": "Tool output"}.get(role, role)
+        lines.append(f"## {title}\n\n{content}\n")
+    try:
+        out.write_text("\n".join(lines))
+        print(f"(saved transcript to {out})")
+    except Exception as e:
+        print(f"(couldn't save: {e})")
+
+
+# ---------- chat ----------
+
+def stream_once(url, key, model, messages):
+    """One streamed request. Returns (content, tool_calls)."""
+    payload = {"model": model, "messages": messages, "tools": TOOLS,
+               "max_tokens": 2000, "stream": True}
+    content_parts = []
+    calls = {}
+    printed = False
+    with urllib.request.urlopen(request(url, key, "/v1/chat/completions",
+                                        payload), timeout=900) as r:
+        for rawline in r:
+            line = rawline.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                if not printed:
+                    print()
+                    printed = True
+                print(piece, end="", flush=True)
+                content_parts.append(piece)
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = calls.setdefault(idx, {"id": tc.get("id"),
+                                              "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
+    if printed:
+        print()
+    tool_calls = [{"id": c["id"] or f"call_{i}", "type": "function",
+                   "function": {"name": c["name"], "arguments": c["arguments"]}}
+                  for i, c in sorted(calls.items())]
+    return "".join(content_parts), tool_calls
+
+
+def chat_turn(url, key, model, messages):
+    for _ in range(MAX_TOOL_STEPS):
+        content, tool_calls = stream_once(url, key, model, messages)
+        if not tool_calls:
+            messages.append({"role": "assistant", "content": content})
+            return
+        messages.append({"role": "assistant", "content": content or None,
+                         "tool_calls": tool_calls})
+        for call in tool_calls:
+            fn = call["function"]["name"]
+            try:
+                args = json.loads(call["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = exec_tool(fn, args)
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": result})
+    print("(stopped: too many tool steps — break the task into smaller pieces)")
+
+
+def trim(messages):
+    starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(starts) > MAX_HISTORY_TURNS:
+        cut = starts[-MAX_HISTORY_TURNS]
+        return [messages[0]] + messages[cut:]
+    return messages
+
+
+# ---------- main ----------
+
+def parse_args(argv):
+    model = None
+    system = DEFAULT_SYSTEM
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
+            system = argv[i + 1]
+            i += 2
+        elif argv[i] in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            model = argv[i]
+            i += 1
+    return model, system
+
+
+def main():
+    url, key = load_cfg()
+    model_arg, system = parse_args(sys.argv[1:])
+    ensure_server(url, key)
+    model = model_arg or pick_model(url, key)
+    print(f"mlxcli — model: {model} — /help for commands")
+    messages = [{"role": "system", "content": system}]
+    while True:
+        try:
+            user = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not user:
+            continue
+        if user in ("/exit", "/quit"):
+            break
+        if user == "/help":
+            print(HELP)
+            continue
+        if user == "/clear":
+            messages = [{"role": "system", "content": system}]
+            print("(history cleared)")
+            continue
+        if user == "/mem":
+            do_mem()
+            continue
+        if user == "/models":
+            for mid in list_models(url, key):
+                print(f"  {mid}" + (" (active)" if mid == model else ""))
+            continue
+        if user == "/model":
+            model = pick_model(url, key)
+            print(f"(switched to {model} — history kept)")
+            continue
+        if user.startswith("/save"):
+            do_save(user[5:], messages, model)
+            continue
+        if user.startswith("/paste"):
+            do_paste(user[6:], messages)
+            continue
+        messages.append({"role": "user", "content": user})
+        messages = trim(messages)
+        try:
+            chat_turn(url, key, model, messages)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:400]
+            print(f"\n[server error {e.code}] {body}")
+        except Exception as e:
+            print(f"\n[error] {e}")
+
+
+if __name__ == "__main__":
+    main()
