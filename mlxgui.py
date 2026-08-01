@@ -139,6 +139,9 @@ class MlxGui(tk.Tk):
         ttk.OptionMenu(top, self.convert_var, self.convert_var.get(), *CONVERT_MODES).pack(
             side="left", padx=(6, 12)
         )
+        ttk.Label(top, text="auto converts Office/PDF; text reads directly").pack(
+            side="left", padx=(0, 12)
+        )
 
         ttk.Button(top, text="Files", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
