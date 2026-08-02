@@ -13,7 +13,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 from xml.sax.saxutils import escape
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -273,13 +273,14 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
-        self.chat = scrolledtext.ScrolledText(self, wrap="word", padx=10, pady=10)
-        self.chat.pack(fill="both", expand=True, padx=10)
+        chat_frame = ttk.Frame(self)
+        chat_frame.pack(fill="both", expand=True, padx=10)
+        self.chat = tk.Text(chat_frame, wrap="word", padx=10, pady=10, undo=True)
+        chat_scroll = ttk.Scrollbar(chat_frame, orient="vertical", command=self.chat.yview)
+        self.chat.configure(yscrollcommand=chat_scroll.set)
+        self.chat.pack(side="left", fill="both", expand=True)
+        chat_scroll.pack(side="right", fill="y")
         self.chat.configure(state="normal", selectbackground="#2f6fed", selectforeground="#ffffff")
-        self.chat.bind("<Key>", self.block_chat_edit)
-        self.chat.bind("<<Paste>>", lambda _event: "break")
-        self.chat.bind("<Command-v>", lambda _event: "break")
-        self.chat.bind("<Control-v>", lambda _event: "break")
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -313,13 +314,6 @@ class MlxGui(tk.Tk):
         self.chat.insert("end", text)
         if not self.chat.tag_ranges("sel"):
             self.chat.see("end")
-
-    def block_chat_edit(self, event):
-        if event.keysym.lower() in ("c", "a") and (event.state & 0x000C):
-            return None
-        if event.keysym in ("Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End"):
-            return None
-        return "break"
 
     def select_all_chat(self, _event=None):
         self.chat.focus_set()
