@@ -14,6 +14,7 @@ import zipfile
 from datetime import datetime
 from xml.sax.saxutils import escape
 from tkinter import filedialog, messagebox, ttk
+from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -150,6 +151,7 @@ def paragraph_xml(text, style=None):
 
 
 def markdown_to_docx(path, title, markdown):
+    return formatted_markdown_to_docx(path, title, markdown)
     body = [paragraph_xml(title, "Title")]
     body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
     for line in markdown.splitlines():
@@ -244,6 +246,7 @@ class MlxGui(tk.Tk):
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.busy = False
+        self.last_user_text = ""
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -268,6 +271,7 @@ class MlxGui(tk.Tk):
 
         ttk.Button(top, text="Import Files", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Export Reply", command=self.export_reply).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Save DOCX", command=self.save_latest_docx).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Select All", command=self.select_all_chat).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Selected", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
@@ -398,6 +402,39 @@ class MlxGui(tk.Tk):
         self.status_var.set("Copied latest reply")
         return "break"
 
+    def autosave_docx_requested(self):
+        text = self.last_user_text.lower()
+        wants_doc = any(term in text for term in ("word document", "docx", ".docx", "export as word", "save as word"))
+        wants_save = any(term in text for term in ("save", "export", "create", "make", "generate"))
+        return wants_doc and wants_save
+
+    def default_docx_path(self):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        text = self.last_user_text.lower()
+        if "omlx" in text and ("mlxgui" in text or "mlxcli" in text):
+            name = "omlx-mlxcli-mlxgui-setup"
+        else:
+            name = "mlxgui-reply"
+        return DOWNLOADS / f"{name}-{stamp}.docx"
+
+    def save_docx_content(self, content, target=None):
+        target = pathlib.Path(target or self.default_docx_path()).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        markdown_to_docx(target, "mlxgui Export", content)
+        self.status_var.set(f"Saved {target.name}")
+        self.append(f"\n[saved Word document to {target}]\n")
+        return target
+
+    def save_latest_docx(self):
+        content = self.latest_reply_text()
+        if not content:
+            messagebox.showinfo("No reply", "There is no model reply to save yet.")
+            return
+        try:
+            self.save_docx_content(content)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
     def paste_into_input(self, _event=None):
         self.input.focus_set()
         text = ""
@@ -521,6 +558,7 @@ class MlxGui(tk.Tk):
             messagebox.showinfo("No model", "Wait for models to load first.")
             return
         self.input.delete("1.0", "end")
+        self.last_user_text = text
         self.messages.append({"role": "user", "content": text})
         self.messages = trim(self.messages)
         self.append(f"\nYou: {text}\n\nModel: ")
@@ -586,6 +624,11 @@ class MlxGui(tk.Tk):
                     content, usage = event[1], event[2]
                     if content:
                         self.messages.append({"role": "assistant", "content": content})
+                        if self.autosave_docx_requested():
+                            try:
+                                self.save_docx_content(content)
+                            except Exception as exc:
+                                self.append(f"\n[could not save Word document: {exc}]\n")
                     in_tokens, out_tokens = usage_counts(usage)
                     self.totals["in"] += in_tokens
                     self.totals["out"] += out_tokens

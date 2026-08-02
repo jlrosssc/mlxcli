@@ -24,6 +24,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 from xml.sax.saxutils import escape
+from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 MAX_TOOL_STEPS = 8
@@ -245,6 +246,7 @@ def paragraph_xml(text, style=None):
 
 
 def markdown_to_docx(path, title, markdown):
+    return formatted_markdown_to_docx(path, title, markdown)
     body = [paragraph_xml(title, "Title")]
     body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
     for line in markdown.splitlines():
