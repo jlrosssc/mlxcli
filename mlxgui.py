@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import urllib.parse
 import urllib.request
 import zipfile
@@ -249,6 +250,7 @@ class MlxGui(tk.Tk):
         self.busy = False
         self.last_user_text = ""
         self.reply_boxes = []
+        self.current_stream_start = None
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -284,10 +286,51 @@ class MlxGui(tk.Tk):
         self.chat.configure(yscrollcommand=chat_scroll.set)
         self.chat.pack(side="left", fill="both", expand=True)
         chat_scroll.pack(side="right", fill="y")
-        self.chat.configure(state="normal", selectbackground="#2f6fed", selectforeground="#ffffff")
-        self.chat.tag_configure("user_header", foreground="#0b5cad")
-        self.chat.tag_configure("model_header", foreground="#0a7c4a")
-        self.chat.tag_configure("meta", foreground="#667085")
+        body_font = tkfont.Font(family="Georgia", size=16)
+        label_font = tkfont.Font(family="Helvetica", size=13)
+        small_font = tkfont.Font(family="Helvetica", size=11)
+        code_font = tkfont.Font(family="Menlo", size=13)
+        self.chat.configure(
+            state="normal",
+            background="#ffffff",
+            borderwidth=0,
+            font=body_font,
+            insertbackground="#111111",
+            relief="flat",
+            selectbackground="#2f6fed",
+            selectforeground="#ffffff",
+        )
+        self.chat.tag_configure(
+            "user_bubble",
+            justify="right",
+            background="#f2f1ef",
+            foreground="#202020",
+            font=tkfont.Font(family="Helvetica", size=17),
+            lmargin1=180,
+            lmargin2=180,
+            rmargin=24,
+            spacing1=12,
+            spacing3=18,
+        )
+        self.chat.tag_configure(
+            "assistant_label",
+            foreground="#7a7a73",
+            font=label_font,
+            spacing1=14,
+            spacing3=8,
+        )
+        self.chat.tag_configure(
+            "assistant_body",
+            foreground="#0f0f0f",
+            font=body_font,
+            lmargin1=14,
+            lmargin2=14,
+            rmargin=40,
+            spacing1=3,
+            spacing3=8,
+        )
+        self.chat.tag_configure("meta", foreground="#667085", font=small_font, spacing1=8, spacing3=8)
+        self.chat.tag_configure("code", foreground="#9a3412", background="#f4f4f5", font=code_font)
 
         self.output_frame = ttk.Frame(self, padding=(10, 8, 10, 0))
         self.output_frame.pack(fill="x")
@@ -380,6 +423,27 @@ class MlxGui(tk.Tk):
         if not self.chat.tag_ranges("sel"):
             self.chat.see("end")
 
+    def append_model_text(self, text):
+        start = self.chat.index("end-1c")
+        self.chat.insert("end", text, "assistant_body")
+        end = self.chat.index("end-1c")
+        self.apply_inline_code_tag(start, end)
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+
+    def apply_inline_code_tag(self, start, end):
+        text = self.chat.get(start, end)
+        offset = 0
+        while True:
+            left = text.find("`", offset)
+            if left < 0:
+                break
+            right = text.find("`", left + 1)
+            if right < 0:
+                break
+            self.chat.tag_add("code", f"{start}+{left}c", f"{start}+{right + 1}c")
+            offset = right + 1
+
     def add_reply_box(self, content):
         box_frame = ttk.Frame(self.reply_box_container, padding=(0, 4, 0, 0))
         box_frame.pack(fill="x")
@@ -388,6 +452,14 @@ class MlxGui(tk.Tk):
         ttk.Button(buttons, text="Copy", command=lambda c=content: self.copy_text(c)).pack(side="left")
         ttk.Button(buttons, text="DOCX", command=lambda c=content: self.save_docx_content(c)).pack(side="left", padx=(6, 0))
         text = tk.Text(box_frame, height=5, wrap="word", padx=8, pady=6)
+        text.configure(
+            background="#fbfbfa",
+            borderwidth=1,
+            font=tkfont.Font(family="Helvetica", size=12),
+            relief="solid",
+            selectbackground="#2f6fed",
+            selectforeground="#ffffff",
+        )
         text.insert("1.0", content)
         text.pack(fill="x")
         self.reply_boxes.append(box_frame)
@@ -637,9 +709,9 @@ class MlxGui(tk.Tk):
         self.last_user_text = text
         self.messages.append({"role": "user", "content": text})
         self.messages = trim(self.messages)
-        self.append_tagged("\nYou\n", "user_header")
-        self.append(f"{text}\n")
-        self.append_tagged("\nModel\n", "model_header")
+        self.append_tagged(f"\n{text}\n", "user_bubble")
+        self.append_tagged("Assistant\n", "assistant_label")
+        self.current_stream_start = self.chat.index("end-1c")
         self.busy = True
         self.send_button.configure(state="disabled")
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
@@ -690,7 +762,7 @@ class MlxGui(tk.Tk):
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "append":
-                    self.append(event[1])
+                    self.append_model_text(event[1])
                 elif kind == "status":
                     self.status_var.set(event[1])
                 elif kind == "models":
