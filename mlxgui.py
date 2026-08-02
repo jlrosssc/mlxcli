@@ -247,6 +247,7 @@ class MlxGui(tk.Tk):
         self.convert_var = tk.StringVar(value="auto")
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
+        self.working_var = tk.StringVar(value="")
         self.busy = False
         self.last_user_text = ""
         self.current_stream_start = None
@@ -402,8 +403,10 @@ class MlxGui(tk.Tk):
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
 
-        status = ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(10, 0, 10, 8))
-        status.pack(fill="x")
+        status_bar = ttk.Frame(self, padding=(10, 0, 10, 8))
+        status_bar.pack(fill="x")
+        ttk.Label(status_bar, textvariable=self.working_var, width=10).pack(side="left")
+        ttk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
 
     def build_menu(self):
         menu = tk.Menu(self)
@@ -466,6 +469,13 @@ class MlxGui(tk.Tk):
 
     def status(self, text):
         self.events.put(("status", text))
+
+    def start_working(self, text="Thinking"):
+        self.working_var.set("Working...")
+        self.status_var.set(text)
+
+    def stop_working(self):
+        self.working_var.set("")
 
     def append(self, text):
         self.chat.insert("end", text)
@@ -768,6 +778,7 @@ class MlxGui(tk.Tk):
         self.current_stream_end = self.current_stream_start
         self.busy = True
         self.send_button.configure(state="disabled")
+        self.start_working("Waiting for model response")
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
 
     def stream_reply(self, model):
@@ -843,6 +854,7 @@ class MlxGui(tk.Tk):
                     )
                     self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}")
                     self.busy = False
+                    self.stop_working()
                     self.send_button.configure(state="normal")
                     self.current_stream_start = None
                     self.current_stream_end = None
