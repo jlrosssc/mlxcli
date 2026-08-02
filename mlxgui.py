@@ -159,7 +159,7 @@ class MlxGui(tk.Tk):
             side="left", padx=(0, 12)
         )
 
-        ttk.Button(top, text="Files", command=self.import_files).pack(side="left")
+        ttk.Button(top, text="Import Files", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
@@ -199,24 +199,27 @@ class MlxGui(tk.Tk):
         self.status("Ready")
 
     def import_files(self):
-        paths = filedialog.askopenfilenames(title="Import files")
+        paths = filedialog.askopenfilenames(title="Import one or more files")
         if not paths:
             return
         mode = self.convert_var.get()
         sections = []
+        labels = []
         try:
             for path in paths:
                 text, label = convert_file(path, mode)
                 clipped = text[:MAX_FILE_CHARS]
                 note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
                 sections.append(f"Contents of {label}:\n\n{clipped}{note}")
+                labels.append(label)
         except Exception as exc:
-            messagebox.showerror("Import failed", str(exc))
+            messagebox.showerror("Import failed", f"No files were imported.\n\n{exc}")
             return
         content = "\n\n---\n\n".join(sections)
         self.messages.append({"role": "user", "content": content})
         self.messages = trim(self.messages)
-        self.append(f"\n[imported {len(paths)} file(s) as {mode}]\n")
+        self.append(f"\n[imported {len(labels)} file(s) as {mode}: {', '.join(labels)}]\n")
+        self.status_var.set(f"Imported {len(labels)} file(s)")
 
     def clear_chat(self):
         self.messages = [{"role": "system", "content": DEFAULT_SYSTEM}]
