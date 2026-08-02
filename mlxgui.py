@@ -282,9 +282,17 @@ class MlxGui(tk.Tk):
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
-        self.input = ttk.Entry(bottom)
+        self.input = tk.Text(bottom, height=3, wrap="word", undo=True)
         self.input.pack(side="left", fill="x", expand=True)
-        self.input.bind("<Return>", lambda _event: self.send())
+        self.input.bind("<Return>", self.send_from_keyboard)
+        self.input.bind("<Shift-Return>", lambda _event: None)
+        self.input.bind("<Command-v>", self.paste_into_input)
+        self.input.bind("<Control-v>", self.paste_into_input)
+        self.input.bind("<<Paste>>", self.paste_into_input)
+        self.input.bind("<Button-2>", self.paste_into_input)
+        self.chat.bind("<Command-c>", self.copy_chat_selection)
+        self.chat.bind("<Control-c>", self.copy_chat_selection)
+        self.chat.bind("<<Copy>>", self.copy_chat_selection)
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
 
@@ -346,6 +354,33 @@ class MlxGui(tk.Tk):
             self.after_cancel(self.select_scroll_after)
             self.select_scroll_after = None
         self.chat.configure(state="disabled")
+        return "break"
+
+    def copy_chat_selection(self, _event=None):
+        try:
+            selected = self.chat.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(selected)
+        return "break"
+
+    def paste_into_input(self, _event=None):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        try:
+            self.input.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        self.input.insert("insert", text)
+        return "break"
+
+    def send_from_keyboard(self, event):
+        if event.state & 0x0001:
+            return None
+        self.send()
         return "break"
 
     def start_server_and_models(self):
@@ -436,14 +471,14 @@ class MlxGui(tk.Tk):
     def send(self):
         if self.busy:
             return
-        text = self.input.get().strip()
+        text = self.input.get("1.0", "end-1c").strip()
         if not text:
             return
         model = self.model_var.get()
         if not model:
             messagebox.showinfo("No model", "Wait for models to load first.")
             return
-        self.input.delete(0, "end")
+        self.input.delete("1.0", "end")
         self.messages.append({"role": "user", "content": text})
         self.messages = trim(self.messages)
         self.append(f"\nYou: {text}\n\nModel: ")
