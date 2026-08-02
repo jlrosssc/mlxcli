@@ -244,9 +244,6 @@ class MlxGui(tk.Tk):
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.busy = False
-        self.selecting_chat = False
-        self.select_scroll_after = None
-        self.select_pointer = (0, 0)
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -275,10 +272,11 @@ class MlxGui(tk.Tk):
 
         self.chat = scrolledtext.ScrolledText(self, wrap="word", padx=10, pady=10)
         self.chat.pack(fill="both", expand=True, padx=10)
-        self.chat.configure(state="disabled")
-        self.chat.bind("<ButtonPress-1>", self.begin_chat_select)
-        self.chat.bind("<B1-Motion>", self.extend_chat_select)
-        self.chat.bind("<ButtonRelease-1>", self.end_chat_select)
+        self.chat.configure(state="normal")
+        self.chat.bind("<Key>", lambda _event: "break")
+        self.chat.bind("<<Paste>>", lambda _event: "break")
+        self.chat.bind("<Command-v>", lambda _event: "break")
+        self.chat.bind("<Control-v>", lambda _event: "break")
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -303,58 +301,9 @@ class MlxGui(tk.Tk):
         self.events.put(("status", text))
 
     def append(self, text):
-        self.chat.configure(state="normal")
         self.chat.insert("end", text)
-        self.chat.see("end")
-        self.chat.configure(state="disabled")
-
-    def begin_chat_select(self, event):
-        self.selecting_chat = True
-        self.select_pointer = (event.x, event.y)
-        self.chat.configure(state="normal")
-        self.chat.mark_set("select_anchor", f"@{event.x},{event.y}")
-        self.chat.tag_remove("sel", "1.0", "end")
-        self.chat.configure(state="disabled")
-        return "break"
-
-    def extend_chat_select(self, event):
-        self.select_pointer = (event.x, event.y)
-        self.update_chat_selection()
-        self.schedule_chat_autoscroll()
-        return "break"
-
-    def update_chat_selection(self):
-        x, y = self.select_pointer
-        self.chat.configure(state="normal")
-        self.chat.tag_remove("sel", "1.0", "end")
-        self.chat.tag_add("sel", "select_anchor", f"@{x},{y}")
-        self.chat.configure(state="disabled")
-
-    def schedule_chat_autoscroll(self):
-        if self.select_scroll_after is None:
-            self.select_scroll_after = self.after(80, self.chat_autoscroll)
-
-    def chat_autoscroll(self):
-        self.select_scroll_after = None
-        if not self.selecting_chat:
-            return
-        _x, y = self.select_pointer
-        if y < 0:
-            self.chat.yview_scroll(-1, "units")
-            self.update_chat_selection()
-            self.schedule_chat_autoscroll()
-        elif y > self.chat.winfo_height():
-            self.chat.yview_scroll(1, "units")
-            self.update_chat_selection()
-            self.schedule_chat_autoscroll()
-
-    def end_chat_select(self, _event):
-        self.selecting_chat = False
-        if self.select_scroll_after is not None:
-            self.after_cancel(self.select_scroll_after)
-            self.select_scroll_after = None
-        self.chat.configure(state="disabled")
-        return "break"
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
 
     def copy_chat_selection(self, _event=None):
         try:
@@ -465,7 +414,6 @@ class MlxGui(tk.Tk):
         self.tokens_var.set("tokens: in 0 / out 0")
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
-        self.chat.configure(state="disabled")
         self.status_var.set("Cleared")
 
     def send(self):
