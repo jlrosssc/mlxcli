@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -179,6 +180,67 @@ def usage_counts(usage):
     return int(in_tokens or 0), int(out_tokens or 0)
 
 
+def system_resource_lines():
+    lines = []
+
+    def sysctl(name):
+        try:
+            out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=5)
+            return int(out.stdout.strip())
+        except Exception:
+            return None
+
+    total = sysctl("hw.memsize")
+    cap = sysctl("iogpu.wired_limit_mb")
+    if total:
+        lines.append(f"- Total RAM: {total / 2**30:.1f} GB")
+    if cap:
+        lines.append(f"- Metal cap: {cap / 1024:.1f} GB")
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        match = re.search(r"page size of (\d+)", vm)
+        page = int(match.group(1)) if match else 16384
+
+        def pages(label):
+            found = re.search(label + r":\s+(\d+)", vm)
+            return int(found.group(1)) * page if found else 0
+
+        free = pages("Pages free")
+        reclaim = free + pages("Pages inactive") + pages("Pages purgeable")
+        lines.append(f"- Free now: {free / 2**30:.1f} GB")
+        lines.append(f"- Reclaimable: {reclaim / 2**30:.1f} GB")
+    except Exception as exc:
+        lines.append(f"- vm_stat unavailable: {exc}")
+    try:
+        ps = subprocess.run(["ps", "axo", "rss=,comm="], capture_output=True, text=True, timeout=5)
+        rows = []
+        for line in ps.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                rows.append((int(parts[0]), parts[1]))
+        rows.sort(reverse=True)
+        lines.append("")
+        lines.append("Top Memory Users")
+        shown = 0
+        for rss, command in rows:
+            mb = rss // 1024
+            if mb < 300 or shown >= 10:
+                break
+            if ".app/" in command:
+                segment = command.split("/Applications/")[-1]
+                name = segment.split(".app/")[0] if ".app/" in segment else command.rsplit("/", 1)[-1]
+            else:
+                name = command.rsplit("/", 1)[-1]
+            tag = " <- oMLX" if "omlx" in command.lower() else ""
+            lines.append(f"- {mb:>6} MB  {name}{tag}")
+            shown += 1
+        if shown == 0:
+            lines.append("- Nothing over 300 MB")
+    except Exception as exc:
+        lines.append(f"- ps unavailable: {exc}")
+    return lines
+
+
 def trim(messages):
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if len(starts) > MAX_HISTORY_TURNS:
@@ -300,6 +362,7 @@ class MlxGui(tk.Tk):
         self.system_prompt = load_system_prompt()
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
+        self.last_turn_tokens = {"in": 0, "out": 0}
         self.events = queue.Queue()
         self.model_var = tk.StringVar()
         self.convert_var = tk.StringVar(value="auto")
@@ -341,6 +404,7 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="Copy", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Defaults", command=self.open_dialogue_options).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Resources", command=self.open_resources).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
         chat_frame = ttk.Frame(self)
@@ -678,6 +742,65 @@ class MlxGui(tk.Tk):
         self.apply_system_prompt(DEFAULT_SYSTEM)
         self.status_var.set("Restored built-in dialogue defaults")
 
+    def open_resources(self):
+        win = tk.Toplevel(self)
+        win.title("Resources")
+        win.geometry("620x520")
+        win.transient(self)
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Local session and Mac resource snapshot").pack(anchor="w")
+        text = tk.Text(frame, wrap="word", padx=8, pady=8, height=20)
+        text.pack(fill="both", expand=True, pady=(8, 10))
+        text.insert("1.0", self.resource_report())
+        text.configure(state="disabled")
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+
+        def refresh():
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", self.resource_report())
+            text.configure(state="disabled")
+
+        ttk.Button(buttons, text="Clear Conversation", command=self.clear_chat).pack(side="left")
+        ttk.Button(buttons, text="Refresh", command=refresh).pack(side="right")
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def resource_report(self):
+        lines = [
+            "Dialogue",
+            f"- User turns in context: {self.user_turn_count()} of {MAX_HISTORY_TURNS}",
+            f"- Last turn tokens: in {self.last_turn_tokens['in']:,} / out {self.last_turn_tokens['out']:,}",
+            f"- Session tokens: in {self.totals['in']:,} / out {self.totals['out']:,}",
+            f"- Imported file cap: {MAX_FILE_CHARS:,} characters per file",
+            "",
+            "Guidance",
+            self.resource_guidance(),
+            "",
+            "Mac Memory",
+        ]
+        lines.extend(system_resource_lines())
+        return "\n".join(lines)
+
+    def user_turn_count(self):
+        return sum(1 for message in self.messages if message.get("role") == "user")
+
+    def resource_guidance(self):
+        last_in = self.last_turn_tokens["in"]
+        turns = self.user_turn_count()
+        if last_in >= 12000:
+            return "- Clear or start a new dialogue soon. Input context is already large."
+        if last_in >= 8000:
+            return "- Consider Clear after this task. Input context is approaching a heavy local-model turn."
+        if turns >= MAX_HISTORY_TURNS:
+            return "- Conversation is at the retained-turn limit; older turns are being trimmed automatically."
+        if turns >= MAX_HISTORY_TURNS - 3:
+            return "- Several turns are in context. Clear when the current topic is done."
+        return "- Resource use looks reasonable for the current dialogue."
+
     def handle_escape(self, _event=None):
         if self.busy:
             self.cancel_current_response()
@@ -1008,6 +1131,7 @@ class MlxGui(tk.Tk):
     def clear_chat(self):
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
+        self.last_turn_tokens = {"in": 0, "out": 0}
         self.tokens_var.set("tokens: in 0 / out 0")
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
@@ -1115,6 +1239,7 @@ class MlxGui(tk.Tk):
                             except Exception as exc:
                                 self.append(f"\n[could not save Word document: {exc}]\n")
                     in_tokens, out_tokens = usage_counts(usage)
+                    self.last_turn_tokens = {"in": in_tokens, "out": out_tokens}
                     self.totals["in"] += in_tokens
                     self.totals["out"] += out_tokens
                     self.tokens_var.set(

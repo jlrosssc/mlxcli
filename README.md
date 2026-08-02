@@ -41,6 +41,7 @@ server to come up. It does not launch the companion dashboard viewer.
 /convert MODE   set paste conversion: auto, all, or off
 /model          switch models
 /models         list server models
+/resources      show dialogue pressure, token totals, and Mac memory status
 /mem            show local memory status and top memory users
 /tokens         show running session token totals
 /save [file]    save the transcript as markdown
@@ -112,6 +113,10 @@ These per-turn numbers are meant as an early warning gauge. If input tokens
 start drifting into large counts as a session ages, use `/clear` before context
 pressure becomes a failure.
 
+Use `/resources` for a combined view of retained dialogue turns, last-turn
+tokens, session totals, import caps, Mac memory, Metal cap, and top memory
+users. In the GUI, use the **Resources** button for the same kind of snapshot.
+
 ## Dialogue Defaults
 
 `mlxcli` and `mlxgui` share a lightweight default instruction file at
@@ -142,7 +147,8 @@ streamed replies, token totals, clear, multi-file import, and latest-reply
 export to `.docx`, `.md`, or `.txt`. Every selected file is converted according
 to the active `auto`, `all`, or `off` Markdown mode before the batch is added to
 context. It also includes Dialogue Options for editing the saved default
-instructions used by both the GUI and CLI.
+instructions used by both the GUI and CLI, plus a Resources snapshot for
+deciding when to clear or end a dialogue.
 
 Run it:
 

@@ -2,14 +2,14 @@
 """mlxcli v5 — a minimal local agent CLI for oMLX.
 
 Stdlib only (markitdown used via subprocess if installed, for docx/pdf paste).
-Zero-overhead design: ~60-token system prompt, streaming output, bounded
-history, approval-gated tools with diff preview.
+Low-overhead design: streaming output, bounded history, shared dialogue
+defaults, and approval-gated tools with diff preview.
 
 Usage:
   mlxcli [model] [-p "custom system prompt"]
 
 Commands:
-  /paste <file>  /convert  /model  /models  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
+  /paste <file>  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
 """
 import difflib
 import json
@@ -110,6 +110,7 @@ HELP = """Commands:
   /system default restore the built-in dialogue defaults
   /model          switch models (picker; history kept)
   /models         list models the server offers
+  /resources      show dialogue pressure, token totals, and Mac memory status
   /mem            show RAM status, Metal cap, and top memory users
   /tokens         show running token totals for this mlxcli session
   /save [file]    save transcript as markdown (default: ~/Downloads/mlxcli-<timestamp>.md)
@@ -462,6 +463,27 @@ def do_mem():
         print(f"(ps unavailable: {e})")
 
 
+def do_resources(totals, messages, last_turn):
+    turns = sum(1 for message in messages if message.get("role") == "user")
+    print("Dialogue:")
+    print(f"  user turns in context: {turns} of {MAX_HISTORY_TURNS}")
+    print(f"  last turn tokens:      in {last_turn['in']:,} / out {last_turn['out']:,}")
+    print(f"  session tokens:        in {totals['in']:,} / out {totals['out']:,}")
+    print(f"  imported file cap:     {MAX_FILE_CHARS:,} chars per file")
+    if last_turn["in"] >= 12000:
+        print("  guidance: clear or start a new dialogue soon; input context is large")
+    elif last_turn["in"] >= 8000:
+        print("  guidance: consider /clear after this task; input context is getting heavy")
+    elif turns >= MAX_HISTORY_TURNS:
+        print("  guidance: retained-turn limit reached; older turns are being trimmed")
+    elif turns >= MAX_HISTORY_TURNS - 3:
+        print("  guidance: several turns are in context; /clear when this topic is done")
+    else:
+        print("  guidance: resource use looks reasonable for this dialogue")
+    print()
+    do_mem()
+
+
 def do_paste(arg, messages, convert_mode):
     raw = arg.strip().strip('"').strip("'")
     if not raw:
@@ -627,7 +649,7 @@ def chat_turn(url, key, model, messages, totals):
             totals["in"] += turn_in
             totals["out"] += turn_out
             print_tokens("turn", turn_in, turn_out)
-            return
+            return turn_in, turn_out
         messages.append({"role": "assistant", "content": content or None,
                          "tool_calls": tool_calls})
         for call in tool_calls:
@@ -643,6 +665,7 @@ def chat_turn(url, key, model, messages, totals):
     totals["in"] += turn_in
     totals["out"] += turn_out
     print_tokens("turn", turn_in, turn_out)
+    return turn_in, turn_out
 
 
 def trim(messages):
@@ -680,6 +703,7 @@ def main():
     print(f"mlxcli — model: {model} — /help for commands")
     messages = [{"role": "system", "content": system}]
     totals = {"in": 0, "out": 0}
+    last_turn = {"in": 0, "out": 0}
     convert_mode = "auto"
     while True:
         try:
@@ -742,6 +766,9 @@ def main():
         if user == "/tokens":
             print_tokens("session", totals["in"], totals["out"])
             continue
+        if user in ("/resources", "/resource"):
+            do_resources(totals, messages, last_turn)
+            continue
         if user == "/convert":
             print(f"(paste conversion: {convert_mode}; modes: auto, all, off)")
             continue
@@ -776,7 +803,8 @@ def main():
         messages.append({"role": "user", "content": user})
         messages = trim(messages)
         try:
-            chat_turn(url, key, model, messages, totals)
+            turn_in, turn_out = chat_turn(url, key, model, messages, totals)
+            last_turn = {"in": turn_in, "out": turn_out}
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
             print(f"\n[server error {e.code}] {body}")
