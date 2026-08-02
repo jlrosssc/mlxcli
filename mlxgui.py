@@ -244,6 +244,10 @@ class MlxGui(tk.Tk):
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.busy = False
+        self.chat_selecting = False
+        self.chat_anchor = None
+        self.chat_select_after = None
+        self.chat_pointer = (0, 0)
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -274,7 +278,10 @@ class MlxGui(tk.Tk):
 
         self.chat = scrolledtext.ScrolledText(self, wrap="word", padx=10, pady=10)
         self.chat.pack(fill="both", expand=True, padx=10)
-        self.chat.configure(state="normal")
+        self.chat.configure(state="normal", selectbackground="#2f6fed", selectforeground="#ffffff")
+        self.chat.bind("<ButtonPress-1>", self.begin_chat_selection)
+        self.chat.bind("<B1-Motion>", self.drag_chat_selection)
+        self.chat.bind("<ButtonRelease-1>", self.end_chat_selection)
         self.chat.bind("<<Paste>>", lambda _event: "break")
         self.chat.bind("<Command-v>", lambda _event: "break")
         self.chat.bind("<Control-v>", lambda _event: "break")
@@ -307,6 +314,55 @@ class MlxGui(tk.Tk):
         self.chat.insert("end", text)
         if not self.chat.tag_ranges("sel"):
             self.chat.see("end")
+
+    def begin_chat_selection(self, event):
+        self.chat.focus_set()
+        self.chat_selecting = True
+        self.chat_pointer = (event.x, event.y)
+        self.chat_anchor = self.chat.index(f"@{event.x},{event.y}")
+        self.chat.mark_set("insert", self.chat_anchor)
+        self.chat.tag_remove("sel", "1.0", "end")
+        return "break"
+
+    def drag_chat_selection(self, event):
+        self.chat_pointer = (event.x, event.y)
+        self.update_chat_selection()
+        self.schedule_chat_selection_scroll()
+        return "break"
+
+    def update_chat_selection(self):
+        if not self.chat_anchor:
+            return
+        x, y = self.chat_pointer
+        current = self.chat.index(f"@{x},{y}")
+        self.chat.tag_remove("sel", "1.0", "end")
+        self.chat.tag_add("sel", self.chat_anchor, current)
+        self.chat.mark_set("insert", current)
+
+    def schedule_chat_selection_scroll(self):
+        if self.chat_select_after is None:
+            self.chat_select_after = self.after(80, self.chat_selection_scroll)
+
+    def chat_selection_scroll(self):
+        self.chat_select_after = None
+        if not self.chat_selecting:
+            return
+        _x, y = self.chat_pointer
+        if y < 0:
+            self.chat.yview_scroll(-1, "units")
+            self.update_chat_selection()
+            self.schedule_chat_selection_scroll()
+        elif y > self.chat.winfo_height():
+            self.chat.yview_scroll(1, "units")
+            self.update_chat_selection()
+            self.schedule_chat_selection_scroll()
+
+    def end_chat_selection(self, _event):
+        self.chat_selecting = False
+        if self.chat_select_after is not None:
+            self.after_cancel(self.chat_select_after)
+            self.chat_select_after = None
+        return "break"
 
     def copy_chat_selection(self, _event=None):
         try:
