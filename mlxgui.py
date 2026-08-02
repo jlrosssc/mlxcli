@@ -288,10 +288,6 @@ class MlxGui(tk.Tk):
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Return>", self.send_from_keyboard)
         self.input.bind("<Shift-Return>", lambda _event: None)
-        self.input.bind("<Command-v>", self.paste_into_input)
-        self.input.bind("<Control-v>", self.paste_into_input)
-        self.input.bind("<<Paste>>", self.paste_into_input)
-        self.input.bind("<Button-2>", self.paste_into_input)
         self.chat.bind("<Command-c>", self.copy_chat_selection)
         self.chat.bind("<Command-C>", self.copy_chat_selection)
         self.chat.bind("<Control-c>", self.copy_chat_selection)
@@ -301,6 +297,7 @@ class MlxGui(tk.Tk):
         self.chat.bind("<Control-a>", self.select_all_chat)
         self.chat.bind("<Control-A>", self.select_all_chat)
         self.chat.bind("<<Copy>>", self.copy_chat_selection)
+        ttk.Button(bottom, text="Paste", command=self.paste_into_input).pack(side="left", padx=(8, 0))
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
 
