@@ -259,6 +259,8 @@ class MlxGui(tk.Tk):
         self.working_started_at = None
         self.working_after = None
         self.context_widget = None
+        self.cancel_requested = False
+        self.pending_user_index = None
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -441,7 +443,7 @@ class MlxGui(tk.Tk):
         self.bind_all("<Command-A>", lambda _event: self.menu_select_all())
         self.bind_all("<Control-a>", lambda _event: self.menu_select_all())
         self.bind_all("<Control-A>", lambda _event: self.menu_select_all())
-        self.bind_all("<Escape>", lambda _event: self.quit_app())
+        self.bind_all("<Escape>", self.handle_escape)
         self.text_menu = tk.Menu(self, tearoff=False)
         self.text_menu.add_command(label="Copy", command=self.context_copy)
         self.text_menu.add_command(label="Paste", command=self.context_paste)
@@ -545,6 +547,36 @@ class MlxGui(tk.Tk):
         self.stop_working()
         self.destroy()
         return "break"
+
+    def handle_escape(self, _event=None):
+        if self.busy:
+            self.cancel_current_response()
+        else:
+            self.status_var.set("Nothing running")
+        return "break"
+
+    def cancel_current_response(self):
+        self.cancel_requested = True
+        self.status_var.set("Stopping current response...")
+        self.working_var.set("Stopping")
+        self.send_button.configure(state="normal")
+
+    def finish_canceled_response(self, partial_text):
+        if self.current_stream_start and self.current_stream_end and partial_text:
+            self.style_assistant_range(self.current_stream_start, self.current_stream_end)
+        if self.pending_user_index is not None and self.pending_user_index < len(self.messages):
+            pending = self.messages[self.pending_user_index]
+            if pending.get("role") == "user" and pending.get("content") == self.last_user_text:
+                del self.messages[self.pending_user_index]
+        self.pending_user_index = None
+        self.cancel_requested = False
+        self.busy = False
+        self.stop_working()
+        self.send_button.configure(state="normal")
+        self.current_stream_start = None
+        self.current_stream_end = None
+        self.append_tagged("\n[stopped - partial reply not kept in context]\n", "meta")
+        self.status_var.set("Stopped")
 
     def append(self, text):
         self.chat.insert("end", text)
@@ -865,6 +897,8 @@ class MlxGui(tk.Tk):
         self.last_user_text = text
         self.messages.append({"role": "user", "content": text})
         self.messages = trim(self.messages)
+        self.pending_user_index = len(self.messages) - 1
+        self.cancel_requested = False
         self.append_tagged(f"\n{text}\n", "user_bubble")
         self.append_tagged("Assistant\n", "assistant_label")
         self.current_stream_start = self.chat.index("end-1c")
@@ -889,6 +923,9 @@ class MlxGui(tk.Tk):
                 request(self.url, self.key, "/v1/chat/completions", payload), timeout=900
             ) as resp:
                 for rawline in resp:
+                    if self.cancel_requested:
+                        self.events.put(("canceled", "".join(parts)))
+                        return
                     line = rawline.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -906,11 +943,17 @@ class MlxGui(tk.Tk):
                         continue
                     piece = (choices[0].get("delta") or {}).get("content")
                     if piece:
+                        if self.cancel_requested:
+                            self.events.put(("canceled", "".join(parts)))
+                            return
                         parts.append(piece)
                         self.events.put(("append", piece))
         except Exception as exc:
-            self.events.put(("append", f"\n[error] {exc}\n"))
-            self.events.put(("done", "", {}))
+            if self.cancel_requested:
+                self.events.put(("canceled", "".join(parts)))
+            else:
+                self.events.put(("append", f"\n[error] {exc}\n"))
+                self.events.put(("done", "", {}))
             return
         self.events.put(("done", "".join(parts), usage))
 
@@ -930,6 +973,8 @@ class MlxGui(tk.Tk):
                         self.model_var.set(models[0])
                 elif kind == "done":
                     content, usage = event[1], event[2]
+                    self.pending_user_index = None
+                    self.cancel_requested = False
                     if content:
                         if self.current_stream_start and self.current_stream_end:
                             self.style_assistant_range(self.current_stream_start, self.current_stream_end)
@@ -951,6 +996,8 @@ class MlxGui(tk.Tk):
                     self.send_button.configure(state="normal")
                     self.current_stream_start = None
                     self.current_stream_end = None
+                elif kind == "canceled":
+                    self.finish_canceled_response(event[1])
         except queue.Empty:
             pass
         self.after(60, self.drain_events)
