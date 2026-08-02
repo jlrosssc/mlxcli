@@ -288,6 +288,11 @@ class MlxGui(tk.Tk):
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Return>", self.send_from_keyboard)
         self.input.bind("<Shift-Return>", lambda _event: None)
+        self.input.bind("<Command-v>", self.paste_into_input)
+        self.input.bind("<Command-V>", self.paste_into_input)
+        self.input.bind("<Control-v>", self.paste_into_input)
+        self.input.bind("<Control-V>", self.paste_into_input)
+        self.input.bind("<<Paste>>", self.paste_into_input)
         self.chat.bind("<Command-c>", self.copy_chat_selection)
         self.chat.bind("<Command-C>", self.copy_chat_selection)
         self.chat.bind("<Control-c>", self.copy_chat_selection)
@@ -350,15 +355,29 @@ class MlxGui(tk.Tk):
         return "break"
 
     def paste_into_input(self, _event=None):
+        self.input.focus_set()
+        text = ""
         try:
             text = self.clipboard_get()
         except tk.TclError:
+            pass
+        if not text and shutil.which("pbpaste"):
+            try:
+                text = subprocess.run(
+                    ["pbpaste"], capture_output=True, text=True, timeout=2
+                ).stdout
+            except Exception:
+                text = ""
+        if not text:
+            self.status_var.set("Clipboard is empty or unavailable")
             return "break"
         try:
             self.input.delete("sel.first", "sel.last")
         except tk.TclError:
             pass
         self.input.insert("insert", text)
+        self.input.see("insert")
+        self.status_var.set(f"Pasted {len(text)} chars")
         return "break"
 
     def send_from_keyboard(self, event):
