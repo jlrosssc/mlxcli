@@ -385,6 +385,8 @@ class MlxGui(tk.Tk):
             spacing1=8,
             spacing3=8,
         )
+        self.raise_text_selection()
+        self.chat.bind("<ButtonRelease-1>", lambda _event: self.raise_text_selection())
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -473,6 +475,14 @@ class MlxGui(tk.Tk):
     def status(self, text):
         self.events.put(("status", text))
 
+    def raise_text_selection(self):
+        try:
+            self.chat.tag_raise("sel")
+            self.input.tag_raise("sel")
+        except Exception:
+            pass
+        return None
+
     def start_working(self, text="Thinking"):
         self.working_started_at = time.time()
         self.update_working_elapsed()
@@ -520,6 +530,7 @@ class MlxGui(tk.Tk):
     def style_assistant_range(self, start, end):
         self.apply_markdown_line_tags(start, end)
         self.apply_inline_code_tag(start, end)
+        self.raise_text_selection()
 
     def apply_markdown_line_tags(self, start, end):
         text = self.chat.get(start, end)
