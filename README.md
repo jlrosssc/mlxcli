@@ -112,6 +112,28 @@ These per-turn numbers are meant as an early warning gauge. If input tokens
 start drifting into large counts as a session ages, use `/clear` before context
 pressure becomes a failure.
 
+## Dialogue Defaults
+
+`mlxcli` and `mlxgui` share a lightweight default instruction file at
+`~/.omlx/mlx_system_prompt.txt`. The built-in defaults keep replies concise,
+avoid hidden reasoning, keep code answers focused on final code, and remind the
+model to respect local memory limits.
+
+In `mlxgui`, open **Defaults > Dialogue Options...** or use the **Defaults**
+button to edit and save those instructions. The dialog includes presets for
+concise agent conversation, code-focused replies, and document drafting.
+
+In `mlxcli`:
+
+```bash
+/system
+/system save Keep answers short and show code only unless I ask for explanation.
+/system preset concise
+/system preset code
+/system preset docs
+/system default
+```
+
 ## Lightweight GUI
 
 `mlxgui.py` is a small Tkinter interface for the same local oMLX chat flow. It
@@ -119,7 +141,8 @@ does not embed a browser and does not use WebKit. It provides model selection,
 streamed replies, token totals, clear, multi-file import, and latest-reply
 export to `.docx`, `.md`, or `.txt`. Every selected file is converted according
 to the active `auto`, `all`, or `off` Markdown mode before the batch is added to
-context.
+context. It also includes Dialogue Options for editing the saved default
+instructions used by both the GUI and CLI.
 
 Run it:
 

@@ -27,6 +27,7 @@ from xml.sax.saxutils import escape
 from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
+SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_TOOL_STEPS = 8
 MAX_FILE_CHARS = 8000
@@ -36,11 +37,48 @@ CONVERT_MODES = {"auto", "all", "off"}
 DOWNLOADS = pathlib.Path.home() / "Downloads"
 
 DEFAULT_SYSTEM = (
-    "You are a concise assistant running locally on the user's Mac. "
-    "Use tools only when the task requires reading/writing files or running "
-    "commands. Save created files in ~/Downloads unless the user gives another "
-    "path. Work in small steps. Keep answers brief and practical."
+    "You are a concise assistant running locally on the user's Mac.\n"
+    "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+    "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
+    "Use tools only when the task requires reading/writing files or running commands.\n"
+    "Save created files in ~/Downloads unless the user gives another path.\n"
+    "Keep replies brief and avoid repeating large imported text unless asked.\n"
+    "Respect local LLM memory limits: summarize when possible, use only relevant imported context, and suggest /clear when old context is no longer needed.\n"
+    "Work in small steps. Be direct, respectful, and practical."
 )
+PRESET_SYSTEMS = {
+    "default": DEFAULT_SYSTEM,
+    "concise": (
+        "You are a concise, efficient assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "Answer with the smallest complete response that solves the request.\n"
+        "For code requests, give the final code block first with at most one short note.\n"
+        "Avoid restating the user's request or repeating large imported text.\n"
+        "Use bullets only when they improve scanning.\n"
+        "Ask a clarifying question only when the missing detail blocks useful work.\n"
+        "Respect local LLM memory limits: use only relevant imported context, summarize instead of quoting, and suggest /clear when old context is no longer needed.\n"
+        "Save created files in ~/Downloads unless the user gives another path.\n"
+        "Be direct, respectful, and practical."
+    ),
+    "code": (
+        "You are a concise coding assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "For code requests, provide runnable code and only the explanation needed to use it.\n"
+        "Prefer simple, efficient standard-library solutions unless a dependency is clearly better.\n"
+        "Mention important assumptions and edge cases briefly.\n"
+        "Respect local LLM memory limits and avoid repeating large context.\n"
+        "Save created files in ~/Downloads unless the user gives another path."
+    ),
+    "docs": (
+        "You are a concise writing assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "Produce clean Markdown suitable for DOCX export.\n"
+        "Use clear headings, short paragraphs, and practical formatting.\n"
+        "Avoid long quoted source text unless the user asks for it.\n"
+        "Respect local LLM memory limits by summarizing imported material.\n"
+        "Save created files in ~/Downloads unless the user gives another path."
+    ),
+}
 
 TOOLS = [
     {"type": "function", "function": {
@@ -64,6 +102,12 @@ TOOLS = [
 HELP = """Commands:
   /paste <file>   inject a file into context (text/md directly; docx/pdf via markitdown)
   /convert MODE   set paste conversion: auto, all, or off
+  /system         show the active dialogue defaults
+  /system save TEXT
+                  save TEXT as the default system instructions for mlxcli/mlxgui
+  /system preset concise|code|docs|default
+                  save a built-in dialogue preset as the default
+  /system default restore the built-in dialogue defaults
   /model          switch models (picker; history kept)
   /models         list models the server offers
   /mem            show RAM status, Metal cap, and top memory users
@@ -90,6 +134,21 @@ def load_cfg():
         except Exception:
             pass
     return url, key
+
+
+def load_system_prompt():
+    try:
+        saved = SYSTEM_PROMPT_PATH.read_text().strip()
+        if saved:
+            return saved
+    except Exception:
+        pass
+    return DEFAULT_SYSTEM
+
+
+def save_system_prompt(text):
+    SYSTEM_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEM_PROMPT_PATH.write_text(text.strip() + "\n")
 
 
 def request(url, key, path, payload=None):
@@ -598,7 +657,7 @@ def trim(messages):
 
 def parse_args(argv):
     model = None
-    system = DEFAULT_SYSTEM
+    system = load_system_prompt()
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
@@ -638,6 +697,47 @@ def main():
         if user == "/clear":
             messages = [{"role": "system", "content": system}]
             print("(history cleared)")
+            continue
+        if user == "/system":
+            print(system)
+            continue
+        if user.startswith("/system save "):
+            content = user[len("/system save "):].strip()
+            if not content:
+                print("usage: /system save TEXT")
+                continue
+            try:
+                save_system_prompt(content)
+            except Exception as e:
+                print(f"[error] could not save system prompt: {e}")
+                continue
+            system = content
+            messages[0] = {"role": "system", "content": system}
+            print(f"(saved dialogue defaults to {SYSTEM_PROMPT_PATH})")
+            continue
+        if user.startswith("/system preset "):
+            preset = user[len("/system preset "):].strip().lower()
+            if preset not in PRESET_SYSTEMS:
+                print("usage: /system preset concise|code|docs|default")
+                continue
+            system = PRESET_SYSTEMS[preset]
+            try:
+                save_system_prompt(system)
+            except Exception as e:
+                print(f"[error] could not save system prompt: {e}")
+                continue
+            messages[0] = {"role": "system", "content": system}
+            print(f"(saved {preset} dialogue preset)")
+            continue
+        if user == "/system default":
+            try:
+                save_system_prompt(DEFAULT_SYSTEM)
+            except Exception as e:
+                print(f"[error] could not restore system prompt: {e}")
+                continue
+            system = DEFAULT_SYSTEM
+            messages[0] = {"role": "system", "content": system}
+            print("(restored built-in dialogue defaults)")
             continue
         if user == "/tokens":
             print_tokens("session", totals["in"], totals["out"])

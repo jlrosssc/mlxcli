@@ -20,6 +20,7 @@ from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
+SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
@@ -27,10 +28,47 @@ CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
 DOWNLOADS = pathlib.Path.home() / "Downloads"
 DEFAULT_SYSTEM = (
-    "You are a concise assistant running locally on the user's Mac. "
-    "Save created files in ~/Downloads unless the user gives another path. "
-    "Keep answers brief and practical."
+    "You are a concise assistant running locally on the user's Mac.\n"
+    "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+    "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
+    "Save created files in ~/Downloads unless the user gives another path.\n"
+    "Keep replies brief and avoid repeating large imported text unless asked.\n"
+    "Respect local LLM memory limits: summarize when possible, use only relevant imported context, and suggest Clear when old context is no longer needed.\n"
+    "Be direct, respectful, and practical."
 )
+PRESET_SYSTEMS = {
+    "Built-in Default": DEFAULT_SYSTEM,
+    "Concise, Efficient Agent Conversation": (
+        "You are a concise, efficient assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "Answer with the smallest complete response that solves the request.\n"
+        "For code requests, give the final code block first with at most one short note.\n"
+        "Avoid restating the user's request or repeating large imported text.\n"
+        "Use bullets only when they improve scanning.\n"
+        "Ask a clarifying question only when the missing detail blocks useful work.\n"
+        "Respect local LLM memory limits: use only relevant imported context, summarize instead of quoting, and suggest Clear when old context is no longer needed.\n"
+        "Save created files in ~/Downloads unless the user gives another path.\n"
+        "Be direct, respectful, and practical."
+    ),
+    "Code-Focused": (
+        "You are a concise coding assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "For code requests, provide runnable code and only the explanation needed to use it.\n"
+        "Prefer simple, efficient standard-library solutions unless a dependency is clearly better.\n"
+        "Mention important assumptions and edge cases briefly.\n"
+        "Respect local LLM memory limits and avoid repeating large context.\n"
+        "Save created files in ~/Downloads unless the user gives another path."
+    ),
+    "Document Drafting": (
+        "You are a concise writing assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "Produce clean Markdown suitable for DOCX export.\n"
+        "Use clear headings, short paragraphs, and practical formatting.\n"
+        "Avoid long quoted source text unless the user asks for it.\n"
+        "Respect local LLM memory limits by summarizing imported material.\n"
+        "Save created files in ~/Downloads unless the user gives another path."
+    ),
+}
 
 
 def load_cfg():
@@ -46,6 +84,21 @@ def load_cfg():
         except Exception:
             pass
     return url, key
+
+
+def load_system_prompt():
+    try:
+        saved = SYSTEM_PROMPT_PATH.read_text().strip()
+        if saved:
+            return saved
+    except Exception:
+        pass
+    return DEFAULT_SYSTEM
+
+
+def save_system_prompt(text):
+    SYSTEM_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEM_PROMPT_PATH.write_text(text.strip() + "\n")
 
 
 def request(url, key, path, payload=None):
@@ -244,7 +297,8 @@ class MlxGui(tk.Tk):
         self.minsize(720, 500)
 
         self.url, self.key = load_cfg()
-        self.messages = [{"role": "system", "content": DEFAULT_SYSTEM}]
+        self.system_prompt = load_system_prompt()
+        self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
         self.events = queue.Queue()
         self.model_var = tk.StringVar()
@@ -286,6 +340,7 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="All", command=self.select_all_chat).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Defaults", command=self.open_dialogue_options).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
         chat_frame = ttk.Frame(self)
@@ -430,6 +485,10 @@ class MlxGui(tk.Tk):
         edit.add_separator()
         edit.add_command(label="Clear Chat", command=self.clear_chat)
         menu.add_cascade(label="Edit", menu=edit)
+        defaults = tk.Menu(menu, tearoff=False)
+        defaults.add_command(label="Dialogue Options...", command=self.open_dialogue_options)
+        defaults.add_command(label="Restore Built-in Dialogue Defaults", command=self.restore_builtin_dialogue_defaults)
+        menu.add_cascade(label="Defaults", menu=defaults)
         self.config(menu=menu)
         self.bind_all("<Command-c>", lambda _event: self.menu_copy())
         self.bind_all("<Command-C>", lambda _event: self.menu_copy())
@@ -547,6 +606,77 @@ class MlxGui(tk.Tk):
         self.stop_working()
         self.destroy()
         return "break"
+
+    def apply_system_prompt(self, text):
+        self.system_prompt = text.strip() or DEFAULT_SYSTEM
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self.system_prompt
+        else:
+            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+
+    def open_dialogue_options(self):
+        win = tk.Toplevel(self)
+        win.title("Dialogue Options")
+        win.geometry("720x460")
+        win.transient(self)
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Default instructions sent at the start of each conversation").pack(anchor="w")
+        preset_row = ttk.Frame(frame)
+        preset_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(preset_row, text="Preset").pack(side="left")
+        preset_var = tk.StringVar(value="Concise, Efficient Agent Conversation")
+        ttk.OptionMenu(
+            preset_row,
+            preset_var,
+            preset_var.get(),
+            *PRESET_SYSTEMS.keys(),
+        ).pack(side="left", padx=(8, 8))
+
+        text = tk.Text(frame, wrap="word", height=16, padx=8, pady=8)
+        text.pack(fill="both", expand=True, pady=(8, 10))
+        text.insert("1.0", self.system_prompt)
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+
+        def save_current():
+            content = text.get("1.0", "end-1c").strip()
+            if not content:
+                messagebox.showinfo("Dialogue Options", "Instructions cannot be empty.")
+                return
+            try:
+                save_system_prompt(content)
+            except Exception as exc:
+                messagebox.showerror("Save failed", str(exc))
+                return
+            self.apply_system_prompt(content)
+            self.status_var.set(f"Saved dialogue defaults to {SYSTEM_PROMPT_PATH}")
+            win.destroy()
+
+        def restore_text():
+            text.delete("1.0", "end")
+            text.insert("1.0", DEFAULT_SYSTEM)
+
+        def apply_preset():
+            text.delete("1.0", "end")
+            text.insert("1.0", PRESET_SYSTEMS[preset_var.get()])
+
+        ttk.Button(buttons, text="Save Default", command=save_current).pack(side="right")
+        ttk.Button(buttons, text="Restore Built-in", command=restore_text).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="Apply Preset", command=apply_preset).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
+        text.focus_set()
+
+    def restore_builtin_dialogue_defaults(self):
+        try:
+            save_system_prompt(DEFAULT_SYSTEM)
+        except Exception as exc:
+            messagebox.showerror("Restore failed", str(exc))
+            return
+        self.apply_system_prompt(DEFAULT_SYSTEM)
+        self.status_var.set("Restored built-in dialogue defaults")
 
     def handle_escape(self, _event=None):
         if self.busy:
@@ -876,7 +1006,7 @@ class MlxGui(tk.Tk):
         self.append(f"\n[exported latest reply to {target}]\n")
 
     def clear_chat(self):
-        self.messages = [{"role": "system", "content": DEFAULT_SYSTEM}]
+        self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
         self.tokens_var.set("tokens: in 0 / out 0")
         self.chat.configure(state="normal")
