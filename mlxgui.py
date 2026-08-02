@@ -252,6 +252,8 @@ class MlxGui(tk.Tk):
         self.last_user_text = ""
         self.current_stream_start = None
         self.current_stream_end = None
+        self.working_started_at = None
+        self.working_after = None
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -430,6 +432,7 @@ class MlxGui(tk.Tk):
         self.bind_all("<Command-A>", lambda _event: self.menu_select_all())
         self.bind_all("<Control-a>", lambda _event: self.menu_select_all())
         self.bind_all("<Control-A>", lambda _event: self.menu_select_all())
+        self.bind_all("<Escape>", lambda _event: self.quit_app())
 
     def focused_text_widget(self):
         widget = self.focus_get()
@@ -471,11 +474,30 @@ class MlxGui(tk.Tk):
         self.events.put(("status", text))
 
     def start_working(self, text="Thinking"):
-        self.working_var.set("Working...")
+        self.working_started_at = time.time()
+        self.update_working_elapsed()
         self.status_var.set(text)
 
     def stop_working(self):
+        if self.working_after is not None:
+            self.after_cancel(self.working_after)
+            self.working_after = None
+        self.working_started_at = None
         self.working_var.set("")
+
+    def update_working_elapsed(self):
+        if not self.busy or self.working_started_at is None:
+            self.working_var.set("")
+            self.working_after = None
+            return
+        elapsed = int(time.time() - self.working_started_at)
+        self.working_var.set(f"Working {elapsed}s")
+        self.working_after = self.after(1000, self.update_working_elapsed)
+
+    def quit_app(self):
+        self.stop_working()
+        self.destroy()
+        return "break"
 
     def append(self, text):
         self.chat.insert("end", text)
