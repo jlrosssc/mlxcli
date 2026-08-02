@@ -32,6 +32,7 @@ OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_TOOL_STEPS = 8
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
+MAX_RESPONSE_TOKENS = 2500
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = {"auto", "all", "off"}
 DOWNLOADS = pathlib.Path.home() / "Downloads"
@@ -79,6 +80,11 @@ PRESET_SYSTEMS = {
         "Save created files in ~/Downloads unless the user gives another path."
     ),
 }
+CODE_REQUEST_SYSTEM = (
+    "This turn is a code/script request. Do not include hidden reasoning, planning, or analysis. "
+    "Start with the final code block. After the code, include only requested output or one short usage note. "
+    "If the user asks to list generated values, list them after the code without explaining your process."
+)
 
 TOOLS = [
     {"type": "function", "function": {
@@ -145,6 +151,29 @@ def load_system_prompt():
     except Exception:
         pass
     return DEFAULT_SYSTEM
+
+
+def is_code_request(text):
+    lowered = text.lower()
+    code_terms = (
+        "script", "code", "program", "python", "bash", "shell", "function",
+        "create a", "write a", "generate a",
+    )
+    return any(term in lowered for term in code_terms)
+
+
+def request_messages_for_turn(messages):
+    user_text = ""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            user_text = message.get("content") or ""
+            break
+    if not is_code_request(user_text):
+        return messages
+    scoped = list(messages)
+    insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+    scoped.insert(insert_at, {"role": "system", "content": CODE_REQUEST_SYSTEM})
+    return scoped
 
 
 def save_system_prompt(text):
@@ -604,8 +633,8 @@ def print_tokens(label, in_tokens, out_tokens):
 
 def stream_once(url, key, model, messages):
     """One streamed request. Returns (content, tool_calls, usage)."""
-    payload = {"model": model, "messages": messages, "tools": TOOLS,
-               "max_tokens": 2000, "stream": True,
+    payload = {"model": model, "messages": request_messages_for_turn(messages), "tools": TOOLS,
+               "max_tokens": MAX_RESPONSE_TOKENS, "stream": True,
                "stream_options": {"include_usage": True}}
     content_parts = []
     calls = {}

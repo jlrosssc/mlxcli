@@ -26,6 +26,7 @@ GUI_DEFAULTS_PATH = pathlib.Path.home() / ".omlx" / "mlxgui_defaults.json"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
+MAX_RESPONSE_TOKENS = 2500
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
 DOWNLOADS = pathlib.Path.home() / "Downloads"
@@ -71,6 +72,11 @@ PRESET_SYSTEMS = {
         "Save created files in ~/Downloads unless the user gives another path."
     ),
 }
+CODE_REQUEST_SYSTEM = (
+    "This turn is a code/script request. Do not include hidden reasoning, planning, or analysis. "
+    "Start with the final code block. After the code, include only requested output or one short usage note. "
+    "If the user asks to list generated values, list them after the code without explaining your process."
+)
 
 
 def load_cfg():
@@ -197,9 +203,25 @@ def usage_counts(usage):
     return int(in_tokens or 0), int(out_tokens or 0)
 
 
-def system_resource_lines():
-    lines = []
+def is_code_request(text):
+    lowered = text.lower()
+    code_terms = (
+        "script", "code", "program", "python", "bash", "shell", "function",
+        "create a", "write a", "generate a",
+    )
+    return any(term in lowered for term in code_terms)
 
+
+def request_messages_for_turn(messages, user_text):
+    if not is_code_request(user_text):
+        return messages
+    scoped = list(messages)
+    insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+    scoped.insert(insert_at, {"role": "system", "content": CODE_REQUEST_SYSTEM})
+    return scoped
+
+
+def system_resource_snapshot():
     def sysctl(name):
         try:
             out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=5)
@@ -207,12 +229,14 @@ def system_resource_lines():
         except Exception:
             return None
 
-    total = sysctl("hw.memsize")
-    cap = sysctl("iogpu.wired_limit_mb")
-    if total:
-        lines.append(f"- Total RAM: {total / 2**30:.1f} GB")
-    if cap:
-        lines.append(f"- Metal cap: {cap / 1024:.1f} GB")
+    snapshot = {
+        "total": sysctl("hw.memsize"),
+        "metal_cap": sysctl("iogpu.wired_limit_mb"),
+        "free": None,
+        "reclaimable": None,
+        "top": [],
+        "errors": [],
+    }
     try:
         vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
         match = re.search(r"page size of (\d+)", vm)
@@ -223,11 +247,10 @@ def system_resource_lines():
             return int(found.group(1)) * page if found else 0
 
         free = pages("Pages free")
-        reclaim = free + pages("Pages inactive") + pages("Pages purgeable")
-        lines.append(f"- Free now: {free / 2**30:.1f} GB")
-        lines.append(f"- Reclaimable: {reclaim / 2**30:.1f} GB")
+        snapshot["free"] = free
+        snapshot["reclaimable"] = free + pages("Pages inactive") + pages("Pages purgeable")
     except Exception as exc:
-        lines.append(f"- vm_stat unavailable: {exc}")
+        snapshot["errors"].append(f"vm_stat unavailable: {exc}")
     try:
         ps = subprocess.run(["ps", "axo", "rss=,comm="], capture_output=True, text=True, timeout=5)
         rows = []
@@ -236,12 +259,9 @@ def system_resource_lines():
             if len(parts) == 2 and parts[0].isdigit():
                 rows.append((int(parts[0]), parts[1]))
         rows.sort(reverse=True)
-        lines.append("")
-        lines.append("Top Memory Users")
-        shown = 0
         for rss, command in rows:
             mb = rss // 1024
-            if mb < 300 or shown >= 10:
+            if mb < 300 or len(snapshot["top"]) >= 10:
                 break
             if ".app/" in command:
                 segment = command.split("/Applications/")[-1]
@@ -249,12 +269,33 @@ def system_resource_lines():
             else:
                 name = command.rsplit("/", 1)[-1]
             tag = " <- oMLX" if "omlx" in command.lower() else ""
-            lines.append(f"- {mb:>6} MB  {name}{tag}")
-            shown += 1
-        if shown == 0:
-            lines.append("- Nothing over 300 MB")
+            snapshot["top"].append((mb, name, tag))
     except Exception as exc:
-        lines.append(f"- ps unavailable: {exc}")
+        snapshot["errors"].append(f"ps unavailable: {exc}")
+    return snapshot
+
+
+def system_resource_lines():
+    lines = []
+    snapshot = system_resource_snapshot()
+    total = snapshot["total"]
+    cap = snapshot["metal_cap"]
+    if total:
+        lines.append(f"- Total RAM: {total / 2**30:.1f} GB")
+    if cap:
+        lines.append(f"- Metal cap: {cap / 1024:.1f} GB")
+    if snapshot["free"] is not None:
+        lines.append(f"- Free now: {snapshot['free'] / 2**30:.1f} GB")
+    if snapshot["reclaimable"] is not None:
+        lines.append(f"- Reclaimable: {snapshot['reclaimable'] / 2**30:.1f} GB")
+    lines.extend(f"- {error}" for error in snapshot["errors"])
+    lines.append("")
+    lines.append("Top Memory Users")
+    if snapshot["top"]:
+        for mb, name, tag in snapshot["top"]:
+            lines.append(f"- {mb:>6} MB  {name}{tag}")
+    else:
+        lines.append("- Nothing over 300 MB")
     return lines
 
 
@@ -388,6 +429,7 @@ class MlxGui(tk.Tk):
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.resource_var = tk.StringVar(value="Context: OK")
+        self.memory_var = tk.StringVar(value="Memory: ...")
         self.working_var = tk.StringVar(value="")
         self.busy = False
         self.last_user_text = ""
@@ -400,6 +442,7 @@ class MlxGui(tk.Tk):
         self.pending_user_index = None
 
         self.build_ui()
+        self.update_memory_indicator()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
         self.after(60, self.drain_events)
 
@@ -417,6 +460,7 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
         ttk.Label(top, textvariable=self.resource_var).pack(side="right", padx=(0, 12))
+        ttk.Label(top, textvariable=self.memory_var).pack(side="right", padx=(0, 12))
 
         chat_frame = ttk.Frame(self)
         chat_frame.pack(fill="both", expand=True, padx=10)
@@ -843,6 +887,7 @@ class MlxGui(tk.Tk):
         buttons.pack(fill="x")
 
         def refresh():
+            self.update_memory_indicator()
             text.configure(state="normal")
             text.delete("1.0", "end")
             text.insert("1.0", self.resource_report())
@@ -917,6 +962,17 @@ class MlxGui(tk.Tk):
 
     def update_resource_indicator(self):
         self.resource_var.set(self.resource_status_text())
+
+    def update_memory_indicator(self):
+        snapshot = system_resource_snapshot()
+        total = snapshot["total"]
+        reclaimable = snapshot["reclaimable"]
+        if not total or reclaimable is None:
+            self.memory_var.set("Memory: unavailable")
+            return
+        used = max(total - reclaimable, 0)
+        used_pct = used / total * 100
+        self.memory_var.set(f"Memory: {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail")
 
     def handle_escape(self, _event=None):
         if self.busy:
@@ -1299,8 +1355,8 @@ class MlxGui(tk.Tk):
     def stream_reply(self, model):
         payload = {
             "model": model,
-            "messages": self.messages,
-            "max_tokens": 2000,
+            "messages": request_messages_for_turn(self.messages, self.last_user_text),
+            "max_tokens": MAX_RESPONSE_TOKENS,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -1380,6 +1436,7 @@ class MlxGui(tk.Tk):
                         f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}"
                     )
                     self.update_resource_indicator()
+                    self.update_memory_indicator()
                     self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}")
                     self.busy = False
                     self.stop_working()
