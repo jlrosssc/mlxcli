@@ -21,8 +21,10 @@ MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
+DOWNLOADS = pathlib.Path.home() / "Downloads"
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac. "
+    "Save created files in ~/Downloads unless the user gives another path. "
     "Keep answers brief and practical."
 )
 
@@ -358,7 +360,10 @@ class MlxGui(tk.Tk):
         self.status("Ready")
 
     def import_files(self):
-        paths = filedialog.askopenfilenames(title="Import one or more files")
+        paths = filedialog.askopenfilenames(
+            title="Import one or more files",
+            initialdir=str(DOWNLOADS),
+        )
         if not paths:
             return
         mode = self.convert_var.get()
@@ -392,7 +397,7 @@ class MlxGui(tk.Tk):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = filedialog.asksaveasfilename(
             title="Export latest model reply",
-            initialdir=str(pathlib.Path.home() / "Downloads"),
+            initialdir=str(DOWNLOADS),
             initialfile=f"mlxgui-reply-{stamp}.docx",
             defaultextension=".docx",
             filetypes=[

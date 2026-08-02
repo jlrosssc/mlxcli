@@ -9,7 +9,7 @@ Usage:
   mlxcli [model] [-p "custom system prompt"]
 
 Commands:
-  /paste <file>  /convert  /model  /models  /mem  /tokens  /save [file]  /clear  /help  /exit
+  /paste <file>  /convert  /model  /models  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
 """
 import difflib
 import json
@@ -21,6 +21,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
+from datetime import datetime
+from xml.sax.saxutils import escape
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 MAX_TOOL_STEPS = 8
@@ -28,11 +31,13 @@ MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = {"auto", "all", "off"}
+DOWNLOADS = pathlib.Path.home() / "Downloads"
 
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac. "
     "Use tools only when the task requires reading/writing files or running "
-    "commands. Work in small steps. Keep answers brief and practical."
+    "commands. Save created files in ~/Downloads unless the user gives another "
+    "path. Work in small steps. Keep answers brief and practical."
 )
 
 TOOLS = [
@@ -61,7 +66,8 @@ HELP = """Commands:
   /models         list models the server offers
   /mem            show RAM status, Metal cap, and top memory users
   /tokens         show running token totals for this mlxcli session
-  /save [file]    save the transcript as markdown (default: ~/mlxcli-<timestamp>.md)
+  /save [file]    save transcript as markdown (default: ~/Downloads/mlxcli-<timestamp>.md)
+  /export [file]  save latest model reply as .docx, .md, or .txt (default: ~/Downloads/mlxcli-reply-<timestamp>.docx)
   /clear          wipe conversation history
   /help           this text
   /exit           quit"""
@@ -177,7 +183,7 @@ def exec_tool(name, args):
     if name == "write_file":
         path = args.get("path", "")
         content = args.get("content", "")
-        target = pathlib.Path(path).expanduser()
+        target = resolve_output_path(path)
         old = ""
         if target.exists():
             try:
@@ -196,9 +202,10 @@ def exec_tool(name, args):
                 print(f"  ... ({len(diff) - 80} more diff lines)")
         else:
             print("  (no textual change)")
-        if not approve(f"write {len(content)} chars to {path}"):
+        if not approve(f"write {len(content)} chars to {target}"):
             return "User declined."
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
             return "Written."
         except Exception as e:
@@ -207,6 +214,113 @@ def exec_tool(name, args):
 
 
 # ---------- commands ----------
+
+def resolve_output_path(raw):
+    p = pathlib.Path(raw).expanduser()
+    if not p.is_absolute():
+        p = DOWNLOADS / p
+    return p
+
+
+def markdown_to_text(markdown):
+    lines = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+        elif stripped.startswith(("- ", "* ")):
+            stripped = "- " + stripped[2:].strip()
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def paragraph_xml(text, style=None):
+    p_pr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+    runs = []
+    for part in text.split("\n"):
+        if runs:
+            runs.append("<w:br/>")
+        runs.append(f"<w:t>{escape(part)}</w:t>")
+    return f"<w:p>{p_pr}<w:r>{''.join(runs)}</w:r></w:p>"
+
+
+def markdown_to_docx(path, title, markdown):
+    body = [paragraph_xml(title, "Title")]
+    body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            body.append(paragraph_xml(""))
+        elif stripped.startswith("### "):
+            body.append(paragraph_xml(stripped[4:], "Heading3"))
+        elif stripped.startswith("## "):
+            body.append(paragraph_xml(stripped[3:], "Heading2"))
+        elif stripped.startswith("# "):
+            body.append(paragraph_xml(stripped[2:], "Heading1"))
+        elif stripped.startswith(("- ", "* ")):
+            body.append(paragraph_xml("- " + stripped[2:]))
+        else:
+            body.append(paragraph_xml(stripped))
+
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {''.join(body)}
+    <w:sectPr>
+      <w:pgSz w:w="12240" w:h="15840"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr>
+    <w:pPr><w:spacing w:after="120" w:line="300" w:lineRule="auto"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Title">
+    <w:name w:val="Title"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="0B2545"/><w:sz w:val="48"/></w:rPr>
+    <w:pPr><w:spacing w:after="200"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="32"/></w:rPr>
+    <w:pPr><w:spacing w:before="360" w:after="200"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="26"/></w:rPr>
+    <w:pPr><w:spacing w:before="280" w:after="140"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="1F4D78"/><w:sz w:val="24"/></w:rPr>
+    <w:pPr><w:spacing w:before="200" w:after="100"/></w:pPr>
+  </w:style>
+</w:styles>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>'''
+    doc_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/_rels/document.xml.rels", doc_rels)
+        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/styles.xml", styles_xml)
 
 def convert_file(path, mode="auto"):
     if mode not in CONVERT_MODES:
@@ -310,10 +424,10 @@ def do_paste(arg, messages, convert_mode):
 def do_save(arg, messages, model):
     raw = arg.strip().strip('"')
     if raw:
-        out = pathlib.Path(raw).expanduser()
+        out = resolve_output_path(raw)
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = pathlib.Path.home() / f"mlxcli-{stamp}.md"
+        out = DOWNLOADS / f"mlxcli-{stamp}.md"
     lines = [f"# mlxcli session — {time.strftime('%Y-%m-%d %H:%M')} — model: {model}\n"]
     for m in messages:
         role = m.get("role")
@@ -323,10 +437,44 @@ def do_save(arg, messages, model):
         title = {"user": "You", "assistant": "Model", "tool": "Tool output"}.get(role, role)
         lines.append(f"## {title}\n\n{content}\n")
     try:
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(lines))
         print(f"(saved transcript to {out})")
     except Exception as e:
         print(f"(couldn't save: {e})")
+
+
+def do_export(arg, messages):
+    content = ""
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and message.get("content"):
+            content = message["content"]
+            break
+    if not content:
+        print("(there is no model reply to export yet)")
+        return
+    raw = arg.strip().strip('"')
+    if raw:
+        out = resolve_output_path(raw)
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        out = DOWNLOADS / f"mlxcli-reply-{stamp}.docx"
+    if not out.suffix:
+        out = out.with_suffix(".docx")
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        suffix = out.suffix.lower()
+        if suffix == ".docx":
+            markdown_to_docx(out, "mlxcli Export", content)
+        elif suffix == ".md":
+            out.write_text(content)
+        elif suffix == ".txt":
+            out.write_text(markdown_to_text(content))
+        else:
+            out.write_text(content)
+        print(f"(exported latest reply to {out})")
+    except Exception as e:
+        print(f"(couldn't export: {e})")
 
 
 def usage_counts(usage):
@@ -512,6 +660,9 @@ def main():
             continue
         if user.startswith("/save"):
             do_save(user[5:], messages, model)
+            continue
+        if user.startswith("/export"):
+            do_export(user[7:], messages)
             continue
         if user.startswith("/paste"):
             do_paste(user[6:], messages, convert_mode)

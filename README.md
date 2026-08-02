@@ -44,10 +44,35 @@ server to come up. It does not launch the companion dashboard viewer.
 /mem            show local memory status and top memory users
 /tokens         show running session token totals
 /save [file]    save the transcript as markdown
+/export [file]  save the latest model reply as .docx, .md, or .txt
 /clear          wipe conversation history
 /help           show command help
 /exit           quit
 ```
+
+## Saving Created Documents
+
+Both `mlxcli` and `mlxgui.py` use `~/Downloads` as the default file location for
+created or exported files.
+
+In the CLI:
+
+```text
+/export
+/export family-guide.docx
+/export notes.md
+/save
+```
+
+`/export` saves the latest model reply. With no filename, it creates a Word
+document named like `~/Downloads/mlxcli-reply-20260801-211500.docx`. Relative
+filenames such as `family-guide.docx` are also saved in `~/Downloads`.
+
+`/save` saves the full transcript as Markdown in `~/Downloads` unless you give a
+full path.
+
+In the GUI, use **Export Reply**. The save dialog starts in `~/Downloads` and can
+write `.docx`, `.md`, or `.txt`.
 
 ## Markdown Import
 
