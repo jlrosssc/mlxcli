@@ -20,6 +20,7 @@ from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
+OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
@@ -74,6 +75,9 @@ def ensure_server(url, key, status):
         return True
     status("Launching oMLX...")
     subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
+    if OMLX_BIN.exists():
+        status("Starting oMLX server...")
+        subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
     for _ in range(30):
         time.sleep(2)
         if server_up(url, key):

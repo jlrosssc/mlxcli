@@ -27,6 +27,7 @@ from xml.sax.saxutils import escape
 from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
+OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_TOOL_STEPS = 8
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
@@ -119,6 +120,9 @@ def ensure_server(url, key):
     r = subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit("Couldn't find the oMLX app in /Applications — start it manually.")
+    if OMLX_BIN.exists():
+        print("Starting oMLX server...")
+        subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
     waited = 0
     while waited < 60:
         time.sleep(2)
