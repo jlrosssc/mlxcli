@@ -29,6 +29,9 @@ MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 MAX_RESPONSE_TOKENS = 2500
 RESOURCE_REFRESH_MS = 5000
+RAG_MAX_FILES = 64
+RAG_MAX_CHUNKS = 4
+RAG_CHUNK_CHARS = 1800
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
 DOWNLOADS = pathlib.Path.home() / "Downloads"
@@ -221,6 +224,82 @@ def request_messages_for_turn(messages, user_text):
     insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
     scoped.insert(insert_at, {"role": "system", "content": CODE_REQUEST_SYSTEM})
     return scoped
+
+
+def rag_candidate_files(folder):
+    root = pathlib.Path(folder).expanduser()
+    if not root.exists() or not root.is_dir():
+        raise RuntimeError(f"RAG folder not found: {root}")
+    files = []
+    for path in sorted(root.rglob("*")):
+        if len(files) >= RAG_MAX_FILES:
+            break
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix.lower() in CONVERTIBLE or path.suffix.lower() in {".md", ".txt", ".csv", ".json"}:
+            files.append(path)
+    return files
+
+
+def rag_text_for_file(path):
+    suffix = path.suffix.lower()
+    mode = "all" if suffix in CONVERTIBLE else "off"
+    text, label = convert_file(path, mode)
+    return text, label
+
+
+def rag_chunks(text, label):
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return []
+    chunks = []
+    start = 0
+    while start < len(compact):
+        end = min(start + RAG_CHUNK_CHARS, len(compact))
+        chunks.append((label, compact[start:end]))
+        start = end
+    return chunks
+
+
+def score_rag_chunk(query, chunk_text):
+    terms = [term for term in re.findall(r"[A-Za-z0-9_]{3,}", query.lower()) if term]
+    if not terms:
+        return 0
+    lowered = chunk_text.lower()
+    return sum(lowered.count(term) for term in terms)
+
+
+def rag_matches_for_query(folder, query):
+    matches = []
+    for path in rag_candidate_files(folder):
+        try:
+            text, label = rag_text_for_file(path)
+        except Exception:
+            continue
+        for chunk_label, chunk_text in rag_chunks(text, label):
+            score = score_rag_chunk(query, chunk_text)
+            if score > 0:
+                matches.append((score, chunk_label, chunk_text))
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[:RAG_MAX_CHUNKS]
+
+
+def request_messages_with_rag(messages, user_text, rag_folder):
+    scoped = request_messages_for_turn(messages, user_text)
+    folder = (rag_folder or "").strip()
+    if not folder:
+        return scoped, None
+    matches = rag_matches_for_query(folder, user_text)
+    if not matches:
+        return scoped, "No matching RAG excerpts were found for this prompt."
+    content_lines = ["Relevant reference excerpts from the chat RAG folder:"]
+    used_labels = []
+    for _score, label, chunk_text in matches:
+        used_labels.append(label)
+        content_lines.append(f"\n[{label}]\n{chunk_text}")
+    insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+    scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
+    return scoped, f"RAG used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}"
 
 
 def system_resource_snapshot():
@@ -1477,9 +1556,16 @@ class MlxGui(tk.Tk):
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
 
     def stream_reply(self, model):
+        request_messages, rag_status = request_messages_with_rag(
+            self.messages,
+            self.last_user_text,
+            self.chat_rag_folder_var.get(),
+        )
+        if rag_status:
+            self.events.put(("status", rag_status))
         payload = {
             "model": model,
-            "messages": request_messages_for_turn(self.messages, self.last_user_text),
+            "messages": request_messages,
             "max_tokens": MAX_RESPONSE_TOKENS,
             "stream": True,
             "stream_options": {"include_usage": True},
