@@ -87,7 +87,8 @@ CODE_REQUEST_SYSTEM = (
 RAG_USE_SYSTEM = (
     "Local reference excerpts from the selected chat RAG folder are included for this turn. "
     "Use those excerpts as your available file context. Do not say you cannot access files or folders directly "
-    "if RAG excerpts are present."
+    "if RAG excerpts are present. Do not ask the user to paste or re-share documents that are already represented "
+    "in the provided RAG excerpts."
 )
 
 
@@ -424,8 +425,11 @@ def request_messages_with_rag(messages, user_text, rag_folder):
     scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
     insert_at += 1
     content_lines.append(
-        "\nUse the provided excerpts to compare the source files that are represented here. "
-        "If the request asks for ranking, rank the represented files directly."
+        "\nTreat the represented files above as the available documents for this turn. "
+        "Use the provided excerpts to compare the source files that are represented here. "
+        "If the request asks for ranking, rank the represented files directly. "
+        "If some files are represented only partially, still analyze and rank the represented set rather than asking "
+        "the user to paste the resumes again."
     )
     scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
     failed_note = ""
