@@ -236,7 +236,6 @@ def system_resource_snapshot():
         "metal_cap": sysctl("iogpu.wired_limit_mb"),
         "free": None,
         "reclaimable": None,
-        "gpu": None,
         "top": [],
         "errors": [],
     }
@@ -291,7 +290,6 @@ def system_resource_lines():
         lines.append(f"- Free now: {snapshot['free'] / 2**30:.1f} GB")
     if snapshot["reclaimable"] is not None:
         lines.append(f"- Reclaimable: {snapshot['reclaimable'] / 2**30:.1f} GB")
-    lines.append(f"- GPU usage: {snapshot['gpu'] if snapshot['gpu'] is not None else 'unavailable without heavier sampling'}")
     lines.extend(f"- {error}" for error in snapshot["errors"])
     lines.append("")
     lines.append("Top Memory Users")
@@ -982,9 +980,8 @@ class MlxGui(tk.Tk):
             return
         used = max(total - reclaimable, 0)
         used_pct = used / total * 100
-        gpu = snapshot["gpu"] if snapshot["gpu"] is not None else "n/a"
         self.memory_var.set(
-            f"Resources: memory {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail | GPU {gpu}"
+            f"Resources: memory {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail"
         )
 
     def start_resource_refresh(self):
