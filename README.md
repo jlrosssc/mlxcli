@@ -115,7 +115,7 @@ pressure becomes a failure.
 
 Use `/resources` for a combined view of retained dialogue turns, last-turn
 tokens, session totals, import caps, practical recommendations, Mac memory,
-Metal cap, and top memory users. In the GUI, use the **Resources** button for
+Metal cap, and top memory users. In the GUI, use **View > Resources...** for
 the same kind of snapshot. The GUI toolbar also shows a small context pressure
 indicator: `Context: OK`, `Context: Growing`, or `Context: Clear Soon`.
 
@@ -126,9 +126,10 @@ indicator: `Context: OK`, `Context: Growing`, or `Context: Clear Soon`.
 avoid hidden reasoning, keep code answers focused on final code, and remind the
 model to respect local memory limits.
 
-In `mlxgui`, open **Defaults > Dialogue Options...** or use the **Defaults**
-button to edit and save those instructions. The dialog includes presets for
-concise agent conversation, code-focused replies, and document drafting.
+In `mlxgui`, use the **Settings** button or **Defaults > Settings...**. The
+Settings window separates saved defaults from current-chat settings. Defaults
+include dialogue presets and import conversion mode. Current-chat settings
+include the RAG folder associated only with that dialogue.
 
 In `mlxcli`:
 
@@ -148,9 +149,8 @@ does not embed a browser and does not use WebKit. It provides model selection,
 streamed replies, token totals, clear, multi-file import, and latest-reply
 export to `.docx`, `.md`, or `.txt`. Every selected file is converted according
 to the active `auto`, `all`, or `off` Markdown mode before the batch is added to
-context. It also includes Dialogue Options for editing the saved default
-instructions used by both the GUI and CLI, plus a Resources snapshot for
-deciding when to clear or end a dialogue.
+context. The main toolbar stays small, while export, copy, resources, defaults,
+and chat-specific RAG folder settings live in menus or the Settings window.
 
 Run it:
 

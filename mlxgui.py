@@ -22,6 +22,7 @@ from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
+GUI_DEFAULTS_PATH = pathlib.Path.home() / ".omlx" / "mlxgui_defaults.json"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
@@ -100,6 +101,22 @@ def load_system_prompt():
 def save_system_prompt(text):
     SYSTEM_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
     SYSTEM_PROMPT_PATH.write_text(text.strip() + "\n")
+
+
+def load_gui_defaults():
+    defaults = {"convert_mode": "auto"}
+    try:
+        saved = json.loads(GUI_DEFAULTS_PATH.read_text())
+        if saved.get("convert_mode") in CONVERT_MODES:
+            defaults["convert_mode"] = saved["convert_mode"]
+    except Exception:
+        pass
+    return defaults
+
+
+def save_gui_defaults(defaults):
+    GUI_DEFAULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GUI_DEFAULTS_PATH.write_text(json.dumps(defaults, indent=2) + "\n")
 
 
 def request(url, key, path, payload=None):
@@ -360,12 +377,14 @@ class MlxGui(tk.Tk):
 
         self.url, self.key = load_cfg()
         self.system_prompt = load_system_prompt()
+        self.gui_defaults = load_gui_defaults()
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.events = queue.Queue()
         self.model_var = tk.StringVar()
-        self.convert_var = tk.StringVar(value="auto")
+        self.convert_var = tk.StringVar(value=self.gui_defaults["convert_mode"])
+        self.chat_rag_folder_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.resource_var = tk.StringVar(value="Context: OK")
@@ -393,19 +412,9 @@ class MlxGui(tk.Tk):
         self.model_box = ttk.Combobox(top, textvariable=self.model_var, state="readonly", width=38)
         self.model_box.pack(side="left", padx=(6, 12))
 
-        ttk.Label(top, text="Imports").pack(side="left")
-        ttk.OptionMenu(top, self.convert_var, self.convert_var.get(), *CONVERT_MODES).pack(
-            side="left", padx=(6, 12)
-        )
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Import", command=self.import_files).pack(side="left")
-        ttk.Button(top, text="Export", command=self.export_reply).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="DOCX", command=self.save_latest_docx).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="All", command=self.select_all_chat).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Copy", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Defaults", command=self.open_dialogue_options).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Resources", command=self.open_resources).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
         ttk.Label(top, textvariable=self.resource_var).pack(side="right", padx=(0, 12))
 
@@ -544,15 +553,27 @@ class MlxGui(tk.Tk):
 
     def build_menu(self):
         menu = tk.Menu(self)
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Import Files...", command=self.import_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export Latest Reply...", command=self.export_reply)
+        file_menu.add_command(label="Save Latest Reply as DOCX", command=self.save_latest_docx)
+        file_menu.add_separator()
+        file_menu.add_command(label="Quit", command=self.quit_app)
+        menu.add_cascade(label="File", menu=file_menu)
         edit = tk.Menu(menu, tearoff=False)
         edit.add_command(label="Copy", accelerator="Cmd+C", command=self.menu_copy)
         edit.add_command(label="Paste", accelerator="Cmd+V", command=self.menu_paste)
         edit.add_command(label="Select All", accelerator="Cmd+A", command=self.menu_select_all)
+        edit.add_command(label="Copy Latest Reply", command=self.copy_latest_reply)
         edit.add_separator()
         edit.add_command(label="Clear Chat", command=self.clear_chat)
         menu.add_cascade(label="Edit", menu=edit)
+        view = tk.Menu(menu, tearoff=False)
+        view.add_command(label="Resources...", command=self.open_resources)
+        menu.add_cascade(label="View", menu=view)
         defaults = tk.Menu(menu, tearoff=False)
-        defaults.add_command(label="Dialogue Options...", command=self.open_dialogue_options)
+        defaults.add_command(label="Settings...", command=self.open_settings)
         defaults.add_command(label="Restore Built-in Dialogue Defaults", command=self.restore_builtin_dialogue_defaults)
         menu.add_cascade(label="Defaults", menu=defaults)
         self.config(menu=menu)
@@ -681,15 +702,26 @@ class MlxGui(tk.Tk):
             self.messages.insert(0, {"role": "system", "content": self.system_prompt})
 
     def open_dialogue_options(self):
+        return self.open_settings()
+
+    def open_settings(self):
         win = tk.Toplevel(self)
-        win.title("Dialogue Options")
-        win.geometry("720x460")
+        win.title("Settings")
+        win.geometry("760x540")
         win.transient(self)
 
         frame = ttk.Frame(win, padding=12)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Default instructions sent at the start of each conversation").pack(anchor="w")
-        preset_row = ttk.Frame(frame)
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill="both", expand=True)
+
+        defaults_tab = ttk.Frame(notebook, padding=10)
+        chat_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(defaults_tab, text="Defaults")
+        notebook.add(chat_tab, text="This Chat")
+
+        ttk.Label(defaults_tab, text="Saved defaults used when mlxgui starts or chat is cleared").pack(anchor="w")
+        preset_row = ttk.Frame(defaults_tab)
         preset_row.pack(fill="x", pady=(8, 0))
         ttk.Label(preset_row, text="Preset").pack(side="left")
         preset_var = tk.StringVar(value="Concise, Efficient Agent Conversation")
@@ -700,12 +732,50 @@ class MlxGui(tk.Tk):
             *PRESET_SYSTEMS.keys(),
         ).pack(side="left", padx=(8, 8))
 
-        text = tk.Text(frame, wrap="word", height=16, padx=8, pady=8)
+        default_convert_var = tk.StringVar(value=self.convert_var.get())
+        ttk.Label(preset_row, text="Import conversion").pack(side="left", padx=(16, 0))
+        ttk.OptionMenu(
+            preset_row,
+            default_convert_var,
+            default_convert_var.get(),
+            *CONVERT_MODES,
+        ).pack(side="left", padx=(8, 0))
+
+        text = tk.Text(defaults_tab, wrap="word", height=16, padx=8, pady=8)
         text.pack(fill="both", expand=True, pady=(8, 10))
         text.insert("1.0", self.system_prompt)
 
-        buttons = ttk.Frame(frame)
+        buttons = ttk.Frame(defaults_tab)
         buttons.pack(fill="x")
+
+        ttk.Label(chat_tab, text="Settings that apply only to the current dialogue").pack(anchor="w")
+        rag_row = ttk.Frame(chat_tab)
+        rag_row.pack(fill="x", pady=(12, 6))
+        ttk.Label(rag_row, text="RAG folder").pack(side="left")
+        rag_entry = ttk.Entry(rag_row, textvariable=self.chat_rag_folder_var)
+        rag_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+
+        def browse_rag_folder():
+            folder = filedialog.askdirectory(title="Select RAG folder", initialdir=str(DOWNLOADS))
+            if folder:
+                self.chat_rag_folder_var.set(folder)
+                self.status_var.set(f"Set chat RAG folder to {folder}")
+
+        def clear_rag_folder():
+            self.chat_rag_folder_var.set("")
+            self.status_var.set("Cleared chat RAG folder")
+
+        ttk.Button(rag_row, text="Browse", command=browse_rag_folder).pack(side="left")
+        ttk.Button(rag_row, text="Clear", command=clear_rag_folder).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            chat_tab,
+            text=(
+                "The RAG folder is intentionally chat-specific. It is not saved as a global default, "
+                "so unrelated chats do not automatically reference the same documents."
+            ),
+            wraplength=680,
+        ).pack(anchor="w", pady=(4, 12))
+        ttk.Button(chat_tab, text="Open Resources", command=self.open_resources).pack(anchor="w")
 
         def save_current():
             content = text.get("1.0", "end-1c").strip()
@@ -717,8 +787,19 @@ class MlxGui(tk.Tk):
             except Exception as exc:
                 messagebox.showerror("Save failed", str(exc))
                 return
+            mode = default_convert_var.get()
+            if mode not in CONVERT_MODES:
+                messagebox.showinfo("Settings", "Choose a valid import conversion mode.")
+                return
+            self.gui_defaults["convert_mode"] = mode
+            try:
+                save_gui_defaults(self.gui_defaults)
+            except Exception as exc:
+                messagebox.showerror("Save failed", str(exc))
+                return
             self.apply_system_prompt(content)
-            self.status_var.set(f"Saved dialogue defaults to {SYSTEM_PROMPT_PATH}")
+            self.convert_var.set(mode)
+            self.status_var.set("Saved default settings")
             win.destroy()
 
         def restore_text():
@@ -778,6 +859,7 @@ class MlxGui(tk.Tk):
             f"- Last turn tokens: in {self.last_turn_tokens['in']:,} / out {self.last_turn_tokens['out']:,}",
             f"- Session tokens: in {self.totals['in']:,} / out {self.totals['out']:,}",
             f"- Imported file cap: {MAX_FILE_CHARS:,} characters per file",
+            f"- RAG folder: {self.chat_rag_folder_var.get() or '(none set for this chat)'}",
             "",
             "Guidance",
             self.resource_guidance(),
@@ -1169,6 +1251,7 @@ class MlxGui(tk.Tk):
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
+        self.chat_rag_folder_var.set("")
         self.tokens_var.set("tokens: in 0 / out 0")
         self.update_resource_indicator()
         self.chat.configure(state="normal")
