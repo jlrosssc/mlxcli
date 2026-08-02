@@ -271,6 +271,7 @@ class MlxGui(tk.Tk):
 
         ttk.Button(top, text="Import Files", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Export Reply", command=self.export_reply).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Select All", command=self.select_all_chat).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Selected", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
@@ -279,6 +280,7 @@ class MlxGui(tk.Tk):
         self.chat = scrolledtext.ScrolledText(self, wrap="word", padx=10, pady=10)
         self.chat.pack(fill="both", expand=True, padx=10)
         self.chat.configure(state="normal", selectbackground="#2f6fed", selectforeground="#ffffff")
+        self.chat.tag_configure("chat_selection", background="#2f6fed", foreground="#ffffff")
         self.chat.bind("<ButtonPress-1>", self.begin_chat_selection)
         self.chat.bind("<B1-Motion>", self.drag_chat_selection)
         self.chat.bind("<ButtonRelease-1>", self.end_chat_selection)
@@ -300,6 +302,10 @@ class MlxGui(tk.Tk):
         self.chat.bind("<Command-C>", self.copy_chat_selection)
         self.chat.bind("<Control-c>", self.copy_chat_selection)
         self.chat.bind("<Control-C>", self.copy_chat_selection)
+        self.chat.bind("<Command-a>", self.select_all_chat)
+        self.chat.bind("<Command-A>", self.select_all_chat)
+        self.chat.bind("<Control-a>", self.select_all_chat)
+        self.chat.bind("<Control-A>", self.select_all_chat)
         self.chat.bind("<<Copy>>", self.copy_chat_selection)
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
@@ -312,7 +318,7 @@ class MlxGui(tk.Tk):
 
     def append(self, text):
         self.chat.insert("end", text)
-        if not self.chat.tag_ranges("sel"):
+        if not self.chat.tag_ranges("chat_selection") and not self.chat.tag_ranges("sel"):
             self.chat.see("end")
 
     def begin_chat_selection(self, event):
@@ -322,6 +328,7 @@ class MlxGui(tk.Tk):
         self.chat_anchor = self.chat.index(f"@{event.x},{event.y}")
         self.chat.mark_set("insert", self.chat_anchor)
         self.chat.tag_remove("sel", "1.0", "end")
+        self.chat.tag_remove("chat_selection", "1.0", "end")
         return "break"
 
     def drag_chat_selection(self, event):
@@ -336,7 +343,13 @@ class MlxGui(tk.Tk):
         x, y = self.chat_pointer
         current = self.chat.index(f"@{x},{y}")
         self.chat.tag_remove("sel", "1.0", "end")
-        self.chat.tag_add("sel", self.chat_anchor, current)
+        self.chat.tag_remove("chat_selection", "1.0", "end")
+        if self.chat.compare(current, "<", self.chat_anchor):
+            start, end = current, self.chat_anchor
+        else:
+            start, end = self.chat_anchor, current
+        self.chat.tag_add("sel", start, end)
+        self.chat.tag_add("chat_selection", start, end)
         self.chat.mark_set("insert", current)
 
     def schedule_chat_selection_scroll(self):
@@ -364,10 +377,27 @@ class MlxGui(tk.Tk):
             self.chat_select_after = None
         return "break"
 
+    def select_all_chat(self, _event=None):
+        self.chat.focus_set()
+        self.chat.tag_remove("sel", "1.0", "end")
+        self.chat.tag_remove("chat_selection", "1.0", "end")
+        self.chat.tag_add("sel", "1.0", "end-1c")
+        self.chat.tag_add("chat_selection", "1.0", "end-1c")
+        self.chat_anchor = "1.0"
+        self.chat.mark_set("insert", "end-1c")
+        self.status_var.set("Selected all chat text")
+        return "break"
+
     def copy_chat_selection(self, _event=None):
-        try:
-            selected = self.chat.get("sel.first", "sel.last")
-        except tk.TclError:
+        ranges = self.chat.tag_ranges("chat_selection")
+        if ranges:
+            selected = self.chat.get(ranges[0], ranges[-1])
+        else:
+            try:
+                selected = self.chat.get("sel.first", "sel.last")
+            except tk.TclError:
+                selected = ""
+        if not selected:
             self.status_var.set("No chat text selected")
             return "break"
         self.clipboard_clear()
