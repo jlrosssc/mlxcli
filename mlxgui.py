@@ -267,13 +267,14 @@ class MlxGui(tk.Tk):
 
         ttk.Button(top, text="Import Files", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Export Reply", command=self.export_reply).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Copy Selected", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
         self.chat = scrolledtext.ScrolledText(self, wrap="word", padx=10, pady=10)
         self.chat.pack(fill="both", expand=True, padx=10)
         self.chat.configure(state="normal")
-        self.chat.bind("<Key>", lambda _event: "break")
         self.chat.bind("<<Paste>>", lambda _event: "break")
         self.chat.bind("<Command-v>", lambda _event: "break")
         self.chat.bind("<Control-v>", lambda _event: "break")
@@ -289,7 +290,9 @@ class MlxGui(tk.Tk):
         self.input.bind("<<Paste>>", self.paste_into_input)
         self.input.bind("<Button-2>", self.paste_into_input)
         self.chat.bind("<Command-c>", self.copy_chat_selection)
+        self.chat.bind("<Command-C>", self.copy_chat_selection)
         self.chat.bind("<Control-c>", self.copy_chat_selection)
+        self.chat.bind("<Control-C>", self.copy_chat_selection)
         self.chat.bind("<<Copy>>", self.copy_chat_selection)
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
@@ -309,9 +312,27 @@ class MlxGui(tk.Tk):
         try:
             selected = self.chat.get("sel.first", "sel.last")
         except tk.TclError:
+            self.status_var.set("No chat text selected")
             return "break"
         self.clipboard_clear()
         self.clipboard_append(selected)
+        self.status_var.set("Copied selected chat text")
+        return "break"
+
+    def latest_reply_text(self):
+        for message in reversed(self.messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                return message["content"]
+        return ""
+
+    def copy_latest_reply(self):
+        content = self.latest_reply_text()
+        if not content:
+            self.status_var.set("No model reply to copy")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.status_var.set("Copied latest reply")
         return "break"
 
     def paste_into_input(self, _event=None):
@@ -370,11 +391,7 @@ class MlxGui(tk.Tk):
         self.status_var.set(f"Imported {len(labels)} file(s)")
 
     def export_reply(self):
-        content = ""
-        for message in reversed(self.messages):
-            if message.get("role") == "assistant" and message.get("content"):
-                content = message["content"]
-                break
+        content = self.latest_reply_text()
         if not content:
             messagebox.showinfo("No reply", "There is no model reply to export yet.")
             return
