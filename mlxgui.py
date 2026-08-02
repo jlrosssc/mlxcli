@@ -265,17 +265,13 @@ class MlxGui(tk.Tk):
         ttk.OptionMenu(top, self.convert_var, self.convert_var.get(), *CONVERT_MODES).pack(
             side="left", padx=(6, 12)
         )
-        ttk.Label(top, text="auto converts Office/PDF; text reads directly").pack(
-            side="left", padx=(0, 12)
-        )
-
-        ttk.Button(top, text="Import Files", command=self.import_files).pack(side="left")
-        ttk.Button(top, text="Export Reply", command=self.export_reply).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Save DOCX", command=self.save_latest_docx).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Select All", command=self.select_all_chat).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Copy Selected", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
+        ttk.Button(top, text="Import", command=self.import_files).pack(side="left")
+        ttk.Button(top, text="Export", command=self.export_reply).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="DOCX", command=self.save_latest_docx).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="All", command=self.select_all_chat).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Copy", command=self.copy_chat_selection).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Copy Reply", command=self.copy_latest_reply).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
         chat_frame = ttk.Frame(self)
@@ -306,6 +302,8 @@ class MlxGui(tk.Tk):
         edit.add_command(label="Copy", accelerator="Cmd+C", command=self.menu_copy)
         edit.add_command(label="Paste", accelerator="Cmd+V", command=self.menu_paste)
         edit.add_command(label="Select All", accelerator="Cmd+A", command=self.menu_select_all)
+        edit.add_separator()
+        edit.add_command(label="Clear Chat", command=self.clear_chat)
         menu.add_cascade(label="Edit", menu=edit)
         self.config(menu=menu)
         self.bind_all("<Command-c>", lambda _event: self.menu_copy())
