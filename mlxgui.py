@@ -32,6 +32,8 @@ RESOURCE_REFRESH_MS = 5000
 RAG_MAX_FILES = 64
 RAG_MAX_CHUNKS = 4
 RAG_CHUNK_CHARS = 1800
+RAG_COMPARE_FILE_LIMIT = 12
+RAG_COMPARE_CHARS = 1200
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
 DOWNLOADS = pathlib.Path.home() / "Downloads"
@@ -179,6 +181,29 @@ def list_models(url, key):
     return [m["id"] for m in data.get("data", [])]
 
 
+def model_tags(model_id):
+    name = model_id.lower()
+    tags = []
+    if "coder" in name or "code" in name:
+        tags.append("Coding")
+    if "gpt-oss" in name or "reason" in name or "r1" in name:
+        tags.append("Reasoning")
+    if "vision" in name or "vl" in name or "llava" in name:
+        tags.append("Vision")
+    if "instruct" in name or "chat" in name or "qwen" in name or "llama" in name or "gemma" in name:
+        tags.append("General")
+    if "creative" in name or "story" in name or "write" in name:
+        tags.append("Creative")
+    if not tags:
+        tags.append("General")
+    # keep order stable, remove duplicates
+    return list(dict.fromkeys(tags))
+
+
+def model_label(model_id):
+    return f"{model_id} [{', '.join(model_tags(model_id))}]"
+
+
 def convert_file(path, mode):
     p = pathlib.Path(path).expanduser()
     should_convert = mode == "all" or (mode == "auto" and p.suffix.lower() in CONVERTIBLE)
@@ -274,6 +299,13 @@ def score_rag_chunk(query, chunk_text):
     return sum(lowered.count(term) for term in terms)
 
 
+def is_compare_all_rag_request(text):
+    lowered = text.lower()
+    compare_terms = ("compare", "rank", "ranking", "strengths", "weaknesses")
+    corpus_terms = ("resume", "resumes", "documents", "candidates", "folder")
+    return any(term in lowered for term in compare_terms) and any(term in lowered for term in corpus_terms)
+
+
 def rag_matches_for_query(folder, query):
     matches = []
     for path in rag_candidate_files(folder):
@@ -304,12 +336,31 @@ def rag_fallback_matches(folder):
     return matches
 
 
+def rag_compare_matches(folder):
+    matches = []
+    for path in rag_candidate_files(folder):
+        try:
+            text, label = rag_text_for_file(path)
+        except Exception:
+            continue
+        chunks = rag_chunks(text, label)
+        if not chunks:
+            continue
+        matches.append((1, chunks[0][0], chunks[0][1][:RAG_COMPARE_CHARS]))
+        if len(matches) >= RAG_COMPARE_FILE_LIMIT:
+            break
+    return matches
+
+
 def request_messages_with_rag(messages, user_text, rag_folder):
     scoped = request_messages_for_turn(messages, user_text)
     folder = (rag_folder or "").strip()
     if not folder:
         return scoped, None
-    matches = rag_matches_for_query(folder, user_text)
+    if is_compare_all_rag_request(user_text):
+        matches = rag_compare_matches(folder)
+    else:
+        matches = rag_matches_for_query(folder, user_text)
     if not matches:
         matches = rag_fallback_matches(folder)
     if not matches:
@@ -322,6 +373,10 @@ def request_messages_with_rag(messages, user_text, rag_folder):
     insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
     scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
     insert_at += 1
+    content_lines.append(
+        "\nUse the provided excerpts to compare the source files that are represented here. "
+        "If the request asks for ranking, rank the represented files directly."
+    )
     scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
     return scoped, f"RAG used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}"
 
@@ -528,6 +583,7 @@ class MlxGui(tk.Tk):
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.events = queue.Queue()
+        self.model_display_to_id = {}
         self.model_var = tk.StringVar()
         self.convert_var = tk.StringVar(value=self.gui_defaults["convert_mode"])
         self.chat_rag_folder_var = tk.StringVar(value="")
@@ -1509,7 +1565,7 @@ class MlxGui(tk.Tk):
             self.chat_rag_folder_var.set(data.get("rag_folder") or "")
             model = data.get("model")
             if model:
-                self.model_var.set(model)
+                self.model_var.set(model_label(model) if self.model_display_to_id else model)
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
             return
@@ -1559,7 +1615,7 @@ class MlxGui(tk.Tk):
         text = self.input.get("1.0", "end-1c").strip()
         if not text:
             return
-        model = self.model_var.get()
+        model = self.selected_model_id()
         if not model:
             messagebox.showinfo("No model", "Wait for models to load first.")
             return
@@ -1635,6 +1691,10 @@ class MlxGui(tk.Tk):
             return
         self.events.put(("done", "".join(parts), usage))
 
+    def selected_model_id(self):
+        selected = self.model_var.get()
+        return self.model_display_to_id.get(selected, selected)
+
     def drain_events(self):
         try:
             while True:
@@ -1646,9 +1706,11 @@ class MlxGui(tk.Tk):
                     self.status_var.set(event[1])
                 elif kind == "models":
                     models = event[1]
-                    self.model_box.configure(values=models)
+                    labels = [model_label(model) for model in models]
+                    self.model_display_to_id = dict(zip(labels, models))
+                    self.model_box.configure(values=labels)
                     if models:
-                        self.model_var.set(models[0])
+                        self.model_var.set(labels[0])
                 elif kind == "done":
                     content, usage = event[1], event[2]
                     self.pending_user_index = None
