@@ -248,6 +248,7 @@ class MlxGui(tk.Tk):
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.busy = False
         self.last_user_text = ""
+        self.reply_boxes = []
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -277,12 +278,22 @@ class MlxGui(tk.Tk):
 
         chat_frame = ttk.Frame(self)
         chat_frame.pack(fill="both", expand=True, padx=10)
+        ttk.Label(chat_frame, text="Conversation").pack(anchor="w")
         self.chat = tk.Text(chat_frame, wrap="word", padx=10, pady=10, undo=True)
         chat_scroll = ttk.Scrollbar(chat_frame, orient="vertical", command=self.chat.yview)
         self.chat.configure(yscrollcommand=chat_scroll.set)
         self.chat.pack(side="left", fill="both", expand=True)
         chat_scroll.pack(side="right", fill="y")
         self.chat.configure(state="normal", selectbackground="#2f6fed", selectforeground="#ffffff")
+        self.chat.tag_configure("user_header", foreground="#0b5cad")
+        self.chat.tag_configure("model_header", foreground="#0a7c4a")
+        self.chat.tag_configure("meta", foreground="#667085")
+
+        self.output_frame = ttk.Frame(self, padding=(10, 8, 10, 0))
+        self.output_frame.pack(fill="x")
+        ttk.Label(self.output_frame, text="Latest Outputs").pack(anchor="w")
+        self.reply_box_container = ttk.Frame(self.output_frame)
+        self.reply_box_container.pack(fill="x")
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -363,6 +374,31 @@ class MlxGui(tk.Tk):
         self.chat.insert("end", text)
         if not self.chat.tag_ranges("sel"):
             self.chat.see("end")
+
+    def append_tagged(self, text, tag):
+        self.chat.insert("end", text, tag)
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+
+    def add_reply_box(self, content):
+        box_frame = ttk.Frame(self.reply_box_container, padding=(0, 4, 0, 0))
+        box_frame.pack(fill="x")
+        buttons = ttk.Frame(box_frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Copy", command=lambda c=content: self.copy_text(c)).pack(side="left")
+        ttk.Button(buttons, text="DOCX", command=lambda c=content: self.save_docx_content(c)).pack(side="left", padx=(6, 0))
+        text = tk.Text(box_frame, height=5, wrap="word", padx=8, pady=6)
+        text.insert("1.0", content)
+        text.pack(fill="x")
+        self.reply_boxes.append(box_frame)
+        while len(self.reply_boxes) > 3:
+            old = self.reply_boxes.pop(0)
+            old.destroy()
+
+    def copy_text(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set(f"Copied {len(text)} chars")
 
     def select_all_chat(self, _event=None):
         self.chat.focus_set()
@@ -582,6 +618,9 @@ class MlxGui(tk.Tk):
         self.tokens_var.set("tokens: in 0 / out 0")
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
+        for box in self.reply_boxes:
+            box.destroy()
+        self.reply_boxes = []
         self.status_var.set("Cleared")
 
     def send(self):
@@ -598,7 +637,9 @@ class MlxGui(tk.Tk):
         self.last_user_text = text
         self.messages.append({"role": "user", "content": text})
         self.messages = trim(self.messages)
-        self.append(f"\nYou: {text}\n\nModel: ")
+        self.append_tagged("\nYou\n", "user_header")
+        self.append(f"{text}\n")
+        self.append_tagged("\nModel\n", "model_header")
         self.busy = True
         self.send_button.configure(state="disabled")
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
@@ -661,6 +702,7 @@ class MlxGui(tk.Tk):
                     content, usage = event[1], event[2]
                     if content:
                         self.messages.append({"role": "assistant", "content": content})
+                        self.add_reply_box(content)
                         if self.autosave_docx_requested():
                             try:
                                 self.save_docx_content(content)
@@ -672,7 +714,7 @@ class MlxGui(tk.Tk):
                     self.tokens_var.set(
                         f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}"
                     )
-                    self.append(f"\n[tokens: in {in_tokens:,} / out {out_tokens:,}]\n")
+                    self.append_tagged(f"\n[tokens: in {in_tokens:,} / out {out_tokens:,}]\n", "meta")
                     self.busy = False
                     self.send_button.configure(state="normal")
                     self.status_var.set("Ready")
