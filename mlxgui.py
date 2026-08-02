@@ -250,6 +250,7 @@ class MlxGui(tk.Tk):
         self.after(60, self.drain_events)
 
     def build_ui(self):
+        self.build_menu()
         top = ttk.Frame(self, padding=(10, 8))
         top.pack(fill="x")
 
@@ -288,26 +289,69 @@ class MlxGui(tk.Tk):
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Return>", self.send_from_keyboard)
         self.input.bind("<Shift-Return>", lambda _event: None)
-        self.input.bind("<Command-v>", self.paste_into_input)
-        self.input.bind("<Command-V>", self.paste_into_input)
-        self.input.bind("<Control-v>", self.paste_into_input)
-        self.input.bind("<Control-V>", self.paste_into_input)
-        self.input.bind("<<Paste>>", self.paste_into_input)
-        self.chat.bind("<Command-c>", self.copy_chat_selection)
-        self.chat.bind("<Command-C>", self.copy_chat_selection)
-        self.chat.bind("<Control-c>", self.copy_chat_selection)
-        self.chat.bind("<Control-C>", self.copy_chat_selection)
-        self.chat.bind("<Command-a>", self.select_all_chat)
-        self.chat.bind("<Command-A>", self.select_all_chat)
-        self.chat.bind("<Control-a>", self.select_all_chat)
-        self.chat.bind("<Control-A>", self.select_all_chat)
-        self.chat.bind("<<Copy>>", self.copy_chat_selection)
         ttk.Button(bottom, text="Paste", command=self.paste_into_input).pack(side="left", padx=(8, 0))
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
 
         status = ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(10, 0, 10, 8))
         status.pack(fill="x")
+
+    def build_menu(self):
+        menu = tk.Menu(self)
+        edit = tk.Menu(menu, tearoff=False)
+        edit.add_command(label="Copy", accelerator="Cmd+C", command=self.menu_copy)
+        edit.add_command(label="Paste", accelerator="Cmd+V", command=self.menu_paste)
+        edit.add_command(label="Select All", accelerator="Cmd+A", command=self.menu_select_all)
+        menu.add_cascade(label="Edit", menu=edit)
+        self.config(menu=menu)
+        self.bind_all("<Command-c>", lambda _event: self.menu_copy())
+        self.bind_all("<Command-C>", lambda _event: self.menu_copy())
+        self.bind_all("<Control-c>", lambda _event: self.menu_copy())
+        self.bind_all("<Control-C>", lambda _event: self.menu_copy())
+        self.bind_all("<Command-v>", lambda _event: self.menu_paste())
+        self.bind_all("<Command-V>", lambda _event: self.menu_paste())
+        self.bind_all("<Control-v>", lambda _event: self.menu_paste())
+        self.bind_all("<Control-V>", lambda _event: self.menu_paste())
+        self.bind_all("<Command-a>", lambda _event: self.menu_select_all())
+        self.bind_all("<Command-A>", lambda _event: self.menu_select_all())
+        self.bind_all("<Control-a>", lambda _event: self.menu_select_all())
+        self.bind_all("<Control-A>", lambda _event: self.menu_select_all())
+
+    def focused_text_widget(self):
+        widget = self.focus_get()
+        return widget if isinstance(widget, tk.Text) else None
+
+    def menu_copy(self):
+        widget = self.focused_text_widget()
+        if widget is self.chat:
+            return self.copy_chat_selection()
+        if widget is self.input:
+            try:
+                selected = self.input.get("sel.first", "sel.last")
+            except tk.TclError:
+                selected = ""
+            if selected:
+                self.clipboard_clear()
+                self.clipboard_append(selected)
+                self.status_var.set("Copied selected input text")
+            return "break"
+        return self.copy_chat_selection()
+
+    def menu_paste(self):
+        widget = self.focused_text_widget()
+        if widget is self.input:
+            return self.paste_into_input()
+        self.input.focus_set()
+        return self.paste_into_input()
+
+    def menu_select_all(self):
+        widget = self.focused_text_widget()
+        if widget is self.input:
+            self.input.tag_add("sel", "1.0", "end-1c")
+            self.input.mark_set("insert", "end-1c")
+            self.status_var.set("Selected all input text")
+            return "break"
+        return self.select_all_chat()
 
     def status(self, text):
         self.events.put(("status", text))
