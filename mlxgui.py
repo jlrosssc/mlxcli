@@ -28,6 +28,7 @@ OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 MAX_RESPONSE_TOKENS = 2500
+RESOURCE_REFRESH_MS = 5000
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
 DOWNLOADS = pathlib.Path.home() / "Downloads"
@@ -235,6 +236,7 @@ def system_resource_snapshot():
         "metal_cap": sysctl("iogpu.wired_limit_mb"),
         "free": None,
         "reclaimable": None,
+        "gpu": None,
         "top": [],
         "errors": [],
     }
@@ -289,6 +291,7 @@ def system_resource_lines():
         lines.append(f"- Free now: {snapshot['free'] / 2**30:.1f} GB")
     if snapshot["reclaimable"] is not None:
         lines.append(f"- Reclaimable: {snapshot['reclaimable'] / 2**30:.1f} GB")
+    lines.append(f"- GPU usage: {snapshot['gpu'] if snapshot['gpu'] is not None else 'unavailable without heavier sampling'}")
     lines.extend(f"- {error}" for error in snapshot["errors"])
     lines.append("")
     lines.append("Top Memory Users")
@@ -438,12 +441,14 @@ class MlxGui(tk.Tk):
         self.current_stream_end = None
         self.working_started_at = None
         self.working_after = None
+        self.resource_after = None
         self.context_widget = None
         self.cancel_requested = False
         self.pending_user_index = None
 
         self.build_ui()
         self.update_memory_indicator()
+        self.start_resource_refresh()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
         self.after(60, self.drain_events)
 
@@ -739,6 +744,7 @@ class MlxGui(tk.Tk):
 
     def quit_app(self):
         self.stop_working()
+        self.stop_resource_refresh()
         self.destroy()
         return "break"
 
@@ -976,7 +982,24 @@ class MlxGui(tk.Tk):
             return
         used = max(total - reclaimable, 0)
         used_pct = used / total * 100
-        self.memory_var.set(f"Resources: memory {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail")
+        gpu = snapshot["gpu"] if snapshot["gpu"] is not None else "n/a"
+        self.memory_var.set(
+            f"Resources: memory {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail | GPU {gpu}"
+        )
+
+    def start_resource_refresh(self):
+        if self.resource_after is None:
+            self.resource_after = self.after(RESOURCE_REFRESH_MS, self.refresh_resources_live)
+
+    def stop_resource_refresh(self):
+        if self.resource_after is not None:
+            self.after_cancel(self.resource_after)
+            self.resource_after = None
+
+    def refresh_resources_live(self):
+        self.resource_after = None
+        self.update_memory_indicator()
+        self.start_resource_refresh()
 
     def handle_escape(self, _event=None):
         if self.busy:

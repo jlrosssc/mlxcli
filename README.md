@@ -118,6 +118,10 @@ tokens, session totals, import caps, practical recommendations, Mac memory,
 Metal cap, and top memory users. In the GUI, use **View > Resources...** for
 the same kind of snapshot. The GUI toolbar also shows a small context pressure
 indicator: `Context: OK`, `Context: Growing`, or `Context: Clear Soon`.
+The bottom GUI status bar refreshes memory availability every few seconds.
+GPU utilization is shown as unavailable unless a lightweight non-privileged
+counter is available; detailed macOS GPU sampling usually requires heavier
+`powermetrics` sampling.
 
 ## Dialogue Defaults
 
