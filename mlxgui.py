@@ -23,6 +23,7 @@ from docx_export import markdown_to_docx as formatted_markdown_to_docx
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
 GUI_DEFAULTS_PATH = pathlib.Path.home() / ".omlx" / "mlxgui_defaults.json"
+SESSIONS_DIR = pathlib.Path.home() / ".omlx" / "sessions"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
@@ -599,6 +600,9 @@ class MlxGui(tk.Tk):
         menu = tk.Menu(self)
         file_menu = tk.Menu(menu, tearoff=False)
         file_menu.add_command(label="Import Files...", command=self.import_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save Dialogue Context...", command=self.save_dialogue_context)
+        file_menu.add_command(label="Load Dialogue Context...", command=self.load_dialogue_context)
         file_menu.add_separator()
         file_menu.add_command(label="Export Latest Reply...", command=self.export_reply)
         file_menu.add_command(label="Save Latest Reply as DOCX", command=self.save_latest_docx)
@@ -1314,6 +1318,106 @@ class MlxGui(tk.Tk):
             return
         self.status_var.set(f"Exported {target.name}")
         self.append(f"\n[exported latest reply to {target}]\n")
+
+    def dialogue_context_data(self):
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "system_prompt": self.system_prompt,
+            "messages": self.messages,
+            "totals": self.totals,
+            "last_turn_tokens": self.last_turn_tokens,
+            "model": self.model_var.get(),
+            "convert_mode": self.convert_var.get(),
+            "rag_folder": self.chat_rag_folder_var.get(),
+        }
+
+    def save_dialogue_context(self):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Save dialogue context",
+            initialdir=str(SESSIONS_DIR),
+            initialfile=f"mlxgui-context-{stamp}.json",
+            defaultextension=".json",
+            filetypes=[("Dialogue context", "*.json")],
+        )
+        if not path:
+            return
+        target = pathlib.Path(path).expanduser()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(self.dialogue_context_data(), indent=2))
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        self.status_var.set(f"Saved dialogue context to {target.name}")
+
+    def load_dialogue_context(self):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = filedialog.askopenfilename(
+            title="Load dialogue context",
+            initialdir=str(SESSIONS_DIR),
+            filetypes=[("Dialogue context", "*.json"), ("JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(pathlib.Path(path).expanduser().read_text())
+            messages = data.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("No saved message context found.")
+            self.system_prompt = data.get("system_prompt") or DEFAULT_SYSTEM
+            self.messages = messages
+            if self.messages[0].get("role") != "system":
+                self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+            else:
+                self.messages[0]["content"] = self.system_prompt
+            totals = data.get("totals") or {}
+            self.totals = {"in": int(totals.get("in") or 0), "out": int(totals.get("out") or 0)}
+            last_turn = data.get("last_turn_tokens") or {}
+            self.last_turn_tokens = {
+                "in": int(last_turn.get("in") or 0),
+                "out": int(last_turn.get("out") or 0),
+            }
+            mode = data.get("convert_mode")
+            if mode in CONVERT_MODES:
+                self.convert_var.set(mode)
+            self.chat_rag_folder_var.set(data.get("rag_folder") or "")
+            model = data.get("model")
+            if model:
+                self.model_var.set(model)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            return
+        self.render_loaded_context()
+        self.tokens_var.set(f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}")
+        self.update_resource_indicator()
+        self.update_memory_indicator()
+        self.current_stream_start = None
+        self.current_stream_end = None
+        self.pending_user_index = None
+        self.cancel_requested = False
+        self.status_var.set(f"Loaded dialogue context from {pathlib.Path(path).name}")
+
+    def render_loaded_context(self):
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        for message in self.messages:
+            role = message.get("role")
+            content = message.get("content") or ""
+            if role == "system" or not content:
+                continue
+            if role == "user":
+                self.append_tagged(f"\n{content}\n", "user_bubble")
+            elif role == "assistant":
+                self.append_tagged("Assistant\n", "assistant_label")
+                start = self.chat.index("end-1c")
+                self.append_model_text(content)
+                end = self.chat.index("end-1c")
+                self.style_assistant_range(start, end)
+            elif role == "tool":
+                self.append_tagged(f"\n[tool]\n{content}\n", "meta")
 
     def clear_chat(self):
         self.messages = [{"role": "system", "content": self.system_prompt}]

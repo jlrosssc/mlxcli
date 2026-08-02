@@ -152,6 +152,11 @@ to the active `auto`, `all`, or `off` Markdown mode before the batch is added to
 context. The main toolbar stays small, while export, copy, resources, defaults,
 and chat-specific RAG folder settings live in menus or the Settings window.
 
+Use **File > Save Dialogue Context...** to save the full active GUI context as
+JSON, including messages, system prompt, token totals, selected model, import
+mode, and the chat-specific RAG folder. Use **File > Load Dialogue Context...**
+to restore it later. The save dialog starts in `~/.omlx/sessions`.
+
 Run it:
 
 ```bash
