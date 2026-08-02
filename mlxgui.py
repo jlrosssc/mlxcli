@@ -82,6 +82,11 @@ CODE_REQUEST_SYSTEM = (
     "Start with the final code block. After the code, include only requested output or one short usage note. "
     "If the user asks to list generated values, list them after the code without explaining your process."
 )
+RAG_USE_SYSTEM = (
+    "Local reference excerpts from the selected chat RAG folder are included for this turn. "
+    "Use those excerpts as your available file context. Do not say you cannot access files or folders directly "
+    "if RAG excerpts are present."
+)
 
 
 def load_cfg():
@@ -284,6 +289,21 @@ def rag_matches_for_query(folder, query):
     return matches[:RAG_MAX_CHUNKS]
 
 
+def rag_fallback_matches(folder):
+    matches = []
+    for path in rag_candidate_files(folder):
+        try:
+            text, label = rag_text_for_file(path)
+        except Exception:
+            continue
+        chunks = rag_chunks(text, label)
+        if chunks:
+            matches.append((1, chunks[0][0], chunks[0][1]))
+        if len(matches) >= RAG_MAX_CHUNKS:
+            break
+    return matches
+
+
 def request_messages_with_rag(messages, user_text, rag_folder):
     scoped = request_messages_for_turn(messages, user_text)
     folder = (rag_folder or "").strip()
@@ -291,13 +311,17 @@ def request_messages_with_rag(messages, user_text, rag_folder):
         return scoped, None
     matches = rag_matches_for_query(folder, user_text)
     if not matches:
-        return scoped, "No matching RAG excerpts were found for this prompt."
+        matches = rag_fallback_matches(folder)
+    if not matches:
+        return scoped, "No usable RAG excerpts were found in the selected folder."
     content_lines = ["Relevant reference excerpts from the chat RAG folder:"]
     used_labels = []
     for _score, label, chunk_text in matches:
         used_labels.append(label)
         content_lines.append(f"\n[{label}]\n{chunk_text}")
     insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+    scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
+    insert_at += 1
     scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
     return scoped, f"RAG used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}"
 
