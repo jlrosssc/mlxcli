@@ -254,6 +254,7 @@ class MlxGui(tk.Tk):
         self.current_stream_end = None
         self.working_started_at = None
         self.working_after = None
+        self.context_widget = None
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -387,6 +388,7 @@ class MlxGui(tk.Tk):
         )
         self.raise_text_selection()
         self.chat.bind("<ButtonRelease-1>", lambda _event: self.raise_text_selection())
+        self.bind_text_context_menu(self.chat)
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -403,6 +405,7 @@ class MlxGui(tk.Tk):
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Return>", self.send_from_keyboard)
         self.input.bind("<Shift-Return>", lambda _event: None)
+        self.bind_text_context_menu(self.input)
         ttk.Button(bottom, text="Paste", command=self.paste_into_input).pack(side="left", padx=(8, 0))
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
@@ -435,6 +438,47 @@ class MlxGui(tk.Tk):
         self.bind_all("<Control-a>", lambda _event: self.menu_select_all())
         self.bind_all("<Control-A>", lambda _event: self.menu_select_all())
         self.bind_all("<Escape>", lambda _event: self.quit_app())
+        self.text_menu = tk.Menu(self, tearoff=False)
+        self.text_menu.add_command(label="Copy", command=self.context_copy)
+        self.text_menu.add_command(label="Paste", command=self.context_paste)
+        self.text_menu.add_command(label="Select All", command=self.context_select_all)
+
+    def bind_text_context_menu(self, widget):
+        widget.bind("<Button-2>", self.show_text_context_menu)
+        widget.bind("<Button-3>", self.show_text_context_menu)
+        widget.bind("<Control-Button-1>", self.show_text_context_menu)
+
+    def show_text_context_menu(self, event):
+        self.context_widget = event.widget
+        event.widget.focus_set()
+        try:
+            self.text_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.text_menu.grab_release()
+        return "break"
+
+    def active_text_widget(self):
+        widget = self.context_widget or self.focused_text_widget()
+        return widget if isinstance(widget, tk.Text) else None
+
+    def context_copy(self):
+        widget = self.active_text_widget()
+        if widget is self.input:
+            return self.copy_input_selection()
+        return self.copy_chat_selection()
+
+    def context_paste(self):
+        widget = self.active_text_widget()
+        if widget is self.input:
+            return self.paste_into_input()
+        self.input.focus_set()
+        return self.paste_into_input()
+
+    def context_select_all(self):
+        widget = self.active_text_widget()
+        if widget is self.input:
+            return self.select_all_input()
+        return self.select_all_chat()
 
     def focused_text_widget(self):
         widget = self.focus_get()
@@ -445,15 +489,7 @@ class MlxGui(tk.Tk):
         if widget is self.chat:
             return self.copy_chat_selection()
         if widget is self.input:
-            try:
-                selected = self.input.get("sel.first", "sel.last")
-            except tk.TclError:
-                selected = ""
-            if selected:
-                self.clipboard_clear()
-                self.clipboard_append(selected)
-                self.status_var.set("Copied selected input text")
-            return "break"
+            return self.copy_input_selection()
         return self.copy_chat_selection()
 
     def menu_paste(self):
@@ -466,10 +502,7 @@ class MlxGui(tk.Tk):
     def menu_select_all(self):
         widget = self.focused_text_widget()
         if widget is self.input:
-            self.input.tag_add("sel", "1.0", "end-1c")
-            self.input.mark_set("insert", "end-1c")
-            self.status_var.set("Selected all input text")
-            return "break"
+            return self.select_all_input()
         return self.select_all_chat()
 
     def status(self, text):
@@ -571,11 +604,34 @@ class MlxGui(tk.Tk):
         self.clipboard_append(text)
         self.status_var.set(f"Copied {len(text)} chars")
 
+    def select_all_input(self, _event=None):
+        self.input.focus_set()
+        self.input.tag_remove("sel", "1.0", "end")
+        self.input.tag_add("sel", "1.0", "end-1c")
+        self.input.mark_set("insert", "end-1c")
+        self.raise_text_selection()
+        self.status_var.set("Selected all input text")
+        return "break"
+
+    def copy_input_selection(self, _event=None):
+        try:
+            selected = self.input.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = ""
+        if not selected:
+            self.status_var.set("No input text selected")
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(selected)
+        self.status_var.set("Copied selected input text")
+        return "break"
+
     def select_all_chat(self, _event=None):
         self.chat.focus_set()
         self.chat.tag_remove("sel", "1.0", "end")
         self.chat.tag_add("sel", "1.0", "end-1c")
         self.chat.mark_set("insert", "end-1c")
+        self.raise_text_selection()
         self.status_var.set("Selected all chat text")
         return "break"
 
