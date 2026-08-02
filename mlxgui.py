@@ -249,7 +249,6 @@ class MlxGui(tk.Tk):
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.busy = False
         self.last_user_text = ""
-        self.reply_boxes = []
         self.current_stream_start = None
 
         self.build_ui()
@@ -322,21 +321,32 @@ class MlxGui(tk.Tk):
         self.chat.tag_configure(
             "assistant_body",
             foreground="#0f0f0f",
+            background="#f7f7f5",
             font=body_font,
-            lmargin1=14,
-            lmargin2=14,
+            lmargin1=24,
+            lmargin2=24,
             rmargin=40,
-            spacing1=3,
-            spacing3=8,
+            spacing1=8,
+            spacing3=10,
         )
         self.chat.tag_configure("meta", foreground="#667085", font=small_font, spacing1=8, spacing3=8)
-        self.chat.tag_configure("code", foreground="#9a3412", background="#f4f4f5", font=code_font)
-
-        self.output_frame = ttk.Frame(self, padding=(10, 8, 10, 0))
-        self.output_frame.pack(fill="x")
-        ttk.Label(self.output_frame, text="Latest Outputs").pack(anchor="w")
-        self.reply_box_container = ttk.Frame(self.output_frame)
-        self.reply_box_container.pack(fill="x")
+        self.chat.tag_configure(
+            "code",
+            foreground="#111827",
+            background="#e9edf3",
+            font=tkfont.Font(family="Menlo", size=13, weight="bold"),
+        )
+        self.chat.tag_configure(
+            "code_block",
+            foreground="#064e3b",
+            background="#eef6ef",
+            font=tkfont.Font(family="Menlo", size=14, weight="bold"),
+            lmargin1=38,
+            lmargin2=38,
+            rmargin=38,
+            spacing1=8,
+            spacing3=8,
+        )
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -434,6 +444,18 @@ class MlxGui(tk.Tk):
     def apply_inline_code_tag(self, start, end):
         text = self.chat.get(start, end)
         offset = 0
+        in_fence = False
+        line_offset = 0
+        for line in text.splitlines(True):
+            stripped = line.strip()
+            line_start = f"{start}+{line_offset}c"
+            line_end = f"{start}+{line_offset + len(line)}c"
+            if stripped.startswith("```"):
+                self.chat.tag_add("code_block", line_start, line_end)
+                in_fence = not in_fence
+            elif in_fence:
+                self.chat.tag_add("code_block", line_start, line_end)
+            line_offset += len(line)
         while True:
             left = text.find("`", offset)
             if left < 0:
@@ -443,29 +465,6 @@ class MlxGui(tk.Tk):
                 break
             self.chat.tag_add("code", f"{start}+{left}c", f"{start}+{right + 1}c")
             offset = right + 1
-
-    def add_reply_box(self, content):
-        box_frame = ttk.Frame(self.reply_box_container, padding=(0, 4, 0, 0))
-        box_frame.pack(fill="x")
-        buttons = ttk.Frame(box_frame)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Copy", command=lambda c=content: self.copy_text(c)).pack(side="left")
-        ttk.Button(buttons, text="DOCX", command=lambda c=content: self.save_docx_content(c)).pack(side="left", padx=(6, 0))
-        text = tk.Text(box_frame, height=5, wrap="word", padx=8, pady=6)
-        text.configure(
-            background="#fbfbfa",
-            borderwidth=1,
-            font=tkfont.Font(family="Helvetica", size=12),
-            relief="solid",
-            selectbackground="#2f6fed",
-            selectforeground="#ffffff",
-        )
-        text.insert("1.0", content)
-        text.pack(fill="x")
-        self.reply_boxes.append(box_frame)
-        while len(self.reply_boxes) > 3:
-            old = self.reply_boxes.pop(0)
-            old.destroy()
 
     def copy_text(self, text):
         self.clipboard_clear()
@@ -690,9 +689,6 @@ class MlxGui(tk.Tk):
         self.tokens_var.set("tokens: in 0 / out 0")
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
-        for box in self.reply_boxes:
-            box.destroy()
-        self.reply_boxes = []
         self.status_var.set("Cleared")
 
     def send(self):
@@ -774,7 +770,6 @@ class MlxGui(tk.Tk):
                     content, usage = event[1], event[2]
                     if content:
                         self.messages.append({"role": "assistant", "content": content})
-                        self.add_reply_box(content)
                         if self.autosave_docx_requested():
                             try:
                                 self.save_docx_content(content)
