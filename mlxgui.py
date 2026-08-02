@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
@@ -450,6 +451,10 @@ class MlxGui(tk.Tk):
         if not text:
             self.status_var.set("Clipboard is empty or unavailable")
             return "break"
+        paths = self.clipboard_file_paths(text)
+        if paths:
+            self.import_paths(paths, source="pasted")
+            return "break"
         try:
             self.input.delete("sel.first", "sel.last")
         except tk.TclError:
@@ -458,6 +463,37 @@ class MlxGui(tk.Tk):
         self.input.see("insert")
         self.status_var.set(f"Pasted {len(text)} chars")
         return "break"
+
+    def clipboard_file_paths(self, text):
+        candidates = []
+        if shutil.which("pbpaste"):
+            try:
+                file_text = subprocess.run(
+                    ["pbpaste", "-Prefer", "file"], capture_output=True, text=True, timeout=2
+                ).stdout
+                candidates.extend(file_text.splitlines())
+            except Exception:
+                pass
+        candidates.extend(text.splitlines())
+        if text.strip().startswith("{") and text.strip().endswith("}"):
+            candidates.extend(part for part in text.strip()[1:-1].split("} {") if part)
+        paths = []
+        for raw in candidates:
+            item = raw.strip().strip('"').strip("'")
+            if not item:
+                continue
+            if item.startswith("file://"):
+                item = urllib.parse.unquote(urllib.parse.urlparse(item).path)
+            p = pathlib.Path(item).expanduser()
+            if p.exists() and p.is_file():
+                paths.append(str(p))
+        deduped = []
+        seen = set()
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                deduped.append(path)
+        return deduped
 
     def send_from_keyboard(self, event):
         if event.state & 0x0001:
@@ -483,6 +519,9 @@ class MlxGui(tk.Tk):
         )
         if not paths:
             return
+        self.import_paths(paths)
+
+    def import_paths(self, paths, source="imported"):
         mode = self.convert_var.get()
         sections = []
         labels = []
@@ -499,7 +538,7 @@ class MlxGui(tk.Tk):
         content = "\n\n---\n\n".join(sections)
         self.messages.append({"role": "user", "content": content})
         self.messages = trim(self.messages)
-        self.append(f"\n[imported {len(labels)} file(s) as {mode}: {', '.join(labels)}]\n")
+        self.append(f"\n[{source} {len(labels)} file(s) as {mode}: {', '.join(labels)}]\n")
         self.status_var.set(f"Imported {len(labels)} file(s)")
 
     def export_reply(self):
