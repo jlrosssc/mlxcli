@@ -10,6 +10,9 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
+import zipfile
+from datetime import datetime
+from xml.sax.saxutils import escape
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
@@ -122,6 +125,107 @@ def trim(messages):
     return messages
 
 
+def markdown_to_text(markdown):
+    lines = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+        elif stripped.startswith(("- ", "* ")):
+            stripped = "- " + stripped[2:].strip()
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def paragraph_xml(text, style=None):
+    p_pr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+    runs = []
+    for part in text.split("\n"):
+        if runs:
+            runs.append("<w:br/>")
+        runs.append(f"<w:t>{escape(part)}</w:t>")
+    return f"<w:p>{p_pr}<w:r>{''.join(runs)}</w:r></w:p>"
+
+
+def markdown_to_docx(path, title, markdown):
+    body = [paragraph_xml(title, "Title")]
+    body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            body.append(paragraph_xml(""))
+        elif stripped.startswith("### "):
+            body.append(paragraph_xml(stripped[4:], "Heading3"))
+        elif stripped.startswith("## "):
+            body.append(paragraph_xml(stripped[3:], "Heading2"))
+        elif stripped.startswith("# "):
+            body.append(paragraph_xml(stripped[2:], "Heading1"))
+        elif stripped.startswith(("- ", "* ")):
+            body.append(paragraph_xml("- " + stripped[2:]))
+        else:
+            body.append(paragraph_xml(stripped))
+
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {''.join(body)}
+    <w:sectPr>
+      <w:pgSz w:w="12240" w:h="15840"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr>
+    <w:pPr><w:spacing w:after="120" w:line="300" w:lineRule="auto"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Title">
+    <w:name w:val="Title"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="0B2545"/><w:sz w:val="48"/></w:rPr>
+    <w:pPr><w:spacing w:after="200"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="32"/></w:rPr>
+    <w:pPr><w:spacing w:before="360" w:after="200"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="26"/></w:rPr>
+    <w:pPr><w:spacing w:before="280" w:after="140"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="1F4D78"/><w:sz w:val="24"/></w:rPr>
+    <w:pPr><w:spacing w:before="200" w:after="100"/></w:pPr>
+  </w:style>
+</w:styles>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>'''
+    doc_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/_rels/document.xml.rels", doc_rels)
+        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/styles.xml", styles_xml)
+
+
 class MlxGui(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -138,6 +242,9 @@ class MlxGui(tk.Tk):
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.busy = False
+        self.selecting_chat = False
+        self.select_scroll_after = None
+        self.select_pointer = (0, 0)
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -160,12 +267,16 @@ class MlxGui(tk.Tk):
         )
 
         ttk.Button(top, text="Import Files", command=self.import_files).pack(side="left")
+        ttk.Button(top, text="Export Reply", command=self.export_reply).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
 
         self.chat = scrolledtext.ScrolledText(self, wrap="word", padx=10, pady=10)
         self.chat.pack(fill="both", expand=True, padx=10)
         self.chat.configure(state="disabled")
+        self.chat.bind("<ButtonPress-1>", self.begin_chat_select)
+        self.chat.bind("<B1-Motion>", self.extend_chat_select)
+        self.chat.bind("<ButtonRelease-1>", self.end_chat_select)
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -186,6 +297,54 @@ class MlxGui(tk.Tk):
         self.chat.insert("end", text)
         self.chat.see("end")
         self.chat.configure(state="disabled")
+
+    def begin_chat_select(self, event):
+        self.selecting_chat = True
+        self.select_pointer = (event.x, event.y)
+        self.chat.configure(state="normal")
+        self.chat.mark_set("select_anchor", f"@{event.x},{event.y}")
+        self.chat.tag_remove("sel", "1.0", "end")
+        self.chat.configure(state="disabled")
+        return "break"
+
+    def extend_chat_select(self, event):
+        self.select_pointer = (event.x, event.y)
+        self.update_chat_selection()
+        self.schedule_chat_autoscroll()
+        return "break"
+
+    def update_chat_selection(self):
+        x, y = self.select_pointer
+        self.chat.configure(state="normal")
+        self.chat.tag_remove("sel", "1.0", "end")
+        self.chat.tag_add("sel", "select_anchor", f"@{x},{y}")
+        self.chat.configure(state="disabled")
+
+    def schedule_chat_autoscroll(self):
+        if self.select_scroll_after is None:
+            self.select_scroll_after = self.after(80, self.chat_autoscroll)
+
+    def chat_autoscroll(self):
+        self.select_scroll_after = None
+        if not self.selecting_chat:
+            return
+        _x, y = self.select_pointer
+        if y < 0:
+            self.chat.yview_scroll(-1, "units")
+            self.update_chat_selection()
+            self.schedule_chat_autoscroll()
+        elif y > self.chat.winfo_height():
+            self.chat.yview_scroll(1, "units")
+            self.update_chat_selection()
+            self.schedule_chat_autoscroll()
+
+    def end_chat_select(self, _event):
+        self.selecting_chat = False
+        if self.select_scroll_after is not None:
+            self.after_cancel(self.select_scroll_after)
+            self.select_scroll_after = None
+        self.chat.configure(state="disabled")
+        return "break"
 
     def start_server_and_models(self):
         if not ensure_server(self.url, self.key, self.status):
@@ -220,6 +379,45 @@ class MlxGui(tk.Tk):
         self.messages = trim(self.messages)
         self.append(f"\n[imported {len(labels)} file(s) as {mode}: {', '.join(labels)}]\n")
         self.status_var.set(f"Imported {len(labels)} file(s)")
+
+    def export_reply(self):
+        content = ""
+        for message in reversed(self.messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                content = message["content"]
+                break
+        if not content:
+            messagebox.showinfo("No reply", "There is no model reply to export yet.")
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Export latest model reply",
+            initialdir=str(pathlib.Path.home() / "Downloads"),
+            initialfile=f"mlxgui-reply-{stamp}.docx",
+            defaultextension=".docx",
+            filetypes=[
+                ("Word document", "*.docx"),
+                ("Markdown", "*.md"),
+                ("Plain text", "*.txt"),
+            ],
+        )
+        if not path:
+            return
+        target = pathlib.Path(path).expanduser()
+        try:
+            if target.suffix.lower() == ".docx":
+                markdown_to_docx(target, "mlxgui Export", content)
+            elif target.suffix.lower() == ".md":
+                target.write_text(content)
+            elif target.suffix.lower() == ".txt":
+                target.write_text(markdown_to_text(content))
+            else:
+                target.write_text(content)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.status_var.set(f"Exported {target.name}")
+        self.append(f"\n[exported latest reply to {target}]\n")
 
     def clear_chat(self):
         self.messages = [{"role": "system", "content": DEFAULT_SYSTEM}]

@@ -91,9 +91,10 @@ pressure becomes a failure.
 
 `mlxgui.py` is a small Tkinter interface for the same local oMLX chat flow. It
 does not embed a browser and does not use WebKit. It provides model selection,
-streamed replies, token totals, clear, and multi-file import. Every selected
-file is converted according to the active `auto`, `all`, or `off` Markdown mode
-before the batch is added to context.
+streamed replies, token totals, clear, multi-file import, and latest-reply
+export to `.docx`, `.md`, or `.txt`. Every selected file is converted according
+to the active `auto`, `all`, or `off` Markdown mode before the batch is added to
+context.
 
 Run it:
 
