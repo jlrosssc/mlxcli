@@ -1150,12 +1150,16 @@ class MlxGui(tk.Tk):
         paths = []
         for raw in candidates:
             item = raw.strip().strip('"').strip("'")
-            if not item:
+            if not self.looks_like_file_path(item):
                 continue
             if item.startswith("file://"):
                 item = urllib.parse.unquote(urllib.parse.urlparse(item).path)
             p = pathlib.Path(item).expanduser()
-            if p.exists() and p.is_file():
+            try:
+                is_file = p.exists() and p.is_file()
+            except OSError:
+                is_file = False
+            if is_file:
                 paths.append(str(p))
         deduped = []
         seen = set()
@@ -1164,6 +1168,14 @@ class MlxGui(tk.Tk):
                 seen.add(path)
                 deduped.append(path)
         return deduped
+
+    def looks_like_file_path(self, item):
+        if not item or len(item) > 1024 or "\n" in item:
+            return False
+        if item.startswith("file://"):
+            return True
+        expanded = item.replace("~", str(pathlib.Path.home()), 1)
+        return expanded.startswith("/") or expanded.startswith("./") or expanded.startswith("../")
 
     def send_from_keyboard(self, event):
         if event.state & 0x0001:
