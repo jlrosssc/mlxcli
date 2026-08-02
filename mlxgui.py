@@ -429,7 +429,7 @@ class MlxGui(tk.Tk):
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
         self.resource_var = tk.StringVar(value="Context: OK")
-        self.memory_var = tk.StringVar(value="Memory: ...")
+        self.memory_var = tk.StringVar(value="Resources: ...")
         self.working_var = tk.StringVar(value="")
         self.busy = False
         self.last_user_text = ""
@@ -460,7 +460,6 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
         ttk.Label(top, textvariable=self.resource_var).pack(side="right", padx=(0, 12))
-        ttk.Label(top, textvariable=self.memory_var).pack(side="right", padx=(0, 12))
 
         chat_frame = ttk.Frame(self)
         chat_frame.pack(fill="both", expand=True, padx=10)
@@ -594,6 +593,7 @@ class MlxGui(tk.Tk):
         status_bar.pack(fill="x")
         ttk.Label(status_bar, textvariable=self.working_var, width=10).pack(side="left")
         ttk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        ttk.Label(status_bar, textvariable=self.memory_var, anchor="e").pack(side="right", padx=(12, 0))
 
     def build_menu(self):
         menu = tk.Menu(self)
@@ -968,11 +968,11 @@ class MlxGui(tk.Tk):
         total = snapshot["total"]
         reclaimable = snapshot["reclaimable"]
         if not total or reclaimable is None:
-            self.memory_var.set("Memory: unavailable")
+            self.memory_var.set("Resources: unavailable")
             return
         used = max(total - reclaimable, 0)
         used_pct = used / total * 100
-        self.memory_var.set(f"Memory: {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail")
+        self.memory_var.set(f"Resources: memory {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail")
 
     def handle_escape(self, _event=None):
         if self.busy:
