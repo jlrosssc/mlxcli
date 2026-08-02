@@ -1662,7 +1662,6 @@ class MlxGui(tk.Tk):
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
-        self.chat_rag_folder_var.set("")
         self.tokens_var.set("tokens: in 0 / out 0")
         self.update_resource_indicator()
         self.chat.configure(state="normal")
