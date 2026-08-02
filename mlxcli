@@ -480,8 +480,28 @@ def do_resources(totals, messages, last_turn):
         print("  guidance: several turns are in context; /clear when this topic is done")
     else:
         print("  guidance: resource use looks reasonable for this dialogue")
+    print("  recommendations:")
+    for recommendation in resource_recommendations(turns, last_turn["in"]):
+        print(f"    - {recommendation}")
     print()
     do_mem()
+
+
+def resource_recommendations(turns, last_in):
+    recommendations = []
+    if last_in >= 12000:
+        recommendations.append("clear now unless the next question needs this full dialogue")
+        recommendations.append("save or export anything important before clearing")
+    elif last_in >= 8000:
+        recommendations.append("finish the current task, then /clear before changing topics")
+        recommendations.append("paste fewer or smaller files, or ask for a summary first")
+    elif turns >= MAX_HISTORY_TURNS - 3:
+        recommendations.append("clear when this topic is done; older turns will soon be trimmed")
+    else:
+        recommendations.append("continue normally")
+    recommendations.append("start a new dialogue for unrelated work")
+    recommendations.append("use /system preset concise for lower-context answers")
+    return recommendations
 
 
 def do_paste(arg, messages, convert_mode):

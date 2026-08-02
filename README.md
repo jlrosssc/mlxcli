@@ -114,8 +114,10 @@ start drifting into large counts as a session ages, use `/clear` before context
 pressure becomes a failure.
 
 Use `/resources` for a combined view of retained dialogue turns, last-turn
-tokens, session totals, import caps, Mac memory, Metal cap, and top memory
-users. In the GUI, use the **Resources** button for the same kind of snapshot.
+tokens, session totals, import caps, practical recommendations, Mac memory,
+Metal cap, and top memory users. In the GUI, use the **Resources** button for
+the same kind of snapshot. The GUI toolbar also shows a small context pressure
+indicator: `Context: OK`, `Context: Growing`, or `Context: Clear Soon`.
 
 ## Dialogue Defaults
 

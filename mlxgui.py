@@ -368,6 +368,7 @@ class MlxGui(tk.Tk):
         self.convert_var = tk.StringVar(value="auto")
         self.status_var = tk.StringVar(value="Starting")
         self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
+        self.resource_var = tk.StringVar(value="Context: OK")
         self.working_var = tk.StringVar(value="")
         self.busy = False
         self.last_user_text = ""
@@ -406,6 +407,7 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="Defaults", command=self.open_dialogue_options).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Resources", command=self.open_resources).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
+        ttk.Label(top, textvariable=self.resource_var).pack(side="right", padx=(0, 12))
 
         chat_frame = ttk.Frame(self)
         chat_frame.pack(fill="both", expand=True, padx=10)
@@ -780,6 +782,9 @@ class MlxGui(tk.Tk):
             "Guidance",
             self.resource_guidance(),
             "",
+            "Recommendations",
+            *self.resource_recommendations(),
+            "",
             "Mac Memory",
         ]
         lines.extend(system_resource_lines())
@@ -800,6 +805,36 @@ class MlxGui(tk.Tk):
         if turns >= MAX_HISTORY_TURNS - 3:
             return "- Several turns are in context. Clear when the current topic is done."
         return "- Resource use looks reasonable for the current dialogue."
+
+    def resource_recommendations(self):
+        last_in = self.last_turn_tokens["in"]
+        turns = self.user_turn_count()
+        recommendations = []
+        if last_in >= 12000:
+            recommendations.append("- Clear now unless the next question needs this full dialogue.")
+            recommendations.append("- Save or export anything important before clearing.")
+        elif last_in >= 8000:
+            recommendations.append("- Finish the current task, then clear before changing topics.")
+            recommendations.append("- Import fewer or smaller files, or ask for a summary first.")
+        elif turns >= MAX_HISTORY_TURNS - 3:
+            recommendations.append("- Clear when this topic is done; older turns will soon be trimmed.")
+        else:
+            recommendations.append("- Continue normally.")
+        recommendations.append("- Start a new dialogue for unrelated work.")
+        recommendations.append("- Use concise dialogue defaults for code or document tasks.")
+        return recommendations
+
+    def resource_status_text(self):
+        last_in = self.last_turn_tokens["in"]
+        turns = self.user_turn_count()
+        if last_in >= 12000:
+            return "Context: Clear Soon"
+        if last_in >= 8000 or turns >= MAX_HISTORY_TURNS - 3:
+            return "Context: Growing"
+        return "Context: OK"
+
+    def update_resource_indicator(self):
+        self.resource_var.set(self.resource_status_text())
 
     def handle_escape(self, _event=None):
         if self.busy:
@@ -829,6 +864,7 @@ class MlxGui(tk.Tk):
         self.current_stream_start = None
         self.current_stream_end = None
         self.append_tagged("\n[stopped - partial reply not kept in context]\n", "meta")
+        self.update_resource_indicator()
         self.status_var.set("Stopped")
 
     def append(self, text):
@@ -1091,6 +1127,7 @@ class MlxGui(tk.Tk):
         self.messages.append({"role": "user", "content": content})
         self.messages = trim(self.messages)
         self.append(f"\n[{source} {len(labels)} file(s) as {mode}: {', '.join(labels)}]\n")
+        self.update_resource_indicator()
         self.status_var.set(f"Imported {len(labels)} file(s)")
 
     def export_reply(self):
@@ -1133,6 +1170,7 @@ class MlxGui(tk.Tk):
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.tokens_var.set("tokens: in 0 / out 0")
+        self.update_resource_indicator()
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
         self.status_var.set("Cleared")
@@ -1153,6 +1191,7 @@ class MlxGui(tk.Tk):
         self.messages = trim(self.messages)
         self.pending_user_index = len(self.messages) - 1
         self.cancel_requested = False
+        self.update_resource_indicator()
         self.append_tagged(f"\n{text}\n", "user_bubble")
         self.append_tagged("Assistant\n", "assistant_label")
         self.current_stream_start = self.chat.index("end-1c")
@@ -1245,6 +1284,7 @@ class MlxGui(tk.Tk):
                     self.tokens_var.set(
                         f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}"
                     )
+                    self.update_resource_indicator()
                     self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}")
                     self.busy = False
                     self.stop_working()
