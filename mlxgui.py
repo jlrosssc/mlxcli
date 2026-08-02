@@ -250,6 +250,7 @@ class MlxGui(tk.Tk):
         self.busy = False
         self.last_user_text = ""
         self.current_stream_start = None
+        self.current_stream_end = None
 
         self.build_ui()
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
@@ -288,7 +289,8 @@ class MlxGui(tk.Tk):
         body_font = tkfont.Font(family="Georgia", size=16)
         label_font = tkfont.Font(family="Helvetica", size=13)
         small_font = tkfont.Font(family="Helvetica", size=11)
-        code_font = tkfont.Font(family="Menlo", size=13)
+        heading_font = tkfont.Font(family="Helvetica", size=19, weight="bold")
+        subheading_font = tkfont.Font(family="Helvetica", size=16, weight="bold")
         self.chat.configure(
             state="normal",
             background="#ffffff",
@@ -331,6 +333,39 @@ class MlxGui(tk.Tk):
         )
         self.chat.tag_configure("meta", foreground="#667085", font=small_font, spacing1=8, spacing3=8)
         self.chat.tag_configure(
+            "heading",
+            foreground="#111111",
+            background="#f7f7f5",
+            font=heading_font,
+            lmargin1=24,
+            lmargin2=24,
+            rmargin=40,
+            spacing1=14,
+            spacing3=8,
+        )
+        self.chat.tag_configure(
+            "subheading",
+            foreground="#252525",
+            background="#f7f7f5",
+            font=subheading_font,
+            lmargin1=24,
+            lmargin2=24,
+            rmargin=40,
+            spacing1=10,
+            spacing3=6,
+        )
+        self.chat.tag_configure(
+            "bullet",
+            foreground="#0f0f0f",
+            background="#f7f7f5",
+            font=body_font,
+            lmargin1=46,
+            lmargin2=66,
+            rmargin=40,
+            spacing1=3,
+            spacing3=5,
+        )
+        self.chat.tag_configure(
             "code",
             foreground="#111827",
             background="#e9edf3",
@@ -351,6 +386,15 @@ class MlxGui(tk.Tk):
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
         self.input = tk.Text(bottom, height=3, wrap="word", undo=True)
+        self.input.configure(
+            background="#fbfbfa",
+            borderwidth=1,
+            padx=10,
+            pady=8,
+            relief="solid",
+            selectbackground="#2f6fed",
+            selectforeground="#ffffff",
+        )
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Return>", self.send_from_keyboard)
         self.input.bind("<Shift-Return>", lambda _event: None)
@@ -437,25 +481,38 @@ class MlxGui(tk.Tk):
         start = self.chat.index("end-1c")
         self.chat.insert("end", text, "assistant_body")
         end = self.chat.index("end-1c")
-        self.apply_inline_code_tag(start, end)
+        self.current_stream_end = end
         if not self.chat.tag_ranges("sel"):
             self.chat.see("end")
 
-    def apply_inline_code_tag(self, start, end):
+    def style_assistant_range(self, start, end):
+        self.apply_markdown_line_tags(start, end)
+        self.apply_inline_code_tag(start, end)
+
+    def apply_markdown_line_tags(self, start, end):
         text = self.chat.get(start, end)
         offset = 0
         in_fence = False
-        line_offset = 0
         for line in text.splitlines(True):
             stripped = line.strip()
-            line_start = f"{start}+{line_offset}c"
-            line_end = f"{start}+{line_offset + len(line)}c"
+            line_start = f"{start}+{offset}c"
+            line_end = f"{start}+{offset + len(line)}c"
             if stripped.startswith("```"):
                 self.chat.tag_add("code_block", line_start, line_end)
                 in_fence = not in_fence
             elif in_fence:
                 self.chat.tag_add("code_block", line_start, line_end)
-            line_offset += len(line)
+            elif stripped.startswith("# "):
+                self.chat.tag_add("heading", line_start, line_end)
+            elif stripped.startswith(("## ", "### ")):
+                self.chat.tag_add("subheading", line_start, line_end)
+            elif stripped.startswith(("- ", "* ")) or (len(stripped) > 3 and stripped[0].isdigit() and stripped[1:3] in (". ", ") ")):
+                self.chat.tag_add("bullet", line_start, line_end)
+            offset += len(line)
+
+    def apply_inline_code_tag(self, start, end):
+        text = self.chat.get(start, end)
+        offset = 0
         while True:
             left = text.find("`", offset)
             if left < 0:
@@ -708,6 +765,7 @@ class MlxGui(tk.Tk):
         self.append_tagged(f"\n{text}\n", "user_bubble")
         self.append_tagged("Assistant\n", "assistant_label")
         self.current_stream_start = self.chat.index("end-1c")
+        self.current_stream_end = self.current_stream_start
         self.busy = True
         self.send_button.configure(state="disabled")
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
@@ -769,6 +827,8 @@ class MlxGui(tk.Tk):
                 elif kind == "done":
                     content, usage = event[1], event[2]
                     if content:
+                        if self.current_stream_start and self.current_stream_end:
+                            self.style_assistant_range(self.current_stream_start, self.current_stream_end)
                         self.messages.append({"role": "assistant", "content": content})
                         if self.autosave_docx_requested():
                             try:
@@ -781,10 +841,11 @@ class MlxGui(tk.Tk):
                     self.tokens_var.set(
                         f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}"
                     )
-                    self.append_tagged(f"\n[tokens: in {in_tokens:,} / out {out_tokens:,}]\n", "meta")
+                    self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}")
                     self.busy = False
                     self.send_button.configure(state="normal")
-                    self.status_var.set("Ready")
+                    self.current_stream_start = None
+                    self.current_stream_end = None
         except queue.Empty:
             pass
         self.after(60, self.drain_events)
