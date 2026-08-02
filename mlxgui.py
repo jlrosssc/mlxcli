@@ -352,23 +352,70 @@ def rag_compare_matches(folder):
     return matches
 
 
+def rag_context_for_query(folder, user_text):
+    files = rag_candidate_files(folder)
+    converted = 0
+    failed = []
+    compare_mode = is_compare_all_rag_request(user_text)
+    scored_matches = []
+    fallback_matches = []
+    file_labels = []
+
+    for path in files:
+        try:
+            text, label = rag_text_for_file(path)
+        except Exception as exc:
+            failed.append(f"{path.name}: {exc}")
+            continue
+        file_labels.append(label)
+        chunks = rag_chunks(text, label)
+        if not chunks:
+            failed.append(f"{path.name}: no usable text extracted")
+            continue
+        converted += 1
+        fallback_matches.append((1, chunks[0][0], chunks[0][1][:RAG_COMPARE_CHARS]))
+        if compare_mode:
+            continue
+        for chunk_label, chunk_text in chunks:
+            score = score_rag_chunk(user_text, chunk_text)
+            if score > 0:
+                scored_matches.append((score, chunk_label, chunk_text))
+
+    if compare_mode:
+        matches = fallback_matches[:RAG_COMPARE_FILE_LIMIT]
+    else:
+        scored_matches.sort(key=lambda item: item[0], reverse=True)
+        matches = scored_matches[:RAG_MAX_CHUNKS] or fallback_matches[:RAG_MAX_CHUNKS]
+
+    return {
+        "folder": pathlib.Path(folder).expanduser(),
+        "candidate_count": len(files),
+        "converted_count": converted,
+        "failed": failed,
+        "file_labels": file_labels,
+        "matches": matches,
+        "compare_mode": compare_mode,
+    }
+
+
 def request_messages_with_rag(messages, user_text, rag_folder):
     scoped = request_messages_for_turn(messages, user_text)
     folder = (rag_folder or "").strip()
     if not folder:
         return scoped, None
-    if is_compare_all_rag_request(user_text):
-        matches = rag_compare_matches(folder)
-    else:
-        matches = rag_matches_for_query(folder, user_text)
-    if not matches:
-        matches = rag_fallback_matches(folder)
+    context = rag_context_for_query(folder, user_text)
+    matches = context["matches"]
     if not matches:
         return scoped, "No usable RAG excerpts were found in the selected folder."
     content_lines = [
-        f"Chat RAG folder: {pathlib.Path(folder).expanduser()}",
+        f"Chat RAG folder: {context['folder']}",
+        f"RAG files found: {context['candidate_count']}",
+        f"RAG files converted successfully: {context['converted_count']}",
         "Relevant reference excerpts from the chat RAG folder:",
     ]
+    if context["file_labels"]:
+        content_lines.append("Files represented in this RAG context:")
+        content_lines.append(", ".join(context["file_labels"]))
     used_labels = []
     for _score, label, chunk_text in matches:
         used_labels.append(label)
@@ -381,7 +428,13 @@ def request_messages_with_rag(messages, user_text, rag_folder):
         "If the request asks for ranking, rank the represented files directly."
     )
     scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
-    return scoped, f"RAG used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}"
+    failed_note = ""
+    if context["failed"]:
+        failed_note = f"; {len(context['failed'])} file(s) failed conversion"
+    return scoped, (
+        f"RAG found {context['candidate_count']} file(s), converted {context['converted_count']}, "
+        f"used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}{failed_note}"
+    )
 
 
 def system_resource_snapshot():
