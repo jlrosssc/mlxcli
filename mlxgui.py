@@ -365,7 +365,10 @@ def request_messages_with_rag(messages, user_text, rag_folder):
         matches = rag_fallback_matches(folder)
     if not matches:
         return scoped, "No usable RAG excerpts were found in the selected folder."
-    content_lines = ["Relevant reference excerpts from the chat RAG folder:"]
+    content_lines = [
+        f"Chat RAG folder: {pathlib.Path(folder).expanduser()}",
+        "Relevant reference excerpts from the chat RAG folder:",
+    ]
     used_labels = []
     for _score, label, chunk_text in matches:
         used_labels.append(label)
