@@ -11,9 +11,13 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import hashlib
+import html
+from html.parser import HTMLParser
 from datetime import datetime
 from xml.sax.saxutils import escape
 from tkinter import filedialog, messagebox, ttk
@@ -33,7 +37,11 @@ RAG_MAX_FILES = 64
 RAG_MAX_CHUNKS = 4
 RAG_CHUNK_CHARS = 1800
 RAG_COMPARE_FILE_LIMIT = 12
-RAG_COMPARE_CHARS = 1200
+RAG_COMPARE_CHARS = 700
+RAG_CACHE_DIRNAME = ".mlxgui_rag_cache"
+RAG_CACHE_INDEX = "index.json"
+URL_MAX_FETCHES = 2
+URL_MAX_CHARS = 12000
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
 DOWNLOADS = pathlib.Path.home() / "Downloads"
@@ -90,6 +98,10 @@ RAG_USE_SYSTEM = (
     "if RAG excerpts are present. Do not ask the user to paste or re-share documents that are already represented "
     "in the provided RAG excerpts."
 )
+URL_USE_SYSTEM = (
+    "Fetched web page content is included for this turn. Use only the retrieved page content for URL summary "
+    "or title requests. If URL retrieval fails, say so explicitly and do not guess."
+)
 
 
 def load_cfg():
@@ -140,7 +152,7 @@ def save_gui_defaults(defaults):
 
 def request(url, key, path, payload=None):
     return urllib.request.Request(
-        url + path,
+        url.rstrip("/") + path,
         data=json.dumps(payload).encode() if payload is not None else None,
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {key}"},
@@ -205,10 +217,175 @@ def model_label(model_id):
     return f"{model_id} [{', '.join(model_tags(model_id))}]"
 
 
+def resolve_model_id(selected, mapping):
+    if selected in mapping:
+        return mapping[selected]
+    known_ids = list(mapping.values())
+    for model_id in known_ids:
+        if selected == model_id or selected.startswith(model_id + " ["):
+            return model_id
+    # Defensive fallback if the visible text was rewritten repeatedly.
+    cleaned = re.sub(r"\s+\[[^\]]+\]\s*$", "", selected).strip()
+    for model_id in known_ids:
+        if cleaned == model_id or cleaned.startswith(model_id + " ["):
+            return model_id
+    return cleaned or selected
+
+
+class HTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_title = False
+        self.skip_depth = 0
+        self.title_parts = []
+        self.text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = True
+        if tag in {"script", "style", "noscript"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = False
+        if tag in {"script", "style", "noscript"} and self.skip_depth:
+            self.skip_depth -= 1
+        if tag in {"p", "div", "section", "article", "li", "br", "h1", "h2", "h3", "h4"}:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        text = html.unescape(data or "")
+        if self.in_title:
+            self.title_parts.append(text)
+        self.text_parts.append(text)
+
+    def title(self):
+        return re.sub(r"\s+", " ", "".join(self.title_parts)).strip()
+
+    def text(self):
+        return re.sub(r"\s+", " ", "".join(self.text_parts)).strip()
+
+
+def detect_urls(text):
+    found = re.findall(r"https?://[^\s)>\"']+", text or "")
+    return list(dict.fromkeys(found))[:URL_MAX_FETCHES]
+
+
+def fetch_url_context_via_safari(url):
+    script = f'''
+set targetUrl to "{url.replace('"', '\\"')}"
+tell application "Safari"
+    activate
+    set newDoc to make new document with properties {{URL:targetUrl}}
+    repeat 60 times
+        delay 0.5
+        try
+            set readyState to do JavaScript "document.readyState" in current tab of newDoc
+            if readyState is "complete" then exit repeat
+        end try
+    end repeat
+    set pageTitle to do JavaScript "document.title || ''" in current tab of newDoc
+    set pageText to do JavaScript "document.body ? document.body.innerText : ''" in current tab of newDoc
+    close newDoc
+    return pageTitle & linefeed & pageText
+end tell
+'''
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "Safari browser fallback failed").strip()
+        raise RuntimeError(detail)
+    output = proc.stdout or ""
+    title, _, text = output.partition("\n")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RuntimeError("Safari browser fallback returned no readable text")
+    return {
+        "url": url,
+        "title": title.strip() or urllib.parse.urlparse(url).netloc,
+        "content_type": "text/html (Safari fallback)",
+        "text": text[:URL_MAX_CHARS],
+    }
+
+
+def fetch_url_context(url):
+    parsed = urllib.parse.urlparse(url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/127.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "text/plain;q=0.8,*/*;q=0.7"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else url,
+    }
+    last_error = None
+    for candidate in [url, url.rstrip("/")]:
+        if not candidate:
+            continue
+        req = urllib.request.Request(candidate, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                raw = resp.read()
+                charset = resp.headers.get_content_charset() or "utf-8"
+            body = raw.decode(charset, errors="replace")
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        status = getattr(last_error, "code", None)
+        if status in {403, 429}:
+            return fetch_url_context_via_safari(url)
+        raise last_error or RuntimeError("Unable to retrieve URL")
+    if "html" in content_type or "<html" in body.lower():
+        parser = HTMLTextExtractor()
+        parser.feed(body)
+        title = parser.title() or urllib.parse.urlparse(url).netloc
+        text = parser.text()
+    elif content_type.startswith("text/"):
+        title = urllib.parse.urlparse(url).path.rsplit("/", 1)[-1] or url
+        text = body
+    else:
+        raise RuntimeError(f"Unsupported content type for lightweight fetch: {content_type or 'unknown'}")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RuntimeError("No readable text found on page")
+    return {
+        "url": url,
+        "title": title,
+        "content_type": content_type or "unknown",
+        "text": text[:URL_MAX_CHARS],
+    }
+
+
 def convert_file(path, mode):
     p = pathlib.Path(path).expanduser()
     should_convert = mode == "all" or (mode == "auto" and p.suffix.lower() in CONVERTIBLE)
     if should_convert:
+        if p.suffix.lower() == ".doc":
+            conv = subprocess.run(
+                ["/usr/bin/textutil", "-convert", "txt", "-stdout", str(p)],
+                capture_output=True,
+                text=True,
+            )
+            if conv.returncode == 0 and conv.stdout.strip():
+                return conv.stdout, f"{p.name} (converted via textutil)"
         markitdown = find_markitdown()
         conv = subprocess.run([markitdown, str(p)], capture_output=True, text=True)
         if conv.returncode != 0 or not conv.stdout.strip():
@@ -265,6 +442,9 @@ def rag_candidate_files(folder):
     for path in sorted(root.rglob("*")):
         if len(files) >= RAG_MAX_FILES:
             break
+        rel_parts = path.relative_to(root).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
         if not path.is_file() or path.name.startswith("."):
             continue
         if path.suffix.lower() in CONVERTIBLE or path.suffix.lower() in {".md", ".txt", ".csv", ".json"}:
@@ -272,11 +452,50 @@ def rag_candidate_files(folder):
     return files
 
 
-def rag_text_for_file(path):
-    suffix = path.suffix.lower()
-    mode = "all" if suffix in CONVERTIBLE else "off"
-    text, label = convert_file(path, mode)
-    return text, label
+def rag_cache_dir(folder):
+    return pathlib.Path(folder).expanduser() / RAG_CACHE_DIRNAME
+
+
+def rag_cache_index_path(folder):
+    return rag_cache_dir(folder) / RAG_CACHE_INDEX
+
+
+def rag_load_cache_index(folder):
+    path = rag_cache_index_path(folder)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rag_save_cache_index(folder, data):
+    cache_dir = rag_cache_dir(folder)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rag_cache_index_path(folder).write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def rag_cache_name(path, folder):
+    root = pathlib.Path(folder).expanduser()
+    rel = path.relative_to(root)
+    digest = hashlib.sha1(str(rel).encode("utf-8")).hexdigest()[:12]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", rel.stem).strip("._") or "document"
+    return f"{stem}-{digest}.md"
+
+
+def extract_candidate_name(text, label):
+    for line in text.splitlines():
+        cleaned = line.strip().strip("*#").strip()
+        if not cleaned:
+            continue
+        if len(cleaned) > 80:
+            continue
+        if any(ch.isdigit() for ch in cleaned):
+            continue
+        return cleaned
+    return pathlib.Path(label).stem
 
 
 def rag_chunks(text, label):
@@ -307,80 +526,110 @@ def is_compare_all_rag_request(text):
     return any(term in lowered for term in compare_terms) and any(term in lowered for term in corpus_terms)
 
 
-def rag_matches_for_query(folder, query):
-    matches = []
-    for path in rag_candidate_files(folder):
-        try:
-            text, label = rag_text_for_file(path)
-        except Exception:
-            continue
-        for chunk_label, chunk_text in rag_chunks(text, label):
-            score = score_rag_chunk(query, chunk_text)
-            if score > 0:
-                matches.append((score, chunk_label, chunk_text))
-    matches.sort(key=lambda item: item[0], reverse=True)
-    return matches[:RAG_MAX_CHUNKS]
+def rag_source_mtime(path):
+    return int(path.stat().st_mtime_ns)
 
 
-def rag_fallback_matches(folder):
-    matches = []
-    for path in rag_candidate_files(folder):
-        try:
-            text, label = rag_text_for_file(path)
-        except Exception:
-            continue
-        chunks = rag_chunks(text, label)
-        if chunks:
-            matches.append((1, chunks[0][0], chunks[0][1]))
-        if len(matches) >= RAG_MAX_CHUNKS:
-            break
-    return matches
+def rag_prepare_file(folder, path, index):
+    root = pathlib.Path(folder).expanduser()
+    rel = str(path.relative_to(root))
+    cache_dir = rag_cache_dir(root)
+    entry = index.get(rel, {})
+    source_mtime = rag_source_mtime(path)
+    cached_name = entry.get("cache_name") or rag_cache_name(path, root)
+    cached_path = cache_dir / cached_name
+    suffix = path.suffix.lower()
+    needs_refresh = (
+        entry.get("source_mtime_ns") != source_mtime
+        or not cached_path.exists()
+        or cached_path.stat().st_size == 0
+    )
+    converted = False
 
+    if suffix in CONVERTIBLE:
+        if needs_refresh:
+            text, _label = convert_file(path, "all")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_path.write_text(text)
+            converted = True
+        else:
+            text = cached_path.read_text(errors="replace")
+    else:
+        text = path.read_text(errors="replace")
+        if needs_refresh:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_path.write_text(text)
 
-def rag_compare_matches(folder):
-    matches = []
-    for path in rag_candidate_files(folder):
-        try:
-            text, label = rag_text_for_file(path)
-        except Exception:
-            continue
-        chunks = rag_chunks(text, label)
-        if not chunks:
-            continue
-        matches.append((1, chunks[0][0], chunks[0][1][:RAG_COMPARE_CHARS]))
-        if len(matches) >= RAG_COMPARE_FILE_LIMIT:
-            break
-    return matches
+    index[rel] = {
+        "cache_name": cached_name,
+        "label": f"{path.name} (cached markdown)",
+        "source_mtime_ns": source_mtime,
+        "cached_at": datetime.now().isoformat(timespec="seconds"),
+        "source_suffix": suffix,
+    }
+    return {
+        "relative_path": rel,
+        "path": path,
+        "text": text,
+        "label": index[rel]["label"],
+        "cache_path": cached_path,
+        "converted": converted,
+    }
 
 
 def rag_context_for_query(folder, user_text):
+    root = pathlib.Path(folder).expanduser()
     files = rag_candidate_files(folder)
+    index = rag_load_cache_index(root)
     converted = 0
+    indexed = 0
     failed = []
     compare_mode = is_compare_all_rag_request(user_text)
     scored_matches = []
     fallback_matches = []
     file_labels = []
+    rebuilt = False
 
     for path in files:
         try:
-            text, label = rag_text_for_file(path)
+            record = rag_prepare_file(root, path, index)
         except Exception as exc:
             failed.append(f"{path.name}: {exc}")
             continue
+        if record["converted"]:
+            converted += 1
+            rebuilt = True
+        indexed += 1
+        text = record["text"]
+        label = record["label"]
         file_labels.append(label)
         chunks = rag_chunks(text, label)
         if not chunks:
             failed.append(f"{path.name}: no usable text extracted")
             continue
-        converted += 1
-        fallback_matches.append((1, chunks[0][0], chunks[0][1][:RAG_COMPARE_CHARS]))
+        candidate_name = extract_candidate_name(text, path.name)
+        fallback_label = f"{candidate_name} | {label}"
+        fallback_matches.append((1, fallback_label, chunks[0][1][:RAG_COMPARE_CHARS]))
         if compare_mode:
             continue
         for chunk_label, chunk_text in chunks:
             score = score_rag_chunk(user_text, chunk_text)
             if score > 0:
                 scored_matches.append((score, chunk_label, chunk_text))
+
+    stale_keys = {str(path.relative_to(root)) for path in files}
+    for rel in list(index):
+        if rel not in stale_keys:
+            cache_name = index.get(rel, {}).get("cache_name")
+            if cache_name:
+                try:
+                    (rag_cache_dir(root) / cache_name).unlink()
+                except FileNotFoundError:
+                    pass
+            del index[rel]
+            rebuilt = True
+    if rebuilt or not rag_cache_index_path(root).exists():
+        rag_save_cache_index(root, index)
 
     if compare_mode:
         matches = fallback_matches[:RAG_COMPARE_FILE_LIMIT]
@@ -389,56 +638,91 @@ def rag_context_for_query(folder, user_text):
         matches = scored_matches[:RAG_MAX_CHUNKS] or fallback_matches[:RAG_MAX_CHUNKS]
 
     return {
-        "folder": pathlib.Path(folder).expanduser(),
+        "folder": root,
         "candidate_count": len(files),
         "converted_count": converted,
+        "indexed_count": indexed,
         "failed": failed,
         "file_labels": file_labels,
         "matches": matches,
         "compare_mode": compare_mode,
+        "cache_dir": rag_cache_dir(root),
     }
 
 
-def request_messages_with_rag(messages, user_text, rag_folder):
+def request_messages_with_context(messages, user_text, rag_folder):
     scoped = request_messages_for_turn(messages, user_text)
+    statuses = []
+    urls = detect_urls(user_text)
+
     folder = (rag_folder or "").strip()
-    if not folder:
-        return scoped, None
-    context = rag_context_for_query(folder, user_text)
-    matches = context["matches"]
-    if not matches:
-        return scoped, "No usable RAG excerpts were found in the selected folder."
-    content_lines = [
-        f"Chat RAG folder: {context['folder']}",
-        f"RAG files found: {context['candidate_count']}",
-        f"RAG files converted successfully: {context['converted_count']}",
-        "Relevant reference excerpts from the chat RAG folder:",
-    ]
-    if context["file_labels"]:
-        content_lines.append("Files represented in this RAG context:")
-        content_lines.append(", ".join(context["file_labels"]))
-    used_labels = []
-    for _score, label, chunk_text in matches:
-        used_labels.append(label)
-        content_lines.append(f"\n[{label}]\n{chunk_text}")
-    insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
-    scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
-    insert_at += 1
-    content_lines.append(
-        "\nTreat the represented files above as the available documents for this turn. "
-        "Use the provided excerpts to compare the source files that are represented here. "
-        "If the request asks for ranking, rank the represented files directly. "
-        "If some files are represented only partially, still analyze and rank the represented set rather than asking "
-        "the user to paste the resumes again."
-    )
-    scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
-    failed_note = ""
-    if context["failed"]:
-        failed_note = f"; {len(context['failed'])} file(s) failed conversion"
-    return scoped, (
-        f"RAG found {context['candidate_count']} file(s), converted {context['converted_count']}, "
-        f"used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}{failed_note}"
-    )
+    if folder:
+        context = rag_context_for_query(folder, user_text)
+        matches = context["matches"]
+        if matches:
+            content_lines = [
+                f"Chat RAG folder: {context['folder']}",
+                f"RAG files found: {context['candidate_count']}",
+                f"RAG files converted this pass: {context['converted_count']}",
+                f"RAG files indexed from cached markdown: {context['indexed_count']}",
+                f"RAG markdown cache: {context['cache_dir']}",
+                "Relevant reference excerpts from the chat RAG folder:",
+            ]
+            if context["file_labels"]:
+                content_lines.append("Files represented in this RAG context:")
+                content_lines.append(", ".join(context["file_labels"]))
+            used_labels = []
+            for _score, label, chunk_text in matches:
+                used_labels.append(label)
+                content_lines.append(f"\n[{label}]\n{chunk_text}")
+            insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+            scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
+            insert_at += 1
+            content_lines.append(
+                "\nTreat the represented files above as the available documents for this turn. "
+                "Use the provided excerpts to compare the source files that are represented here. "
+                "If the request asks for ranking, rank the represented files directly. "
+                "When possible, list every represented candidate by name. "
+                "If some files are represented only partially, still analyze and rank the represented set rather than asking "
+                "the user to paste the resumes again."
+            )
+            scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
+            failed_note = ""
+            if context["failed"]:
+                failed_names = ", ".join(item.split(":", 1)[0] for item in context["failed"][:6])
+                failed_note = f"; {len(context['failed'])} file(s) failed conversion: {failed_names}"
+            statuses.append(
+                f"RAG found {context['candidate_count']} file(s), converted {context['converted_count']}, "
+                f"indexed {context['indexed_count']}, "
+                f"used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}{failed_note}"
+            )
+        else:
+            statuses.append("No usable RAG excerpts were found in the selected folder.")
+
+    if urls:
+        fetched = []
+        for url in urls:
+            try:
+                fetched.append(fetch_url_context(url))
+            except Exception as exc:
+                if not fetched:
+                    return scoped, None, f"Unable to retrieve {url}: {exc}"
+                statuses.append(f"URL fetch skipped {url}: {exc}")
+        if fetched:
+            content_lines = ["Fetched web page content for this turn:"]
+            for item in fetched:
+                content_lines.append(
+                    f"\n[URL]\nTitle: {item['title']}\nURL: {item['url']}\nContent-Type: {item['content_type']}\nExcerpt:\n{item['text']}"
+                )
+            insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+            scoped.insert(insert_at, {"role": "system", "content": URL_USE_SYSTEM})
+            scoped.insert(insert_at + 1, {"role": "system", "content": "\n".join(content_lines)})
+            statuses.append(
+                f"Fetched {len(fetched)} URL(s): {', '.join(item['title'] for item in fetched)}"
+            )
+
+    status_text = " | ".join(statuses) if statuses else None
+    return scoped, status_text, None
 
 
 def system_resource_snapshot():
@@ -678,6 +962,7 @@ class MlxGui(tk.Tk):
         self.model_box = ttk.Combobox(top, textvariable=self.model_var, state="readonly", width=38)
         self.model_box.pack(side="left", padx=(6, 12))
 
+        ttk.Button(top, text="New Chat", command=self.new_chat).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Import", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
@@ -807,10 +1092,7 @@ class MlxGui(tk.Tk):
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Return>", self.send_from_keyboard)
         self.input.bind("<Shift-Return>", lambda _event: None)
-        self.input.bind("<Command-v>", self.paste_into_input)
-        self.input.bind("<Command-V>", self.paste_into_input)
-        self.input.bind("<Control-v>", self.paste_into_input)
-        self.input.bind("<Control-V>", self.paste_into_input)
+        self.input.bind("<<Paste>>", self.paste_into_input)
         self.bind_text_context_menu(self.input)
         ttk.Button(bottom, text="Paste", command=self.paste_into_input).pack(side="left", padx=(8, 0))
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
@@ -826,6 +1108,9 @@ class MlxGui(tk.Tk):
         menu = tk.Menu(self)
         file_menu = tk.Menu(menu, tearoff=False)
         file_menu.add_command(label="Import Files...", command=self.import_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="New Chat", command=self.new_chat)
+        file_menu.add_command(label="Clear Chat", command=self.clear_chat)
         file_menu.add_separator()
         file_menu.add_command(label="Save Dialogue Context...", command=self.save_dialogue_context)
         file_menu.add_command(label="Load Dialogue Context...", command=self.load_dialogue_context)
@@ -1046,6 +1331,18 @@ class MlxGui(tk.Tk):
             ),
             wraplength=680,
         ).pack(anchor="w", pady=(4, 12))
+        ttk.Label(
+            chat_tab,
+            text=(
+                "Original files stay in their original format. mlxgui builds and reuses a hidden "
+                "Markdown cache for retrieval in .mlxgui_rag_cache inside the selected RAG folder."
+            ),
+            wraplength=680,
+        ).pack(anchor="w", pady=(0, 10))
+        rag_actions = ttk.Frame(chat_tab)
+        rag_actions.pack(fill="x", pady=(0, 12))
+        ttk.Button(rag_actions, text="Rebuild RAG Cache", command=self.rebuild_rag_cache).pack(side="left")
+        ttk.Button(rag_actions, text="Clear RAG Cache", command=self.clear_rag_cache).pack(side="left", padx=(8, 0))
         ttk.Button(chat_tab, text="Open Resources", command=self.open_resources).pack(anchor="w")
 
         def save_current():
@@ -1096,6 +1393,37 @@ class MlxGui(tk.Tk):
         self.apply_system_prompt(DEFAULT_SYSTEM)
         self.status_var.set("Restored built-in dialogue defaults")
 
+    def rebuild_rag_cache(self):
+        folder = (self.chat_rag_folder_var.get() or "").strip()
+        if not folder:
+            messagebox.showinfo("RAG cache", "Set a chat RAG folder first.")
+            return
+        try:
+            cache_dir = rag_cache_dir(folder)
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            context = rag_context_for_query(folder, "rebuild rag cache")
+        except Exception as exc:
+            messagebox.showerror("RAG cache", str(exc))
+            return
+        self.status_var.set(
+            f"Rebuilt RAG cache: {context['indexed_count']} file(s) indexed at {context['cache_dir']}"
+        )
+
+    def clear_rag_cache(self):
+        folder = (self.chat_rag_folder_var.get() or "").strip()
+        if not folder:
+            messagebox.showinfo("RAG cache", "Set a chat RAG folder first.")
+            return
+        cache_dir = rag_cache_dir(folder)
+        try:
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+        except Exception as exc:
+            messagebox.showerror("RAG cache", str(exc))
+            return
+        self.status_var.set(f"Cleared RAG cache at {cache_dir}")
+
     def open_resources(self):
         win = tk.Toplevel(self)
         win.title("Resources")
@@ -1132,6 +1460,7 @@ class MlxGui(tk.Tk):
             f"- Session tokens: in {self.totals['in']:,} / out {self.totals['out']:,}",
             f"- Imported file cap: {MAX_FILE_CHARS:,} characters per file",
             f"- RAG folder: {self.chat_rag_folder_var.get() or '(none set for this chat)'}",
+            f"- RAG mode: keep original files, retrieve from cached markdown",
             "",
             "Guidance",
             self.resource_guidance(),
@@ -1658,15 +1987,46 @@ class MlxGui(tk.Tk):
             elif role == "tool":
                 self.append_tagged(f"\n[tool]\n{content}\n", "meta")
 
-    def clear_chat(self):
+    def reset_chat_state(self, keep_rag=True):
+        if not keep_rag:
+            self.chat_rag_folder_var.set("")
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
+        self.last_user_text = ""
+        self.pending_user_index = None
+        self.cancel_requested = False
         self.tokens_var.set("tokens: in 0 / out 0")
         self.update_resource_indicator()
+        self.update_memory_indicator()
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
-        self.status_var.set("Cleared")
+        self.input.delete("1.0", "end")
+        self.current_stream_start = None
+        self.current_stream_end = None
+
+    def new_chat(self):
+        keep_rag = True
+        if self.chat_rag_folder_var.get().strip():
+            keep = messagebox.askyesnocancel(
+                "New Chat",
+                "Keep the current chat RAG folder for the new chat?\n\n"
+                "Yes: start a new chat and keep the RAG folder.\n"
+                "No: start a new chat and clear the RAG folder.\n"
+                "Cancel: stay in the current chat.",
+            )
+            if keep is None:
+                return
+            keep_rag = keep
+        self.reset_chat_state(keep_rag=keep_rag)
+        if keep_rag and self.chat_rag_folder_var.get().strip():
+            self.status_var.set("Started new chat and kept the current RAG folder")
+        else:
+            self.status_var.set("Started new chat")
+
+    def clear_chat(self):
+        self.reset_chat_state(keep_rag=True)
+        self.status_var.set("Cleared current chat")
 
     def send(self):
         if self.busy:
@@ -1695,13 +2055,17 @@ class MlxGui(tk.Tk):
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
 
     def stream_reply(self, model):
-        request_messages, rag_status = request_messages_with_rag(
+        request_messages, context_status, context_error = request_messages_with_context(
             self.messages,
             self.last_user_text,
             self.chat_rag_folder_var.get(),
         )
-        if rag_status:
-            self.events.put(("status", rag_status))
+        if context_status:
+            self.events.put(("status", context_status))
+        if context_error:
+            self.events.put(("append", f"\n[error] {context_error}\n"))
+            self.events.put(("done", "", {}))
+            return
         payload = {
             "model": model,
             "messages": request_messages,
@@ -1741,6 +2105,20 @@ class MlxGui(tk.Tk):
                             return
                         parts.append(piece)
                         self.events.put(("append", piece))
+        except urllib.error.HTTPError as exc:
+            if self.cancel_requested:
+                self.events.put(("canceled", "".join(parts)))
+            else:
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    detail = ""
+                message = f"HTTP {exc.code}: {exc.reason}"
+                if detail:
+                    message += f" - {detail[:400]}"
+                self.events.put(("append", f"\n[error] {message}\n"))
+                self.events.put(("done", "", {}))
+            return
         except Exception as exc:
             if self.cancel_requested:
                 self.events.put(("canceled", "".join(parts)))
@@ -1752,7 +2130,7 @@ class MlxGui(tk.Tk):
 
     def selected_model_id(self):
         selected = self.model_var.get()
-        return self.model_display_to_id.get(selected, selected)
+        return resolve_model_id(selected, self.model_display_to_id)
 
     def drain_events(self):
         try:

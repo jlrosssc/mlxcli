@@ -9,13 +9,18 @@ Usage:
   mlxcli [model] [-p "custom system prompt"]
 
 Commands:
-  /paste <file>  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
+  /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
+  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
 """
 import difflib
+import getpass
 import json
 import os
 import pathlib
 import re
+import select
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -28,12 +33,24 @@ from docx_export import markdown_to_docx as formatted_markdown_to_docx
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
+BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
+TURBO_ROOT = pathlib.Path.home() / "Downloads" / "turbo-fieldfare"
+TURBO_SERVER_BIN = TURBO_ROOT / ".build" / "release" / "TurboFieldfareServer"
+TURBO_MODEL_DIR = TURBO_ROOT / "scratch" / "gemma4.gturbo"
+TURBO_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-server.log"
 MAX_TOOL_STEPS = 8
 MAX_FILE_CHARS = 8000
+MAX_LOADED_CONTEXT_CHARS = 28000
 MAX_HISTORY_TURNS = 12
 MAX_RESPONSE_TOKENS = 2500
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
+SSH_PASSWORD_CACHE = {}
+REVIEWABLE_TEXT = {
+    ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".conf", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".sh",
+    ".zsh", ".bash", ".env", ".xml", ".html", ".css", ".sql", ".csv",
+}
 CONVERT_MODES = {"auto", "all", "off"}
 DOWNLOADS = pathlib.Path.home() / "Downloads"
 
@@ -107,6 +124,36 @@ TOOLS = [
 
 HELP = """Commands:
   /paste <file>   inject a file into context (text/md directly; docx/pdf via markitdown)
+  /review PATH [GLOB]
+                  review a local file, or a folder of local files matching GLOB
+  /resumecompare PATH [JD_FILE]
+                  compare resume files in PATH and rank candidates by seniority/fit
+  /read <file>    load a local file into context so you can ask about it
+  /namefind PATH PATTERN
+                  search filenames under PATH for PATTERN
+  /yamlaudit PATH [GLOB]
+                  audit one YAML file or matching YAML files in a folder
+  /find PATH PATTERN
+                  search local file contents under PATH for PATTERN
+  /ls [path]      list local files/folders at PATH (default: current directory)
+  /gitstatus [path]
+                  show git status for a repo or path inside a repo
+  /gitdiff [path] show git diff for a repo or path inside a repo
+  /sshls USER@HOST:PATH
+                  list a remote directory over SSH
+  /sshread USER@HOST:PATH
+                  load a remote text file into context over SSH
+  /sshfind USER@HOST:PATH PATTERN
+                  search remote text files under PATH for PATTERN over SSH
+  /sshwrite USER@HOST:PATH
+                  write or overwrite a remote file over SSH (content prompted after command)
+  /sshrun USER@HOST COMMAND
+                  run a remote shell command over SSH
+  /agentic        show whether model tool use is enabled
+  /agentic on     enable model-driven tool calls (run/read/write with approvals)
+  /agentic off    disable model-driven tool calls
+  /backend        show active backend
+  /backend NAME   switch backend: omlx or turbofieldfare
   /convert MODE   set paste conversion: auto, all, or off
   /system         show the active dialogue defaults
   /system save TEXT
@@ -116,19 +163,57 @@ HELP = """Commands:
   /system default restore the built-in dialogue defaults
   /model          switch models (picker; history kept)
   /models         list models the server offers
+  /tflog          show the last lines of the TurboFieldfare server log
   /resources      show dialogue pressure, token totals, and Mac memory status
   /mem            show RAM status, Metal cap, and top memory users
+  /where          show current model, modes, and remote context
+  /verbs          show natural-language input/output verbs the router recognizes
   /tokens         show running token totals for this mlxcli session
   /save [file]    save transcript as markdown (default: ~/Downloads/mlxcli-<timestamp>.md)
   /export [file]  save latest model reply as .docx, .md, or .txt (default: ~/Downloads/mlxcli-reply-<timestamp>.docx)
   /clear          wipe conversation history
+  /commands       list slash commands only
   /help           this text
   /exit           quit"""
+
+INPUT_VERBS = (
+    "read", "review", "load", "open", "summarize", "summarise", "analyze", "analyse",
+    "compare", "find", "list", "search", "import", "paste", "inspect", "audit", "check",
+)
+
+OUTPUT_VERBS = (
+    "create", "generate", "make", "write", "build", "draft", "rank", "score", "format",
+    "export", "save", "show",
+)
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare")
 
 
 # ---------- config / server ----------
 
+def load_backend():
+    backend = os.environ.get("MLXCLI_BACKEND", "").strip().lower()
+    if backend in SUPPORTED_BACKENDS:
+        return backend
+    try:
+        saved = BACKEND_PATH.read_text().strip().lower()
+        if saved in SUPPORTED_BACKENDS:
+            return saved
+    except Exception:
+        pass
+    return "omlx"
+
+
+def save_backend(backend):
+    BACKEND_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BACKEND_PATH.write_text(backend.strip().lower() + "\n")
+
+
 def load_cfg():
+    backend = load_backend()
+    if backend == "turbofieldfare":
+        url = os.environ.get("TURBOFIELDFFARE_URL", os.environ.get("TURBOFIELDFARE_URL", os.environ.get("TURBOFIELDFIELDFARE_URL", "http://127.0.0.1:8080")))
+        key = os.environ.get("TURBOFIELDFARE_API_KEY", "")
+        return backend, url, key
     url = os.environ.get("OMLX_URL", "http://localhost:8000")
     key = os.environ.get("OMLX_API_KEY", "")
     if not key and SETTINGS.exists():
@@ -140,7 +225,7 @@ def load_cfg():
                 url = f"http://localhost:{port}"
         except Exception:
             pass
-    return url, key
+    return backend, url, key
 
 
 def load_system_prompt():
@@ -176,17 +261,55 @@ def request_messages_for_turn(messages):
     return scoped
 
 
+def collapse_system_messages(messages):
+    system_parts = []
+    rest = []
+    for message in messages:
+        if message.get("role") == "system":
+            content = (message.get("content") or "").strip()
+            if content:
+                system_parts.append(content)
+        else:
+            rest.append(message)
+    if not system_parts:
+        return rest
+    merged = [{"role": "system", "content": "\n\n".join(system_parts)}]
+    merged.extend(rest)
+    return merged
+
+
+def request_messages_for_mode(messages, agentic_mode, backend):
+    scoped = list(request_messages_for_turn(messages))
+    insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+    if agentic_mode:
+        scoped.insert(insert_at, {"role": "system", "content": (
+            "Agentic mode is enabled. When the user asks about local files, remote files, directories, repos, "
+            "or shell-accessible information, prefer using available tools instead of only describing what they "
+            "could run. Keep tool use minimal, explicit, and relevant. Favor acting over explaining when the task "
+            "is concrete and tool-accessible."
+        )})
+    else:
+        scoped.insert(insert_at, {"role": "system", "content": (
+            "Agentic mode is disabled. Do not attempt tool use; answer only from the provided conversation context."
+        )})
+    if backend == "turbofieldfare":
+        scoped = collapse_system_messages(scoped)
+    return scoped
+
+
 def save_system_prompt(text):
     SYSTEM_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
     SYSTEM_PROMPT_PATH.write_text(text.strip() + "\n")
 
 
 def request(url, key, path, payload=None):
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     return urllib.request.Request(
         url + path,
         data=json.dumps(payload).encode() if payload is not None else None,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {key}"})
+        headers=headers)
 
 
 def api(url, key, path, payload=None):
@@ -202,50 +325,119 @@ def server_up(url, key):
         return False
 
 
-def ensure_server(url, key):
+def ensure_server(backend, url, key):
     if server_up(url, key):
         return
-    print("oMLX not running — launching it...")
-    r = subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
-    if r.returncode != 0:
-        sys.exit("Couldn't find the oMLX app in /Applications — start it manually.")
-    if OMLX_BIN.exists():
-        print("Starting oMLX server...")
-        subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
+    if backend == "turbofieldfare":
+        if not TURBO_SERVER_BIN.exists():
+            sys.exit(f"TurboFieldfare server not found at {TURBO_SERVER_BIN} — build TurboFieldfare first.")
+        if not TURBO_MODEL_DIR.exists():
+            sys.exit(f"TurboFieldfare model not found at {TURBO_MODEL_DIR} — install the model in the TurboFieldfare app first.")
+        print("TurboFieldfare server not running — launching it...")
+        TURBO_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(TURBO_SERVER_LOG, "a")
+        log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
+        log_handle.flush()
+        subprocess.Popen(
+            [str(TURBO_SERVER_BIN), "--model", str(TURBO_MODEL_DIR)],
+            cwd=TURBO_ROOT,
+            stdout=log_handle,
+            stderr=log_handle,
+        )
+    else:
+        print("oMLX not running — launching it...")
+        r = subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit("Couldn't find the oMLX app in /Applications — start it manually.")
+        if OMLX_BIN.exists():
+            print("Starting oMLX server...")
+            subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
     waited = 0
     while waited < 60:
         time.sleep(2)
         waited += 2
         if server_up(url, key):
-            print("oMLX is up.")
+            print(f"{'TurboFieldfare' if backend == 'turbofieldfare' else 'oMLX'} is up.")
             return
+    if backend == "turbofieldfare":
+        sys.exit("TurboFieldfare server did not come up in 60s — check the app/model install.")
     sys.exit("oMLX launched but the server didn't come up in 60s — check the menu bar icon.")
 
 
-def list_models(url, key):
+def list_models(backend, url, key):
     try:
         data = api(url, key, "/v1/models")
     except Exception as e:
-        sys.exit(f"Cannot reach oMLX at {url} ({e}). Is the server running?")
+        name = "TurboFieldfare" if backend == "turbofieldfare" else "oMLX"
+        sys.exit(f"Cannot reach {name} at {url} ({e}). Is the server running?")
     ids = [m["id"] for m in data.get("data", [])]
     if not ids:
-        sys.exit("oMLX reports no models — check the admin panel.")
+        name = "TurboFieldfare" if backend == "turbofieldfare" else "oMLX"
+        sys.exit(f"{name} reports no models.")
     return ids
 
 
-def pick_model(url, key):
-    ids = list_models(url, key)
+def model_tags(model_id):
+    name = model_id.lower()
+    tags = []
+    if "coder" in name or "code" in name:
+        tags.append("Coding")
+    if "gpt-oss" in name or "reason" in name or "r1" in name:
+        tags.append("Reasoning")
+    if "vision" in name or "vl" in name or "llava" in name:
+        tags.append("Vision")
+    if "instruct" in name or "chat" in name or "qwen" in name or "llama" in name or "gemma" in name:
+        tags.append("General")
+    if "creative" in name or "story" in name or "write" in name:
+        tags.append("Creative")
+    if not tags:
+        tags.append("General")
+    return list(dict.fromkeys(tags))
+
+
+def model_label(model_id):
+    return f"{model_id} [{' / '.join(model_tags(model_id))}]"
+
+
+def pick_model(backend, url, key):
+    ids = list_models(backend, url, key)
     if len(ids) == 1:
         return ids[0]
     print("Available local models:")
     for i, mid in enumerate(ids, 1):
-        print(f"  {i}) {mid}")
-    choice = input(f"Select model [1-{len(ids)}, Enter for 1]: ").strip()
+        print(f"  {i}) {model_label(mid)}")
+    try:
+        choice = input(f"Select model [1-{len(ids)}, Enter for 1]: ").strip()
+    except KeyboardInterrupt:
+        print("\n(cancelled)")
+        raise EOFError
     try:
         return ids[int(choice) - 1] if choice else ids[0]
     except (ValueError, IndexError):
         print("(invalid selection — keeping first model)")
         return ids[0]
+
+
+def pick_backend(current_backend):
+    print("Available backends:")
+    labels = list(SUPPORTED_BACKENDS)
+    for i, name in enumerate(labels, 1):
+        marker = " (current)" if name == current_backend else ""
+        print(f"  {i}) {name}{marker}")
+    try:
+        choice = input(f"Select backend [1-{len(labels)}, Enter for {current_backend}]: ").strip().lower()
+    except KeyboardInterrupt:
+        print("\n(cancelled)")
+        raise EOFError
+    if not choice:
+        return current_backend
+    if choice in labels:
+        return choice
+    try:
+        return labels[int(choice) - 1]
+    except (ValueError, IndexError):
+        print("(invalid selection — keeping current backend)")
+        return current_backend
 
 
 # ---------- tools ----------
@@ -423,10 +615,40 @@ def convert_file(path, mode="auto"):
     p = pathlib.Path(path).expanduser()
     should_convert = mode == "all" or (mode == "auto" and p.suffix.lower() in CONVERTIBLE)
     if should_convert:
-        conv = subprocess.run(["markitdown", str(p)], capture_output=True, text=True)
+        if p.suffix.lower() == ".doc":
+            conv = subprocess.run(
+                ["/usr/bin/textutil", "-convert", "txt", "-stdout", str(p)],
+                capture_output=True,
+                text=True,
+            )
+            if conv.returncode == 0 and conv.stdout.strip():
+                return conv.stdout, f"{p.name} (converted via textutil)"
+        markitdown = shutil.which("markitdown")
+        if not markitdown:
+            for candidate in ("/usr/local/bin/markitdown", "/opt/homebrew/bin/markitdown"):
+                if pathlib.Path(candidate).exists():
+                    markitdown = candidate
+                    break
+        if not markitdown:
+            raise RuntimeError(
+                f"markitdown couldn't convert {p.name} — install it with: pip install markitdown"
+            )
+        conv = subprocess.run([markitdown, str(p)], capture_output=True, text=True)
         if conv.returncode != 0 or not conv.stdout.strip():
-            raise RuntimeError("markitdown couldn't convert "
-                               f"{p.name} — install it with: pip install markitdown")
+            detail = (conv.stderr or conv.stdout or "no output").strip()
+            if p.suffix.lower() == ".pdf":
+                pdftotext = shutil.which("pdftotext") or "/opt/homebrew/bin/pdftotext"
+                if pathlib.Path(pdftotext).exists():
+                    pdf_conv = subprocess.run(
+                        [pdftotext, "-layout", str(p), "-"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if pdf_conv.returncode == 0 and pdf_conv.stdout.strip():
+                        return pdf_conv.stdout, f"{p.name} (converted via pdftotext)"
+                    pdf_detail = (pdf_conv.stderr or pdf_conv.stdout or "no output").strip()
+                    raise RuntimeError(f"PDF conversion failed for {p.name}:\nmarkitdown: {detail}\npdftotext: {pdf_detail}")
+            raise RuntimeError(f"markitdown couldn't convert {p.name}:\n{detail}")
         return conv.stdout, f"{p.name} (converted to markdown)"
     try:
         return p.read_text(errors="replace"), p.name
@@ -557,6 +779,983 @@ def do_paste(arg, messages, convert_mode):
     print(f"(pasted {label}: {len(clipped)} chars into context{note} — now ask about it)")
 
 
+def do_read(arg, messages, convert_mode):
+    raw = arg.strip().strip('"').strip("'")
+    if not raw:
+        print("usage: /read <path-to-file>")
+        return
+    do_paste(raw, messages, convert_mode)
+
+
+def print_section(title, lines):
+    print(title)
+    for line in lines:
+        print(f"  {line}")
+
+
+def do_ls(arg):
+    raw = arg.strip().strip('"').strip("'")
+    target = pathlib.Path(raw).expanduser() if raw else pathlib.Path.cwd()
+    if not target.exists():
+        print(f"(path not found: {target})")
+        return
+    if target.is_file():
+        print(target)
+        return
+    entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    if not entries:
+        print(f"(empty directory: {target})")
+        return
+    print(f"{target}:")
+    for entry in entries[:80]:
+        suffix = "/" if entry.is_dir() else ""
+        print(f"  {entry.name}{suffix}")
+    if len(entries) > 80:
+        print(f"  ... plus {len(entries) - 80} more")
+
+
+def do_find(arg):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /find arguments: {e})")
+        return
+    if len(parts) < 2:
+        print("usage: /find PATH PATTERN")
+        return
+    target = pathlib.Path(parts[0]).expanduser()
+    pattern = parts[1]
+    if not target.exists():
+        print(f"(path not found: {target})")
+        return
+    if target.is_file():
+        candidates = [target]
+    else:
+        candidates = [
+            p for p in sorted(target.rglob("*"))
+            if p.is_file() and not any(part.startswith(".") for part in p.relative_to(target).parts)
+        ]
+    regex = re.compile(pattern, re.IGNORECASE)
+    hits = []
+    scanned = 0
+    for path in candidates:
+        if path.suffix.lower() not in REVIEWABLE_TEXT:
+            continue
+        scanned += 1
+        if scanned > 500:
+            break
+        try:
+            text, _label = convert_file(path, "off")
+        except Exception:
+            continue
+        for i, line in enumerate(text.splitlines(), start=1):
+            if regex.search(line):
+                hits.append(f"{path}:{i}: {line.strip()[:180]}")
+                if len(hits) >= 60:
+                    break
+        if len(hits) >= 60:
+            break
+    if not hits:
+        print("(no matches)")
+        return
+    print_section("matches:", hits)
+    if scanned > 500:
+        print("  ... search capped at 500 text files")
+
+
+def namefind_paths(root, term, limit=60):
+    base = pathlib.Path(root).expanduser()
+    if not base.exists():
+        raise RuntimeError(f"path not found: {base}")
+    if base.is_file():
+        return [base] if term.lower() in base.name.lower() else []
+    matches = []
+    for path in sorted(base.rglob("*")):
+        if len(matches) >= limit:
+            break
+        if not path.is_file():
+            continue
+        if any(part.startswith(".") for part in path.relative_to(base).parts):
+            continue
+        if term.lower() in path.name.lower():
+            matches.append(path)
+    return matches
+
+
+def do_namefind(arg):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /namefind arguments: {e})")
+        return
+    if len(parts) < 2:
+        print("usage: /namefind PATH PATTERN")
+        return
+    try:
+        matches = namefind_paths(parts[0], parts[1])
+    except RuntimeError as e:
+        print(f"({e})")
+        return
+    if not matches:
+        print("(no filename matches)")
+        return []
+    print_section("filename matches:", [str(path) for path in matches])
+    return matches
+
+
+def should_follow_last_results(user_text):
+    lowered = (user_text or "").lower()
+    if "these" in lowered and any(term in lowered for term in ("review", "rank", "compare", "list by", "years of experience", "seniority", "strongest", "weakest")):
+        return True
+    if any(term in lowered for term in ("rank the files found", "compare the files found", "review the files found")):
+        return True
+    return False
+
+
+def prompt_for_loaded_files(user_text, labels):
+    listed = "\n".join(f"- {label}" for label in labels)
+    return (
+        f"Using the loaded files below, respond to this request:\n{user_text}\n\n"
+        f"Loaded files:\n{listed}\n\n"
+        "Use candidate or document names when possible, not just filenames."
+    )
+
+
+def content_message_for_text(label, text):
+    clipped = text[:MAX_FILE_CHARS]
+    note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+    return f"Contents of {label}:\n\n{clipped}", f"{label}{note}", len(clipped)
+
+
+def load_selected_files(messages, files, convert_mode, limit=8, char_budget=MAX_LOADED_CONTEXT_CHARS):
+    labels = []
+    seen = set()
+    loaded_chars = 0
+    stopped_for_budget = False
+    for path in files:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            text, label = convert_file(path, convert_mode)
+        except RuntimeError as e:
+            print(f"({path.name}: {e})")
+            continue
+        content, display_label, clipped_len = content_message_for_text(label, text)
+        if labels and loaded_chars + clipped_len > char_budget:
+            stopped_for_budget = True
+            break
+        messages.append({"role": "user", "content": content})
+        labels.append(display_label)
+        loaded_chars += clipped_len
+        if len(labels) >= limit:
+            break
+    if stopped_for_budget:
+        print(f"(stopped loading more files at ~{loaded_chars:,} chars to keep context manageable)")
+    return labels
+
+
+def resolve_local_file_reference(text):
+    quoted = re.findall(r'["\']([^"\']+\.(?:txt|md|docx|pdf|doc|yaml|yml|json|csv|tsv))["\']', text, re.I)
+    bare = re.findall(r'(?<![A-Za-z0-9_./~-])([A-Za-z0-9_./~-]+\.(?:txt|md|docx|pdf|doc|yaml|yml|json|csv|tsv))', text, re.I)
+    candidates = quoted + bare
+    checked = []
+    for raw in candidates:
+        token = raw.strip().strip('"').strip("'").rstrip(".,:;")
+        if not token:
+            continue
+        p = pathlib.Path(token).expanduser()
+        options = [p]
+        if not p.is_absolute():
+            options.append(DOWNLOADS / p)
+            options.append(pathlib.Path.cwd() / p)
+        for option in options:
+            key = str(option)
+            if key in checked:
+                continue
+            checked.append(key)
+            if option.exists() and option.is_file():
+                return option
+    lowered = (text or "").lower()
+    if "downloads" in lowered:
+        for raw in bare:
+            name = pathlib.Path(raw.strip().rstrip(".,:;")).name
+            if not name:
+                continue
+            candidate = DOWNLOADS / name
+            if candidate.exists() and candidate.is_file():
+                return candidate
+    return None
+
+
+def maybe_handle_natural_language_action(user, state, messages, convert_mode):
+    lowered = (user or "").lower().strip()
+    if not lowered:
+        return False
+    has_input_verb = any(re.search(rf'\b{re.escape(verb)}\b', lowered) for verb in INPUT_VERBS)
+    has_output_verb = any(re.search(rf'\b{re.escape(verb)}\b', lowered) for verb in OUTPUT_VERBS)
+    local_file = resolve_local_file_reference(user or "")
+    if local_file and (has_input_verb or has_output_verb or "matrix" in lowered or "table" in lowered):
+        print(f"(routing to /read {local_file})")
+        do_read(str(local_file), messages, convert_mode)
+        state["last_paths"] = [local_file]
+        messages.append({"role": "user", "content": f"Using the loaded file above, {user.strip()}"})
+        return "continue_model"
+    if "find files" in lowered and "download" in lowered and any(term in lowered for term in ("title", "name", "contain", "resume")):
+        term = infer_filename_term(user) or "resume"
+        print(f"(routing to /namefind ~/Downloads {term})")
+        matches = do_namefind(f'"{DOWNLOADS}" "{term}"')
+        state["last_paths"] = matches or []
+        return True
+    remote_match = re.search(r'find all\s+(\.[A-Za-z0-9]+)\s+files?\s+at\s+([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)', lowered)
+    if remote_match:
+        ext = remote_match.group(1)
+        host = remote_match.group(2)
+        pattern = rf'{re.escape(ext)}$'
+        print(f"(routing to /sshfind {host}:/ {pattern})")
+        do_sshfind(f"{host}:/ {shlex.quote(pattern)}")
+        return True
+    local_ls = re.search(r'list files in\s+(.+)$', user.strip(), re.IGNORECASE)
+    if local_ls:
+        target = local_ls.group(1).strip()
+        print(f"(routing to /ls {target})")
+        do_ls(target)
+        return True
+    return False
+
+
+def git_root_for(path):
+    here = pathlib.Path(path).expanduser()
+    base = here if here.is_dir() else here.parent
+    for candidate in [base, *base.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def run_local_command(args, cwd=None):
+    proc = subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output.strip()
+
+
+def parse_remote_spec(raw):
+    spec = raw.strip().strip('"').strip("'")
+    if ":" not in spec:
+        raise ValueError("remote spec must look like user@host:/path")
+    host, path = spec.split(":", 1)
+    host = host.strip()
+    path = path.strip() or "."
+    if not host:
+        raise ValueError("missing remote host before ':'")
+    return host, path
+
+
+def ssh_password_for(host):
+    pw = SSH_PASSWORD_CACHE.get(host)
+    if pw is not None:
+        return pw
+    pw = getpass.getpass(f"({host}) Password: ")
+    SSH_PASSWORD_CACHE[host] = pw
+    return pw
+
+
+def ssh_base_command(host, password):
+    env = os.environ.copy()
+    env["SSHPASS"] = password
+    cmd = [
+        "/opt/homebrew/bin/sshpass",
+        "-e",
+        "ssh",
+        "-o",
+        "PreferredAuthentications=password,keyboard-interactive",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        host,
+    ]
+    return cmd, env
+
+
+def run_ssh_command(host, command):
+    password = ssh_password_for(host)
+    base_cmd, env = ssh_base_command(host, password)
+    proc = subprocess.run(base_cmd + [command], capture_output=True, text=True, timeout=180, env=env)
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output.strip()
+
+
+def run_ssh_command_with_input(host, command, input_text):
+    password = ssh_password_for(host)
+    base_cmd, env = ssh_base_command(host, password)
+    proc = subprocess.run(
+        base_cmd + [command],
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output.strip()
+
+
+def do_gitstatus(arg):
+    raw = arg.strip().strip('"').strip("'")
+    target = pathlib.Path(raw).expanduser() if raw else pathlib.Path.cwd()
+    root = git_root_for(target)
+    if not root:
+        print(f"(not inside a git repo: {target})")
+        return
+    code, output = run_local_command(["git", "status", "--short"], cwd=root)
+    if code != 0:
+        print(f"(git status failed)\n{output}")
+        return
+    print(f"{root}:")
+    print(output or "(clean)")
+
+
+def do_gitdiff(arg):
+    raw = arg.strip().strip('"').strip("'")
+    target = pathlib.Path(raw).expanduser() if raw else pathlib.Path.cwd()
+    root = git_root_for(target)
+    if not root:
+        print(f"(not inside a git repo: {target})")
+        return
+    rel = None
+    if raw:
+        try:
+            rel = str(target.relative_to(root))
+        except ValueError:
+            rel = None
+    cmd = ["git", "diff", "--stat"]
+    if rel and rel != ".":
+        cmd.extend(["--", rel])
+    code, output = run_local_command(cmd, cwd=root)
+    if code != 0:
+        print(f"(git diff failed)\n{output}")
+        return
+    print(f"{root}:")
+    print(output or "(no diff)")
+
+
+def do_sshls(arg):
+    raw = arg.strip()
+    if not raw:
+        print("usage: /sshls USER@HOST:PATH")
+        return
+    try:
+        host, path = parse_remote_spec(raw)
+    except ValueError as e:
+        print(f"({e})")
+        return
+    if not approve(f"ssh ls {host}:{path}"):
+        print("(declined)")
+        return
+    code, output = run_ssh_command(host, f"ls -la {shlex.quote(path)}")
+    if code != 0:
+        print(f"(ssh ls failed)\n{output}")
+        return
+    print(output or "(no output)")
+
+
+def do_sshread(arg, messages):
+    raw = arg.strip()
+    if not raw:
+        print("usage: /sshread USER@HOST:PATH")
+        return
+    try:
+        host, path = parse_remote_spec(raw)
+    except ValueError as e:
+        print(f"({e})")
+        return
+    if not approve(f"ssh read {host}:{path}"):
+        print("(declined)")
+        return
+    code, output = run_ssh_command(host, f"cat {shlex.quote(path)}")
+    if code != 0:
+        print(f"(ssh read failed)\n{output}")
+        return
+    clipped = output[:MAX_FILE_CHARS]
+    note = "" if len(output) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+    label = f"{host}:{path}"
+    messages.append({"role": "user", "content": f"Contents of remote file {label}:\n\n{clipped}"})
+    print(f"(loaded remote file {label} into context{note})")
+
+
+def do_sshfind(arg):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /sshfind arguments: {e})")
+        return
+    if len(parts) < 2:
+        print("usage: /sshfind USER@HOST:PATH PATTERN")
+        return
+    try:
+        host, path = parse_remote_spec(parts[0])
+    except ValueError as e:
+        print(f"({e})")
+        return
+    pattern = parts[1]
+    if not approve(f"ssh find {host}:{path} pattern {pattern}"):
+        print("(declined)")
+        return
+    remote_cmd = (
+        f"find {shlex.quote(path)} -type f "
+        f"\\( -name '*.txt' -o -name '*.md' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' "
+        f"-o -name '*.toml' -o -name '*.ini' -o -name '*.cfg' -o -name '*.py' -o -name '*.sh' \\) "
+        f"-print0 | xargs -0 grep -nEi {shlex.quote(pattern)} | head -60"
+    )
+    code, output = run_ssh_command(host, remote_cmd)
+    if code != 0 and not output:
+        print("(ssh find failed)")
+        return
+    print(output or "(no matches)")
+
+
+def do_sshwrite(arg):
+    raw = arg.strip()
+    if not raw:
+        print("usage: /sshwrite USER@HOST:PATH")
+        return
+    try:
+        host, path = parse_remote_spec(raw)
+    except ValueError as e:
+        print(f"({e})")
+        return
+    print("(enter remote file content, then finish with a single line containing only EOF)")
+    lines = []
+    while True:
+        try:
+            line = input("")
+        except (EOFError, KeyboardInterrupt):
+            print("\n(cancelled)")
+            return
+        if line == "EOF":
+            break
+        lines.append(line)
+    content = "\n".join(lines) + ("\n" if lines else "")
+    if not approve(f"ssh write {len(content)} chars to {host}:{path}"):
+        print("(declined)")
+        return
+    remote_cmd = f"mkdir -p {shlex.quote(str(pathlib.PurePosixPath(path).parent))} && cat > {shlex.quote(path)}"
+    code, output = run_ssh_command_with_input(host, remote_cmd, content)
+    if code != 0:
+        print(f"(ssh write failed)\n{output}")
+        return
+    print(f"(wrote remote file {host}:{path})")
+
+
+def write_remote_file(host, path, content):
+    if not approve(f"ssh write {len(content)} chars to {host}:{path}"):
+        print("(declined)")
+        return False
+    remote_cmd = f"mkdir -p {shlex.quote(str(pathlib.PurePosixPath(path).parent))} && cat > {shlex.quote(path)}"
+    code, output = run_ssh_command_with_input(host, remote_cmd, content)
+    if code != 0:
+        print(f"(ssh write failed)\n{output}")
+        return False
+    print(f"(wrote remote file {host}:{path})")
+    return True
+
+
+def write_remote_file_and_maybe_run(host, path, content, make_executable=False, run_after=False):
+    actions = [f"write {len(content)} chars to {host}:{path}"]
+    if make_executable:
+        actions.append("chmod +x")
+    if run_after:
+        actions.append("run")
+    if not approve(f"ssh {'; '.join(actions)}"):
+        print("(declined)")
+        return False
+    remote_parts = [
+        f"mkdir -p {shlex.quote(str(pathlib.PurePosixPath(path).parent))}",
+        f"cat > {shlex.quote(path)}",
+    ]
+    if make_executable:
+        remote_parts.append(f"chmod +x {shlex.quote(path)}")
+    if run_after:
+        remote_parts.append(shlex.quote(path))
+    remote_cmd = " && ".join(remote_parts)
+    code, output = run_ssh_command_with_input(host, remote_cmd, content)
+    if code != 0 and not output:
+        print("(ssh write/run failed)")
+        return False
+    print(f"(wrote remote file {host}:{path})")
+    if make_executable:
+        print(f"(made executable {host}:{path})")
+    if run_after and output:
+        print(output)
+    elif run_after:
+        print("(no output)")
+    return code == 0
+
+
+def do_sshrun(arg):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /sshrun arguments: {e})")
+        return
+    if len(parts) < 2:
+        print("usage: /sshrun USER@HOST COMMAND")
+        return
+    host = parts[0]
+    command = " ".join(parts[1:])
+    if not approve(f"ssh run {host}: {command}"):
+        print("(declined)")
+        return
+    code, output = run_ssh_command(host, command)
+    if code != 0 and not output:
+        print("(ssh command failed)")
+        return
+    print(output or "(no output)")
+
+
+def maybe_handle_remote_natural_language_action(user, state):
+    text = (user or "").strip()
+    lowered = text.lower()
+    host_match = re.search(r'([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)', text)
+    host = host_match.group(1) if host_match else state.get("current_remote")
+    if not host:
+        return False
+    if lowered.startswith("connect to ") and host:
+        state["current_remote"] = host
+        print(f"(routing to /sshrun {host} whoami)")
+        do_sshrun(f"{host} whoami")
+        return True
+    if host_match:
+        state["current_remote"] = host
+
+    cd_match = re.fullmatch(r'(?:cd|use)\s+(/[^ ]+)', text.strip(), re.I)
+    if cd_match and host:
+        state["current_remote_dir"] = cd_match.group(1)
+        print(f"(remote directory: {state['current_remote_dir']})")
+        return True
+
+    if any(phrase in lowered for phrase in ("find all", "find files", "list files", "search for")) and (".sh" in lowered or "script" in lowered):
+        base = state.get("current_remote_dir") or "/"
+        in_match = re.search(r'\bin\s+(/[^ ]+)', text)
+        if in_match:
+            base = in_match.group(1)
+        elif " here" in lowered:
+            base = state.get("current_remote_dir") or "/"
+        if re.search(r'\bd\*\.sh\b', lowered) or "starting with d" in lowered:
+            pattern = r"d.*\.sh$"
+        elif re.search(r'\*\.sh\b', lowered) or "all .sh files" in lowered:
+            pattern = r"\.sh$"
+        else:
+            pattern = r"\.sh$"
+        state["current_remote_dir"] = base
+        print(f"(routing to /sshfind {host}:{base} {pattern})")
+        do_sshfind(f"{host}:{base} {pattern}")
+        return True
+
+    if "create" in lowered and "script" in lowered and "date" in lowered and "time" in lowered:
+        path_match = re.search(r'(/[^ ]+\.(?:sh|bash))', text)
+        if path_match:
+            path = path_match.group(1)
+        else:
+            dir_match = re.search(r'in\s+(/[^ ]+)', text)
+            name_match = (
+                re.search(r'call\w*\s+([A-Za-z0-9._-]+\.(?:sh|bash))', text, re.I)
+                or re.search(r'name\w*\s+([A-Za-z0-9._-]+\.(?:sh|bash))', text, re.I)
+                or re.search(r'save\s+as\s+([A-Za-z0-9._/-]+\.(?:sh|bash))', text, re.I)
+                or re.search(r'\b([A-Za-z0-9._-]+\.(?:sh|bash))\b', text, re.I)
+            )
+            if dir_match and name_match:
+                name = name_match.group(1)
+                if name.startswith("/"):
+                    path = name
+                else:
+                    path = str(pathlib.PurePosixPath(dir_match.group(1)) / name)
+            elif state.get("current_remote_dir") and name_match:
+                name = name_match.group(1)
+                if name.startswith("/"):
+                    path = name
+                else:
+                    path = str(pathlib.PurePosixPath(state["current_remote_dir"]) / name)
+            else:
+                path = "/tmp/script.sh"
+        state["current_remote_dir"] = str(pathlib.PurePosixPath(path).parent)
+        state["last_remote_path"] = path
+        content = "#!/bin/bash\necho \"Current date and time: $(date '+%Y-%m-%d %H:%M:%S')\"\n"
+        print(f"(routing to remote write {host}:{path})")
+        make_executable = any(term in lowered for term in ("executable", "chmod", "make it executable", "run it", "then run"))
+        run_after = any(term in lowered for term in ("run it", "then run", "execute it"))
+        if (make_executable or run_after):
+            if not write_remote_file_and_maybe_run(host, path, content, make_executable=make_executable, run_after=run_after):
+                return True
+            return True
+        if not write_remote_file(host, path, content):
+            return True
+        return True
+
+    if any(term in lowered for term in ("make it executable", "chmod it")) and state.get("last_remote_path"):
+        path = state["last_remote_path"]
+        print(f"(routing to /sshrun {host} chmod +x {path})")
+        do_sshrun(f"{host} chmod +x {shlex.quote(path)}")
+        return True
+
+    if any(term in lowered for term in ("run it", "execute it")) and state.get("last_remote_path"):
+        path = state["last_remote_path"]
+        print(f"(routing to /sshrun {host} {path})")
+        do_sshrun(f"{host} {shlex.quote(path)}")
+        return True
+    return False
+
+
+def find_resume_files_in_downloads(limit=24):
+    root = DOWNLOADS
+    results = []
+    for path in sorted(root.rglob("*")):
+        if len(results) >= limit:
+            break
+        if not path.is_file():
+            continue
+        if any(part.startswith(".") for part in path.relative_to(root).parts):
+            continue
+        name = path.name.lower()
+        if "resume" not in name:
+            continue
+        if path.suffix.lower() in CONVERTIBLE or path.suffix.lower() in REVIEWABLE_TEXT or path.suffix.lower() in {".pdf"}:
+            results.append(path)
+    return results
+
+
+def local_path_hints(user_text):
+    text = user_text or ""
+    hits = re.findall(r'(?:"([^"]+)"|\'([^\']+)\'|(~/[^\s]+)|(/Users/[^\s]+))', text)
+    paths = []
+    for quoted1, quoted2, tilde_path, abs_path in hits:
+        candidate = quoted1 or quoted2 or tilde_path or abs_path
+        if candidate:
+            paths.append(candidate)
+    lowered = text.lower()
+    if "downloads" in lowered and not paths:
+        paths.append(str(DOWNLOADS))
+    return list(dict.fromkeys(paths))
+
+
+def remote_specs_in_text(user_text):
+    found = re.findall(r'([A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s]+)', user_text or "")
+    return list(dict.fromkeys(found))
+
+
+def infer_filename_term(user_text):
+    lowered = (user_text or "").lower()
+    if "resume" in lowered:
+        return "resume"
+    patterns = [
+        r'with\s+([A-Za-z0-9._-]+)\s+in the name',
+        r'contain(?:ing)?\s+([A-Za-z0-9._-]+)',
+        r'named\s+([A-Za-z0-9._-]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return match.group(1)
+    return None
+
+
+def should_compare_resumes(user_text):
+    lowered = (user_text or "").lower()
+    return "resume" in lowered and any(term in lowered for term in ("compare", "rank", "seniority", "strongest", "weakest"))
+
+
+def should_name_search(user_text):
+    lowered = (user_text or "").lower()
+    return any(term in lowered for term in ("which files", "find files", "list files", "files are in")) and (
+        "name" in lowered or "title" in lowered or "contain" in lowered or "resume" in lowered
+    )
+
+
+def should_preload_file_content(user_text):
+    lowered = (user_text or "").lower()
+    return any(term in lowered for term in ("read", "review", "inspect", "audit", "summarize", "compare", "check"))
+
+
+def load_paths_into_context(messages, files, convert_mode, purpose, limit=8):
+    labels = []
+    for path in files[:limit]:
+        try:
+            labels.append(append_loaded_file(messages, path, convert_mode))
+        except RuntimeError:
+            continue
+    if labels:
+        messages.append({"role": "system", "content": (
+            f"Agentic preflight loaded files for {purpose}:\n" + "\n".join(f"- {label}" for label in labels)
+        )})
+    return labels
+
+
+def apply_agentic_preflight(user_text, messages, convert_mode):
+    notes = []
+    if should_compare_resumes(user_text):
+        paths = local_path_hints(user_text)
+        files = []
+        for hint in paths or [str(DOWNLOADS)]:
+            target = pathlib.Path(hint).expanduser()
+            if target.is_dir():
+                files.extend([p for p in reviewable_paths(target) if "resume" in p.name.lower()][:12])
+            elif target.is_file() and "resume" in target.name.lower():
+                files.append(target)
+        if not files:
+            files = find_resume_files_in_downloads(limit=12)
+        seen = []
+        deduped = []
+        for path in files:
+            key = str(path)
+            if key not in seen:
+                seen.append(key)
+                deduped.append(path)
+        labels = load_paths_into_context(messages, deduped, convert_mode, "resume comparison", limit=8)
+        if labels:
+            notes.append(f"(agentic preloaded {len(labels)} resume file(s))")
+        return notes
+
+    if should_name_search(user_text):
+        term = infer_filename_term(user_text)
+        roots = local_path_hints(user_text) or [str(DOWNLOADS)]
+        results = []
+        if term:
+            for root in roots[:3]:
+                try:
+                    results.extend(namefind_paths(root, term, limit=20))
+                except RuntimeError:
+                    continue
+        if results:
+            lines = "\n".join(f"- {path}" for path in results[:30])
+            messages.append({"role": "system", "content": (
+                f"Agentic filename search found these paths matching '{term}':\n{lines}\n"
+                "Use these search results directly for this turn."
+            )})
+            notes.append(f"(agentic found {min(len(results), 30)} matching file path(s))")
+            return notes
+
+    if should_preload_file_content(user_text):
+        for hint in local_path_hints(user_text)[:2]:
+            target = pathlib.Path(hint).expanduser()
+            if target.is_file():
+                labels = load_paths_into_context(messages, [target], convert_mode, "local file review", limit=1)
+                if labels:
+                    notes.append(f"(agentic loaded {labels[0]})")
+                    return notes
+            elif target.is_dir():
+                pattern = "*.y*ml" if "yaml" in (user_text or "").lower() else "*"
+                try:
+                    files = reviewable_paths(target, pattern)[:6]
+                except RuntimeError:
+                    files = []
+                if files:
+                    labels = load_paths_into_context(messages, files, convert_mode, "directory review", limit=6)
+                    if labels:
+                        notes.append(f"(agentic loaded {len(labels)} file(s) from {target})")
+                        return notes
+
+    for spec in remote_specs_in_text(user_text)[:1]:
+        lowered = (user_text or "").lower()
+        if any(term in lowered for term in ("read", "review", "inspect", "summarize", "check")):
+            try:
+                host, path = parse_remote_spec(spec)
+            except ValueError:
+                continue
+            if not approve(f"ssh read {host}:{path}"):
+                notes.append("(agentic remote read declined)")
+                return notes
+            code, output = run_ssh_command(host, f"cat {shlex.quote(path)}")
+            if code == 0 and output:
+                clipped = output[:MAX_FILE_CHARS]
+                note = "" if len(output) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+                label = f"{host}:{path}{note}"
+                messages.append({"role": "user", "content": f"Contents of remote file {host}:{path}:\n\n{clipped}"})
+                messages.append({"role": "system", "content": f"Agentic preflight loaded remote file for review: {label}"})
+                notes.append(f"(agentic loaded remote file {host}:{path})")
+                return notes
+    return notes
+
+
+def reviewable_paths(folder, pattern=None):
+    root = pathlib.Path(folder).expanduser()
+    if not root.exists() or not root.is_dir():
+        raise RuntimeError(f"folder not found: {root}")
+    candidates = sorted(root.rglob(pattern or "*"))
+    files = []
+    for path in candidates:
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if any(part.startswith(".") for part in path.relative_to(root).parts):
+            continue
+        if path.suffix.lower() in CONVERTIBLE or path.suffix.lower() in REVIEWABLE_TEXT:
+            files.append(path)
+    return files
+
+
+def review_prompt_for_labels(labels):
+    listed = "\n".join(f"- {label}" for label in labels)
+    return (
+        "Review the provided local file content. Focus on correctness, risks, missing validation, "
+        "configuration mistakes, and anything that deserves attention. Keep the review concise and practical.\n\n"
+        f"Files under review:\n{listed}"
+    )
+
+
+def do_review(arg, messages, convert_mode):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /review arguments: {e})")
+        return False
+    if not parts:
+        print("usage: /review PATH [GLOB]")
+        return False
+    target = pathlib.Path(parts[0]).expanduser()
+    pattern = parts[1] if len(parts) > 1 else None
+    if target.is_file():
+        try:
+            text, label = convert_file(target, convert_mode)
+        except RuntimeError as e:
+            print(f"({e})")
+            return False
+        clipped = text[:MAX_FILE_CHARS]
+        note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+        messages.append({"role": "user", "content": f"Contents of {label}:\n\n{clipped}"})
+        messages.append({"role": "user", "content": review_prompt_for_labels([label])})
+        print(f"(loaded {label} for review{note})")
+        return True
+    if target.is_dir():
+        files = reviewable_paths(target, pattern)
+        if not files:
+            shown = pattern or "*"
+            print(f"(no reviewable files found in {target} matching {shown})")
+            return False
+        labels = []
+        loaded = 0
+        for path in files[:12]:
+            try:
+                text, label = convert_file(path, convert_mode)
+            except RuntimeError as e:
+                print(f"({path.name}: {e})")
+                continue
+            clipped = text[:MAX_FILE_CHARS]
+            note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+            messages.append({"role": "user", "content": f"Contents of {label}:\n\n{clipped}"})
+            labels.append(f"{label}{note}")
+            loaded += 1
+        if not loaded:
+            print("(no files could be loaded for review)")
+            return False
+        if len(files) > loaded:
+            labels.append(f"... plus {len(files) - loaded} more matching file(s) not loaded")
+        messages.append({"role": "user", "content": review_prompt_for_labels(labels)})
+        print(f"(loaded {loaded} file(s) from {target} for review)")
+        return True
+    print(f"(path not found: {target})")
+    return False
+
+
+def append_loaded_file(messages, path, convert_mode):
+    text, label = convert_file(path, convert_mode)
+    clipped = text[:MAX_FILE_CHARS]
+    note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
+    messages.append({"role": "user", "content": f"Contents of {label}:\n\n{clipped}"})
+    return f"{label}{note}"
+
+
+def do_resumecompare(arg, messages, convert_mode):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /resumecompare arguments: {e})")
+        return False
+    target = pathlib.Path(parts[0]).expanduser() if parts else DOWNLOADS
+    jd_path = pathlib.Path(parts[1]).expanduser() if len(parts) > 1 else None
+    if target.is_file():
+        files = [target]
+    elif target.is_dir():
+        files = [p for p in reviewable_paths(target) if "resume" in p.name.lower()][:12]
+        if not files and target == DOWNLOADS:
+            files = find_resume_files_in_downloads(limit=12)
+    else:
+        print(f"(path not found: {target})")
+        return False
+    if not files:
+        print(f"(no resume-like files found in {target})")
+        return False
+    labels = []
+    for path in files:
+        try:
+            labels.append(append_loaded_file(messages, path, convert_mode))
+        except RuntimeError as e:
+            print(f"({path.name}: {e})")
+    if not labels:
+        print("(no resume files could be loaded)")
+        return False
+    if jd_path:
+        try:
+            jd_label = append_loaded_file(messages, jd_path, convert_mode)
+            jd_note = f"\nUse the job description from {jd_label} as the evaluation standard."
+        except RuntimeError as e:
+            print(f"(job description not loaded: {e})")
+            jd_note = ""
+    else:
+        jd_note = ""
+    listed = "\n".join(f"- {label}" for label in labels)
+    messages.append({"role": "user", "content": (
+        "Using the loaded resumes, rank the candidates by name from strongest to weakest for the requested role or, "
+        "if no role is specified elsewhere in the conversation, by overall seniority and depth of relevant experience. "
+        "For each candidate, give 2-4 short strengths and 1 short concern. Use candidate names, not filenames."
+        f"{jd_note}\n\nLoaded resume files:\n{listed}"
+    )})
+    print(f"(loaded {len(labels)} resume file(s) for comparison)")
+    return True
+
+
+def do_yamlaudit(arg, messages, convert_mode):
+    try:
+        parts = shlex.split(arg)
+    except ValueError as e:
+        print(f"(couldn't parse /yamlaudit arguments: {e})")
+        return False
+    if not parts:
+        print("usage: /yamlaudit PATH [GLOB]")
+        return False
+    target = pathlib.Path(parts[0]).expanduser()
+    pattern = parts[1] if len(parts) > 1 else "*.y*ml"
+    files = []
+    if target.is_file():
+        files = [target]
+    elif target.is_dir():
+        files = [p for p in sorted(target.rglob(pattern)) if p.is_file()][:12]
+    else:
+        print(f"(path not found: {target})")
+        return False
+    yaml_files = [p for p in files if p.suffix.lower() in {".yaml", ".yml"}]
+    if not yaml_files:
+        print(f"(no YAML files found in {target})")
+        return False
+    labels = []
+    for path in yaml_files:
+        try:
+            labels.append(append_loaded_file(messages, path, "off"))
+        except RuntimeError as e:
+            print(f"({path.name}: {e})")
+    if not labels:
+        print("(no YAML files could be loaded)")
+        return False
+    listed = "\n".join(f"- {label}" for label in labels)
+    messages.append({"role": "user", "content": (
+        "Audit the loaded YAML content. Focus on correctness, risky defaults, missing required fields, malformed "
+        "structure, duplicate/conflicting settings, secrets exposure, and operational risks. Keep the output concise."
+        f"\n\nLoaded YAML files:\n{listed}"
+    )})
+    print(f"(loaded {len(labels)} YAML file(s) for audit)")
+    return True
+
+
 def do_save(arg, messages, model):
     raw = arg.strip().strip('"')
     if raw:
@@ -631,11 +1830,13 @@ def print_tokens(label, in_tokens, out_tokens):
 
 # ---------- chat ----------
 
-def stream_once(url, key, model, messages):
+def stream_once(url, key, model, messages, agentic_mode, backend):
     """One streamed request. Returns (content, tool_calls, usage)."""
-    payload = {"model": model, "messages": request_messages_for_turn(messages), "tools": TOOLS,
+    payload = {"model": model, "messages": request_messages_for_mode(messages, agentic_mode, backend),
                "max_tokens": MAX_RESPONSE_TOKENS, "stream": True,
                "stream_options": {"include_usage": True}}
+    if agentic_mode:
+        payload["tools"] = TOOLS
     content_parts = []
     calls = {}
     usage = {}
@@ -685,14 +1886,17 @@ def stream_once(url, key, model, messages):
     return "".join(content_parts), tool_calls, usage
 
 
-def chat_turn(url, key, model, messages, totals):
+def chat_turn(url, key, model, messages, totals, agentic_mode, backend):
     turn_in = 0
     turn_out = 0
     for _ in range(MAX_TOOL_STEPS):
-        content, tool_calls, usage = stream_once(url, key, model, messages)
+        content, tool_calls, usage = stream_once(url, key, model, messages, agentic_mode, backend)
         in_tokens, out_tokens = usage_counts(usage)
         turn_in += in_tokens
         turn_out += out_tokens
+        if not tool_calls and not content and in_tokens == 0 and out_tokens == 0:
+            print("(turn failed: server returned no output and no token usage; reduce loaded context or retry)")
+            return 0, 0
         if not tool_calls:
             messages.append({"role": "assistant", "content": content})
             totals["in"] += turn_in
@@ -725,6 +1929,85 @@ def trim(messages):
     return messages
 
 
+def commands_only_from_help():
+    commands = []
+    for line in HELP.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("/"):
+            commands.append(stripped.split()[0])
+    return "  " + "  ".join(commands)
+
+
+def verbs_text():
+    return (
+        "input verbs:  " + ", ".join(INPUT_VERBS) + "\n" +
+        "output verbs: " + ", ".join(OUTPUT_VERBS)
+    )
+
+
+def normalize_pasted_command(lines):
+    cleaned = [line.strip() for line in lines if line.strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if cleaned[0].startswith("/"):
+        return cleaned[0]
+    return " ".join(cleaned)
+
+
+def read_user_command():
+    try:
+        first = input("\n> ")
+    except (EOFError, KeyboardInterrupt):
+        raise
+    lines = [first]
+    quiet_deadline = time.time() + 0.35
+    while time.time() < quiet_deadline:
+        remaining = max(0.0, quiet_deadline - time.time())
+        ready, _, _ = select.select([sys.stdin], [], [], min(0.08, remaining))
+        if not ready:
+            continue
+        extra = sys.stdin.readline()
+        if extra == "":
+            break
+        lines.append(extra.rstrip("\n"))
+        quiet_deadline = time.time() + 0.12
+    user = normalize_pasted_command(lines).strip()
+    if len(lines) > 1 and user:
+        print("(normalized pasted multi-line input)")
+    return user
+
+
+def do_where(backend, url, model, convert_mode, agentic_mode, state):
+    remote = state.get("current_remote") or "(none)"
+    remote_dir = state.get("current_remote_dir") or "(none)"
+    last_remote_path = state.get("last_remote_path") or "(none)"
+    print(f"backend: {backend}")
+    print(f"url: {url}")
+    print(f"model: {model}")
+    print(f"convert: {convert_mode}")
+    print(f"agentic: {'on' if agentic_mode else 'off'}")
+    print(f"remote: {remote}")
+    print(f"remote dir: {remote_dir}")
+    print(f"last remote path: {last_remote_path}")
+
+
+def do_tflog():
+    if not TURBO_SERVER_LOG.exists():
+        print(f"(no TurboFieldfare log found at {TURBO_SERVER_LOG})")
+        return
+    try:
+        lines = TURBO_SERVER_LOG.read_text(errors="replace").splitlines()
+    except Exception as e:
+        print(f"(could not read TurboFieldfare log: {e})")
+        return
+    tail = lines[-80:]
+    print(str(TURBO_SERVER_LOG) + ":")
+    for line in tail:
+        print(line)
+
+
 # ---------- main ----------
 
 def parse_args(argv):
@@ -745,18 +2028,25 @@ def parse_args(argv):
 
 
 def main():
-    url, key = load_cfg()
+    backend, url, key = load_cfg()
     model_arg, system = parse_args(sys.argv[1:])
-    ensure_server(url, key)
-    model = model_arg or pick_model(url, key)
-    print(f"mlxcli — model: {model} — /help for commands")
+    if not model_arg:
+        selected_backend = pick_backend(backend)
+        if selected_backend != backend:
+            save_backend(selected_backend)
+            backend, url, key = load_cfg()
+    ensure_server(backend, url, key)
+    model = model_arg or pick_model(backend, url, key)
+    print(f"mlxcli — backend: {backend} — model: {model} — /help for commands")
     messages = [{"role": "system", "content": system}]
     totals = {"in": 0, "out": 0}
     last_turn = {"in": 0, "out": 0}
     convert_mode = "auto"
+    agentic_mode = False
+    state = {"last_paths": [], "current_remote": None, "current_remote_dir": None, "last_remote_path": None}
     while True:
         try:
-            user = input("\n> ").strip()
+            user = read_user_command().strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -764,11 +2054,39 @@ def main():
             continue
         if user in ("/exit", "/quit"):
             break
+        if user == "/commands":
+            print(commands_only_from_help())
+            continue
+        if user == "/verbs":
+            print(verbs_text())
+            continue
         if user == "/help":
             print(HELP)
             continue
+        if user == "/backend":
+            print(f"(backend: {backend})")
+            continue
+        if user.startswith("/backend "):
+            selected = user.split(None, 1)[1].strip().lower()
+            if selected not in SUPPORTED_BACKENDS:
+                print("usage: /backend omlx|turbofieldfare")
+                continue
+            try:
+                save_backend(selected)
+            except Exception as e:
+                print(f"[error] could not save backend: {e}")
+                continue
+            backend, url, key = load_cfg()
+            ensure_server(backend, url, key)
+            model = model_arg or pick_model(backend, url, key)
+            print(f"(backend: {backend}; model: {model})")
+            continue
         if user == "/clear":
             messages = [{"role": "system", "content": system}]
+            state["last_paths"] = []
+            state["current_remote"] = None
+            state["current_remote_dir"] = None
+            state["last_remote_path"] = None
             print("(history cleared)")
             continue
         if user == "/system":
@@ -815,6 +2133,17 @@ def main():
         if user == "/tokens":
             print_tokens("session", totals["in"], totals["out"])
             continue
+        if user == "/agentic":
+            print(f"(agentic mode: {'on' if agentic_mode else 'off'})")
+            continue
+        if user.startswith("/agentic "):
+            mode = user.split(None, 1)[1].strip().lower()
+            if mode not in {"on", "off"}:
+                print("usage: /agentic on|off")
+                continue
+            agentic_mode = mode == "on"
+            print(f"(agentic mode: {'on' if agentic_mode else 'off'})")
+            continue
         if user in ("/resources", "/resource"):
             do_resources(totals, messages, last_turn)
             continue
@@ -832,12 +2161,18 @@ def main():
         if user == "/mem":
             do_mem()
             continue
+        if user == "/tflog":
+            do_tflog()
+            continue
+        if user == "/where":
+            do_where(backend, url, model, convert_mode, agentic_mode, state)
+            continue
         if user == "/models":
-            for mid in list_models(url, key):
+            for mid in list_models(backend, url, key):
                 print(f"  {mid}" + (" (active)" if mid == model else ""))
             continue
         if user == "/model":
-            model = pick_model(url, key)
+            model = pick_model(backend, url, key)
             print(f"(switched to {model} — history kept)")
             continue
         if user.startswith("/save"):
@@ -849,10 +2184,109 @@ def main():
         if user.startswith("/paste"):
             do_paste(user[6:], messages, convert_mode)
             continue
-        messages.append({"role": "user", "content": user})
+        if user.startswith("/review"):
+            if do_review(user[7:], messages, convert_mode):
+                messages = trim(messages)
+                try:
+                    turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
+                    last_turn = {"in": turn_in, "out": turn_out}
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode(errors="replace")[:400]
+                    print(f"\n[server error {e.code}] {body}")
+                except Exception as e:
+                    print(f"\n[error] {e}")
+            continue
+        if user.startswith("/resumecompare"):
+            if do_resumecompare(user[len("/resumecompare"):], messages, convert_mode):
+                messages = trim(messages)
+                try:
+                    turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
+                    last_turn = {"in": turn_in, "out": turn_out}
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode(errors="replace")[:400]
+                    print(f"\n[server error {e.code}] {body}")
+                except Exception as e:
+                    print(f"\n[error] {e}")
+            continue
+        if user.startswith("/yamlaudit"):
+            if do_yamlaudit(user[len("/yamlaudit"):], messages, convert_mode):
+                messages = trim(messages)
+                try:
+                    turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
+                    last_turn = {"in": turn_in, "out": turn_out}
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode(errors="replace")[:400]
+                    print(f"\n[server error {e.code}] {body}")
+                except Exception as e:
+                    print(f"\n[error] {e}")
+            continue
+        if user.startswith("/read"):
+            do_read(user[5:], messages, convert_mode)
+            continue
+        if user.startswith("/find"):
+            do_find(user[5:])
+            continue
+        if user.startswith("/namefind"):
+            state["last_paths"] = do_namefind(user[9:]) or []
+            continue
+        if user == "/ls" or user.startswith("/ls "):
+            do_ls(user[3:])
+            continue
+        if user == "/gitstatus" or user.startswith("/gitstatus "):
+            do_gitstatus(user[10:])
+            continue
+        if user == "/gitdiff" or user.startswith("/gitdiff "):
+            do_gitdiff(user[8:])
+            continue
+        if user.startswith("/sshls"):
+            do_sshls(user[6:])
+            continue
+        if user.startswith("/sshread"):
+            do_sshread(user[8:], messages)
+            continue
+        if user.startswith("/sshfind"):
+            do_sshfind(user[8:])
+            continue
+        if user.startswith("/sshwrite"):
+            do_sshwrite(user[9:])
+            continue
+        if user.startswith("/sshrun"):
+            do_sshrun(user[7:])
+            continue
+        if maybe_handle_remote_natural_language_action(user, state):
+            continue
+        nl_result = maybe_handle_natural_language_action(user, state, messages, convert_mode)
+        if nl_result is True:
+            continue
+        if nl_result == "continue_model":
+            messages = trim(messages)
+            try:
+                turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
+                last_turn = {"in": turn_in, "out": turn_out}
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors="replace")[:400]
+                print(f"\n[server error {e.code}] {body}")
+            except Exception as e:
+                print(f"\n[error] {e}")
+            continue
+        handled_followup = False
+        if should_follow_last_results(user) and state["last_paths"]:
+            selected_paths = state["last_paths"]
+            if "resume" in user.lower():
+                selected_paths = [p for p in selected_paths if "resume" in pathlib.Path(p).name.lower()]
+            labels = load_selected_files(messages, selected_paths, convert_mode, limit=12)
+            if labels:
+                messages.append({"role": "user", "content": prompt_for_loaded_files(user, labels)})
+                print(f"(agentic loaded {len(labels)} file(s) from the last search results)")
+                handled_followup = True
+        if not handled_followup:
+            messages.append({"role": "user", "content": user})
+            if agentic_mode:
+                for note in apply_agentic_preflight(user, messages, convert_mode):
+                    print(note)
         messages = trim(messages)
         try:
-            turn_in, turn_out = chat_turn(url, key, model, messages, totals)
+            turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
             last_turn = {"in": turn_in, "out": turn_out}
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
