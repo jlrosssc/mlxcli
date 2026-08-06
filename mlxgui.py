@@ -31,6 +31,7 @@ from mlxlib import (
     DOWNLOADS, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
     is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
+    requires_agentic_execution as gui_requires_agentic_execution,
     execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
     resolve_output_path, normalize_tool_name as gui_normalize_tool_name,
     infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
@@ -2577,6 +2578,7 @@ class MlxGui(tk.Tk):
             return
         working_messages = list(request_messages)
         agentic = gui_should_auto_enable_agentic(self.last_user_text)
+        execution_required = gui_requires_agentic_execution(self.last_user_text)
         contract = gui_execution_contract(self.last_user_text)
         tool_state = {"write": False, "run": False, "verify": False}
         seen_tool_calls = {}
@@ -2704,6 +2706,20 @@ class MlxGui(tk.Tk):
                 if tool_calls:
                     self.events.put(("status", "Compatibility Python-call-style tool call parsed"))
             if not tool_calls:
+                if execution_required and _step == 0:
+                    # The model answered with prose and never attempted a tool
+                    # call at all - force at least one real attempt before
+                    # falling back to the narrower per-category contract check
+                    # below, which can legitimately require nothing yet still
+                    # need enforcement (e.g. a bare "open <path>" request).
+                    working_messages.append({"role": "assistant", "content": content})
+                    working_messages.append({"role": "user", "content": (
+                        "Execution required for this request. You did not call a tool. "
+                        "Do not report completion. Use run_command, read_file, or write_file now to perform the "
+                        "requested actions, then verify the exact output paths before responding."
+                    )})
+                    self.events.put(("status", "Model returned prose without performing the requested file operation; requesting tool execution"))
+                    continue
                 unmet = [name for name, required in contract.items() if required and not tool_state.get(name)]
                 if unmet and _step < MAX_TOOL_STEPS - 1:
                     working_messages.append({"role": "assistant", "content": content})
