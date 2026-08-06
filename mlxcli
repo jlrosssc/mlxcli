@@ -3172,6 +3172,8 @@ def main():
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
             print(f"[server error {e.code}] {body}")
+        except urllib.error.URLError as e:
+            print(f"[connection error] {e.reason}")
         except KeyboardInterrupt:
             print("(interrupted)")
         return
