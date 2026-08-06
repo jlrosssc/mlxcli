@@ -53,7 +53,7 @@ from mlxlib import (
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop, parse_bare_json_tool_call, parse_xml_tag_tool_call,
     parse_python_call_tool_call, DEFAULT_REPETITION_PENALTY,
-    _unique_call_id,
+    _unique_call_id, suggest_better_backend,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -3158,6 +3158,9 @@ def main():
         if auto_yes:
             ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
         totals = {"in": 0, "out": 0}
+        backend_suggestion = suggest_better_backend(backend, run_task)
+        if backend_suggestion:
+            print(f"(suggestion: {backend_suggestion})")
         messages.append({"role": "user", "content": run_task})
         turn_mode = should_auto_enable_agentic(run_task) if requires_agentic_execution(run_task) else False
         try:
@@ -3429,6 +3432,9 @@ def main():
         request_agentic_mode = agentic_mode or should_auto_enable_agentic(user, messages)
         if request_agentic_mode and not agentic_mode:
             print("(agentic tools auto-enabled for this local-resource request)")
+        backend_suggestion = suggest_better_backend(backend, user)
+        if backend_suggestion:
+            print(f"(suggestion: {backend_suggestion})")
         if maybe_handle_remote_natural_language_action(user, state):
             continue
         state["context_loaded"] = False

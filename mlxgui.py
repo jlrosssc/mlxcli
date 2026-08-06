@@ -41,6 +41,7 @@ from mlxlib import (
     parse_xml_tag_tool_call as gui_parse_xml_tag_tool_call,
     parse_python_call_tool_call as gui_parse_python_call_tool_call,
     DEFAULT_REPETITION_PENALTY, _unique_call_id as gui_unique_call_id,
+    suggest_better_backend as gui_suggest_better_backend,
 )
 
 
@@ -2580,6 +2581,9 @@ class MlxGui(tk.Tk):
         agentic = gui_should_auto_enable_agentic(self.last_user_text)
         execution_required = gui_requires_agentic_execution(self.last_user_text)
         contract = gui_execution_contract(self.last_user_text)
+        backend_suggestion = gui_suggest_better_backend(self.backend, self.last_user_text)
+        if backend_suggestion:
+            self.events.put(("status", f"Suggestion: {backend_suggestion}"))
         tool_state = {"write": False, "run": False, "verify": False}
         seen_tool_calls = {}
         retried_with_tools = False

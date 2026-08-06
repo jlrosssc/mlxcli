@@ -408,6 +408,24 @@ def backup_before_overwrite(target):
 PROJECT_NOTES_FILENAMES = (".mlxcli-notes.md", "AGENTS.md", "CLAUDE.md")
 
 
+def suggest_better_backend(backend, text):
+    """Return a short suggestion if the current backend is known — from this
+    project's own direct testing, not speculation — to be unreliable for the
+    kind of request about to be sent, or None if nothing applies. Deliberately
+    narrow and evidence-based: a topic-based "this model is better for X"
+    router isn't something we have real grounds to build, but "Gemma's
+    tool-call decoder reliably fails on this server for agentic requests" is a
+    confirmed, reproduced finding, not a guess. This never switches anything
+    automatically — local model switches cost real time (stopping one server,
+    loading another), so the choice stays with the user; this only surfaces
+    the suggestion at the moment it'd actually matter."""
+    if backend == "turbofieldfare" and requires_agentic_execution(text):
+        return ("Gemma has shown unreliable tool-calling on this local server for agentic "
+                "requests (confirmed: tool-call parsing failures during testing). "
+                "Consider /backend turbofieldfare-qwen for this one.")
+    return None
+
+
 def find_project_notes(start_dir=None):
     """Look for a project-local instructions file in the given directory
     (default: cwd), trying each conventional filename in turn. Returns
