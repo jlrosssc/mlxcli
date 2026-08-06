@@ -7,59 +7,108 @@ defaults, and approval-gated tools with diff preview.
 
 Usage:
   mlxcli [model] [-p "custom system prompt"]
+  mlxcli --run "task" [-y]   headless one-shot mode: run a single task, print the
+                             result, and exit (no REPL). -y/--yes auto-approves
+                             all tool categories for the run (for scripting/CI).
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
   /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
 """
+import atexit
 import difflib
 import getpass
 import json
 import os
 import pathlib
 import re
+try:
+    import readline
+except ImportError:
+    readline = None
 import select
 import shlex
 import shutil
 import subprocess
 import sys
+import termios
 import time
+import tty
 import urllib.error
 import urllib.request
 import zipfile
 from datetime import datetime
 from xml.sax.saxutils import escape
-from docx_export import markdown_to_docx as formatted_markdown_to_docx
+from xml.etree import ElementTree as ET
+try:
+    from docx_export import markdown_to_docx as formatted_markdown_to_docx
+except ImportError:
+    formatted_markdown_to_docx = None
+from mlxlib import (
+    DOWNLOADS, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
+    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
+    is_code_request, requires_agentic_execution, should_auto_enable_agentic,
+    execution_contract, tool_result_failed, resolve_output_path,
+    normalize_tool_name, infer_command_cwd,
+    backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
+    detect_repetition_loop, parse_bare_json_tool_call, parse_xml_tag_tool_call,
+    parse_python_call_tool_call, DEFAULT_REPETITION_PENALTY,
+    _unique_call_id,
+)
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
 BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
-TURBO_ROOT = pathlib.Path.home() / "Downloads" / "turbo-fieldfare"
+MODELS_ROOT = pathlib.Path.home() / "Models"
+TURBO_ROOT = MODELS_ROOT / "turbo-fieldfare"
 TURBO_SERVER_BIN = TURBO_ROOT / ".build" / "release" / "TurboFieldfareServer"
 TURBO_MODEL_DIR = TURBO_ROOT / "scratch" / "gemma4.gturbo"
 TURBO_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-server.log"
-MAX_TOOL_STEPS = 8
-MAX_FILE_CHARS = 8000
+TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-qwen"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TurboFieldfareServer"
+TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
+TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
+TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
 MAX_LOADED_CONTEXT_CHARS = 28000
-MAX_HISTORY_TURNS = 12
-MAX_RESPONSE_TOKENS = 2500
-CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
+MAX_BATCH_RESUME_CHARS = 22000
 SSH_PASSWORD_CACHE = {}
-REVIEWABLE_TEXT = {
-    ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-    ".conf", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".sh",
-    ".zsh", ".bash", ".env", ".xml", ".html", ".css", ".sql", ".csv",
-}
 CONVERT_MODES = {"auto", "all", "off"}
-DOWNLOADS = pathlib.Path.home() / "Downloads"
+READLINE_HISTORY_PATH = pathlib.Path.home() / ".omlx" / "mlxcli_history"
 
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac.\n"
     "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+    "Treat the user's supplied text, numbers, filenames, and codes as authoritative literal data. "
+    "Do not silently correct, normalize, truncate, expand, or substitute them unless the user explicitly asks.\n"
+    "When a request refers to content 'below', 'above', or 'in the pasted list', verify that the content is actually present. "
+    "If required input is missing, say exactly what is missing instead of guessing.\n"
+    "When a request names a category or target (e.g. 'my photos', 'my documents', 'my files') without stating where it lives, "
+    "ask which folder or path to use. Do not silently reuse a location mentioned in an earlier, unrelated request.\n"
+    "Cloud-sync services (OneDrive, iCloud Drive, Dropbox, Google Drive) are mounted as ordinary local folders on this Mac under "
+    "~/Library/CloudStorage/<Provider>-<Account>/ (e.g. ~/Library/CloudStorage/OneDrive-Personal/). "
+    "A request to 'connect to' or 'access' one of these means listing/reading/writing files in that local synced folder with your "
+    "existing tools — there is no separate login or account connection step, and you must not claim you lack the ability to reach it.\n"
+    "For file and spreadsheet tasks, use the named local resource when available, preserve text-formatted numeric values, "
+    "and follow requested columns, order, and output shape exactly. Distinguish source data from user-provided input data.\n"
+    "For exact-match tasks, compare the complete requested key and apply only the explicitly stated normalization rules; "
+    "never match a convenient suffix or a similar-looking value.\n"
+    "For local file listings or size rankings, use a filename-safe approach such as find with stat and sort by bytes; "
+    "do not parse ls output with positional awk fields because filenames may contain spaces.\n"
+    "For file metadata such as creation dates, use stat on the exact files and report the filesystem values; "
+    "do not infer dates from filenames or conversation text.\n"
     "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
     "Use tools only when the task requires reading/writing files or running commands.\n"
     "Save created files in ~/Downloads unless the user gives another path.\n"
+    "Execution contract: if the user asks you to create, write, run, test, export, verify, or share local files, you MUST use the available tools. "
+    "Never simulate tool output or claim that files were created, executed, inspected, verified, or shared based only on your response. "
+    "After writing files, use a tool to check the exact paths and report only the paths, sizes, and results returned by tools. "
+    "If a required tool action is unavailable or declined, state that the task was not completed.\n"
+    "When running a local script against an absolute input file, use the input file's directory as the working directory unless the user explicitly specifies another one. "
+    "For generated scripts, resolve relative output files beside the input file, not beside the CLI process.\n"
+    "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes. Use python_interpreter only to run already-created code when explicitly needed.\n"
+    "write_file creates parent directories; do not run a separate mkdir when the requested output directory may already exist.\n"
+    "Before overwriting an existing requested file, inspect it and preserve stronger validation already present. write_file always shows the user a diff and asks for approval before an existing file is changed, so call it directly rather than staging a copy elsewhere first. Do not repeat an identical tool call after a successful result; reuse the returned evidence.\n"
     "Keep replies brief and avoid repeating large imported text unless asked.\n"
     "Respect local LLM memory limits: summarize when possible, use only relevant imported context, and suggest /clear when old context is no longer needed.\n"
     "Work in small steps. Be direct, respectful, and practical."
@@ -103,24 +152,7 @@ CODE_REQUEST_SYSTEM = (
     "If the user asks to list generated values, list them after the code without explaining your process."
 )
 
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "run_command",
-        "description": "Run a shell command; returns stdout+stderr (truncated).",
-        "parameters": {"type": "object", "properties": {
-            "command": {"type": "string"}}, "required": ["command"]}}},
-    {"type": "function", "function": {
-        "name": "read_file",
-        "description": "Read a text file (truncated to 8000 chars).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"}}, "required": ["path"]}}},
-    {"type": "function", "function": {
-        "name": "write_file",
-        "description": "Write content to a file (shows a diff and asks first).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"}}, "required": ["path", "content"]}}},
-]
+# TOOLS is imported from mlxlib (shared with mlxgui).
 
 HELP = """Commands:
   /paste <file>   inject a file into context (text/md directly; docx/pdf via markitdown)
@@ -152,8 +184,15 @@ HELP = """Commands:
   /agentic        show whether model tool use is enabled
   /agentic on     enable model-driven tool calls (run/read/write with approvals)
   /agentic off    disable model-driven tool calls
+  /thinking       show whether the model's own prose is shown during agentic retries
+  /thinking on|off
+                  show/hide the model's prose at each retry step of an agentic turn
+                  (this backend has no separate reasoning channel, so this is
+                  "don't hide what it said," not literal chain-of-thought)
+  /notes          show the loaded project notes file, if any (.mlxcli-notes.md,
+                  AGENTS.md, or CLAUDE.md in the directory mlxcli was launched from)
   /backend        show active backend
-  /backend NAME   switch backend: omlx or turbofieldfare
+  /backend NAME   switch backend: omlx, turbofieldfare, or turbofieldfare-qwen
   /convert MODE   set paste conversion: auto, all, or off
   /system         show the active dialogue defaults
   /system save TEXT
@@ -164,10 +203,12 @@ HELP = """Commands:
   /model          switch models (picker; history kept)
   /models         list models the server offers
   /tflog          show the last lines of the TurboFieldfare server log
+  /health         show selected backend health and basic readiness
   /resources      show dialogue pressure, token totals, and Mac memory status
   /mem            show RAM status, Metal cap, and top memory users
   /where          show current model, modes, and remote context
   /verbs          show natural-language input/output verbs the router recognizes
+  ? [request]     refine a request with a short, stateless prompt decoder
   /tokens         show running token totals for this mlxcli session
   /save [file]    save transcript as markdown (default: ~/Downloads/mlxcli-<timestamp>.md)
   /export [file]  save latest model reply as .docx, .md, or .txt (default: ~/Downloads/mlxcli-reply-<timestamp>.docx)
@@ -185,7 +226,74 @@ OUTPUT_VERBS = (
     "create", "generate", "make", "write", "build", "draft", "rank", "score", "format",
     "export", "save", "show",
 )
-SUPPORTED_BACKENDS = ("omlx", "turbofieldfare")
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare", "turbofieldfare-qwen")
+
+
+def is_turbo_backend(backend):
+    return backend in ("turbofieldfare", "turbofieldfare-qwen")
+
+
+def configure_readline():
+    """Enable predictable arrow-key editing and persistent CLI command history."""
+    if readline is None or not sys.stdin.isatty():
+        return
+    try:
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind('"\\e[A": previous-history')
+        readline.parse_and_bind('"\\e[B": next-history')
+        readline.parse_and_bind('"\\e[C": forward-char')
+        readline.parse_and_bind('"\\e[D": backward-char')
+        readline.set_history_length(300)
+        readline.read_history_file(str(READLINE_HISTORY_PATH))
+    except (OSError, AttributeError, RuntimeError):
+        pass
+
+    def save_history():
+        try:
+            READLINE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(str(READLINE_HISTORY_PATH))
+        except (OSError, AttributeError, RuntimeError):
+            pass
+
+    atexit.register(save_history)
+
+
+def backend_label(backend):
+    labels = {
+        "omlx": "oMLX",
+        "turbofieldfare": "TurboFieldfare",
+        "turbofieldfare-qwen": "TurboFieldfare Qwen",
+    }
+    return labels.get(backend, backend)
+
+
+def backend_description(backend):
+    descriptions = {
+        "omlx": "[General / Flexible]",
+        "turbofieldfare": "[Gemma 4 / General]",
+        "turbofieldfare-qwen": "[Qwen 3.6 / Coding]",
+    }
+    return descriptions.get(backend, "")
+
+
+def backend_paths(backend):
+    if backend == "turbofieldfare-qwen":
+        return {
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_QWEN_MODEL_DIR,
+            "log": TURBO_QWEN_SERVER_LOG,
+            "port": "8081",
+        }
+    if backend == "turbofieldfare":
+        return {
+            "root": TURBO_ROOT,
+            "server_bin": TURBO_SERVER_BIN,
+            "model_dir": TURBO_MODEL_DIR,
+            "log": TURBO_SERVER_LOG,
+            "port": "8080",
+        }
+    return {}
 
 
 # ---------- config / server ----------
@@ -214,6 +322,10 @@ def load_cfg():
         url = os.environ.get("TURBOFIELDFFARE_URL", os.environ.get("TURBOFIELDFARE_URL", os.environ.get("TURBOFIELDFIELDFARE_URL", "http://127.0.0.1:8080")))
         key = os.environ.get("TURBOFIELDFARE_API_KEY", "")
         return backend, url, key
+    if backend == "turbofieldfare-qwen":
+        url = os.environ.get("TURBOFIELDFARE_QWEN_URL", "http://127.0.0.1:8081")
+        key = os.environ.get("TURBOFIELDFARE_API_KEY", "")
+        return backend, url, key
     url = os.environ.get("OMLX_URL", "http://localhost:8000")
     key = os.environ.get("OMLX_API_KEY", "")
     if not key and SETTINGS.exists():
@@ -238,13 +350,8 @@ def load_system_prompt():
     return DEFAULT_SYSTEM
 
 
-def is_code_request(text):
-    lowered = text.lower()
-    code_terms = (
-        "script", "code", "program", "python", "bash", "shell", "function",
-        "create a", "write a", "generate a",
-    )
-    return any(term in lowered for term in code_terms)
+# is_code_request, should_auto_enable_agentic, requires_agentic_execution,
+# execution_contract, and tool_result_failed are imported from mlxlib (shared with mlxgui).
 
 
 def request_messages_for_turn(messages):
@@ -286,13 +393,14 @@ def request_messages_for_mode(messages, agentic_mode, backend):
             "Agentic mode is enabled. When the user asks about local files, remote files, directories, repos, "
             "or shell-accessible information, prefer using available tools instead of only describing what they "
             "could run. Keep tool use minimal, explicit, and relevant. Favor acting over explaining when the task "
-            "is concrete and tool-accessible."
+            "is concrete and tool-accessible. Never claim a file was created, run, inspected, verified, or shared "
+            "unless a tool actually performed that action and returned evidence."
         )})
     else:
         scoped.insert(insert_at, {"role": "system", "content": (
             "Agentic mode is disabled. Do not attempt tool use; answer only from the provided conversation context."
         )})
-    if backend == "turbofieldfare":
+    if is_turbo_backend(backend):
         scoped = collapse_system_messages(scoped)
     return scoped
 
@@ -325,24 +433,85 @@ def server_up(url, key):
         return False
 
 
+def ensure_turbo_status_app():
+    if not TURBO_STATUS_APP.exists():
+        return
+    try:
+        subprocess.Popen(
+            ["open", "-g", str(TURBO_STATUS_APP)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def stop_omlx():
+    if not OMLX_BIN.exists():
+        return False
+    result = subprocess.run([str(OMLX_BIN), "stop"], capture_output=True, text=True, timeout=30)
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0 and ("stopped" in output.lower() or "stop" in output.lower() or not output.strip())
+
+
+def stop_turbofieldfare(backend=None):
+    pattern = "TurboFieldfareServer"
+    if backend == "turbofieldfare":
+        pattern = str(TURBO_MODEL_DIR)
+    elif backend == "turbofieldfare-qwen":
+        pattern = str(TURBO_QWEN_MODEL_DIR)
+    first = subprocess.run(["pkill", "-f", pattern], capture_output=True, text=True, timeout=15)
+    time.sleep(1)
+    probe = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=15)
+    if probe.returncode == 0:
+        second = subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, text=True, timeout=15)
+        return second.returncode == 0
+    return first.returncode == 0
+
+
+def stop_other_backend(target_backend):
+    if target_backend == "omlx":
+        stopped_gemma = stop_turbofieldfare("turbofieldfare")
+        stopped_qwen = stop_turbofieldfare("turbofieldfare-qwen")
+        if stopped_gemma or stopped_qwen:
+            print("(stopped TurboFieldfare server)")
+        else:
+            print("(TurboFieldfare server was not running)")
+    elif target_backend == "turbofieldfare":
+        stopped = stop_omlx()
+        print("(stopped oMLX)" if stopped else "(oMLX was not running)")
+        stopped_qwen = stop_turbofieldfare("turbofieldfare-qwen")
+        print("(stopped TurboFieldfare Qwen server)" if stopped_qwen else "(TurboFieldfare Qwen server was not running)")
+    else:
+        stopped = stop_omlx()
+        print("(stopped oMLX)" if stopped else "(oMLX was not running)")
+        stopped_gemma = stop_turbofieldfare("turbofieldfare")
+        print("(stopped TurboFieldfare server)" if stopped_gemma else "(TurboFieldfare server was not running)")
+
+
 def ensure_server(backend, url, key):
+    if is_turbo_backend(backend):
+        ensure_turbo_status_app()
     if server_up(url, key):
         return
-    if backend == "turbofieldfare":
-        if not TURBO_SERVER_BIN.exists():
-            sys.exit(f"TurboFieldfare server not found at {TURBO_SERVER_BIN} — build TurboFieldfare first.")
-        if not TURBO_MODEL_DIR.exists():
-            sys.exit(f"TurboFieldfare model not found at {TURBO_MODEL_DIR} — install the model in the TurboFieldfare app first.")
-        print("TurboFieldfare server not running — launching it...")
-        TURBO_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = open(TURBO_SERVER_LOG, "a")
+    if is_turbo_backend(backend):
+        paths = backend_paths(backend)
+        if not paths["server_bin"].exists():
+            sys.exit(f"{backend_label(backend)} server not found at {paths['server_bin']} — build it first.")
+        if not paths["model_dir"].exists():
+            sys.exit(f"{backend_label(backend)} model not found at {paths['model_dir']} — install the model first.")
+        print(f"{backend_label(backend)} server not running — launching it...")
+        paths["log"].parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(paths["log"], "a")
         log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
         log_handle.flush()
         subprocess.Popen(
-            [str(TURBO_SERVER_BIN), "--model", str(TURBO_MODEL_DIR)],
-            cwd=TURBO_ROOT,
+            [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", paths["port"],
+             "--max-context", "32768"],
+            cwd=paths["root"],
             stdout=log_handle,
             stderr=log_handle,
+            start_new_session=True,
         )
     else:
         print("oMLX not running — launching it...")
@@ -357,10 +526,10 @@ def ensure_server(backend, url, key):
         time.sleep(2)
         waited += 2
         if server_up(url, key):
-            print(f"{'TurboFieldfare' if backend == 'turbofieldfare' else 'oMLX'} is up.")
+            print(f"{backend_label(backend)} is up.")
             return
-    if backend == "turbofieldfare":
-        sys.exit("TurboFieldfare server did not come up in 60s — check the app/model install.")
+    if is_turbo_backend(backend):
+        sys.exit(f"{backend_label(backend)} server did not come up in 60s — check the build/model install.")
     sys.exit("oMLX launched but the server didn't come up in 60s — check the menu bar icon.")
 
 
@@ -368,11 +537,11 @@ def list_models(backend, url, key):
     try:
         data = api(url, key, "/v1/models")
     except Exception as e:
-        name = "TurboFieldfare" if backend == "turbofieldfare" else "oMLX"
+        name = backend_label(backend)
         sys.exit(f"Cannot reach {name} at {url} ({e}). Is the server running?")
     ids = [m["id"] for m in data.get("data", [])]
     if not ids:
-        name = "TurboFieldfare" if backend == "turbofieldfare" else "oMLX"
+        name = backend_label(backend)
         sys.exit(f"{name} reports no models.")
     return ids
 
@@ -406,13 +575,14 @@ def pick_model(backend, url, key):
     print("Available local models:")
     for i, mid in enumerate(ids, 1):
         print(f"  {i}) {model_label(mid)}")
+    valid = {str(i) for i in range(1, len(ids) + 1)}
     try:
-        choice = input(f"Select model [1-{len(ids)}, Enter for 1]: ").strip()
+        choice = read_single_key(f"Select model [1-{len(ids)}, Enter for 1]: ", valid, default="1")
     except KeyboardInterrupt:
         print("\n(cancelled)")
         raise EOFError
     try:
-        return ids[int(choice) - 1] if choice else ids[0]
+        return ids[int(choice) - 1]
     except (ValueError, IndexError):
         print("(invalid selection — keeping first model)")
         return ids[0]
@@ -423,16 +593,16 @@ def pick_backend(current_backend):
     labels = list(SUPPORTED_BACKENDS)
     for i, name in enumerate(labels, 1):
         marker = " (current)" if name == current_backend else ""
-        print(f"  {i}) {name}{marker}")
+        print(f"  {i}) {name} {backend_description(name)}{marker}")
+    valid = {str(i) for i in range(1, len(labels) + 1)}
     try:
-        choice = input(f"Select backend [1-{len(labels)}, Enter for {current_backend}]: ").strip().lower()
+        choice = read_single_key(f"Select backend [1-{len(labels)}, Enter for {current_backend}]: ",
+                                 valid, default="")
     except KeyboardInterrupt:
         print("\n(cancelled)")
         raise EOFError
     if not choice:
         return current_backend
-    if choice in labels:
-        return choice
     try:
         return labels[int(choice) - 1]
     except (ValueError, IndexError):
@@ -442,25 +612,121 @@ def pick_backend(current_backend):
 
 # ---------- tools ----------
 
-def approve(desc):
-    return input(f"  approve: {desc} [y/N] ").strip().lower() == "y"
+def read_single_key(prompt, valid_chars, default=""):
+    """Read one keypress and return it immediately, no Enter required.
+    Falls back to line-buffered input() when stdin isn't a real terminal
+    (e.g. piped/scripted input), where raw keypresses aren't available."""
+    print(prompt, end="", flush=True)
+    if not sys.stdin.isatty():
+        try:
+            line = input().strip().lower()
+        except KeyboardInterrupt:
+            print()
+            raise
+        result = line[:1] if line else default
+        return result
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                ch = default
+                break
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch.lower() in valid_chars:
+                ch = ch.lower()
+                break
+            # unrecognized key: ignore and keep waiting rather than erroring
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    print(ch)
+    return ch
+
+
+# Tool categories the user has approved "always" for the rest of this session,
+# mirroring Claude Code's "don't ask again for this kind of action" behavior.
+ALWAYS_APPROVED = set()
+
+# When on, prints the model's own prose at each retry step of an agentic turn
+# (normally swallowed behind a terse status line), and its prose alongside a
+# tool call in the same turn. This backend doesn't expose a separate
+# reasoning/thinking token stream — there's no hidden chain-of-thought to
+# surface — so this is "don't hide what it actually said," not literal
+# chain-of-thought.
+SHOW_THINKING = False
+
+
+def approve(desc, category=None):
+    if category and category in ALWAYS_APPROVED:
+        print(f"  approve: {desc} [auto-approved: {category}]")
+        return True
+    ch = read_single_key(f"  approve: {desc} [y/N/a=always allow {category or 'this'}] ",
+                         {"y", "n", "a"}, default="n")
+    if ch == "a":
+        if category:
+            ALWAYS_APPROVED.add(category)
+            print(f"  (will auto-approve {category} actions for the rest of this session)")
+        return True
+    return ch == "y"
+
+
+# infer_command_cwd is imported from mlxlib (shared with mlxgui).
 
 
 def exec_tool(name, args):
+    # Some local backends qualify function names as shell:run_command or shell.run_command.
+    # Normalize those names before dispatching so valid tool calls are not silently lost.
+    raw_name = str(name or "")
+    normalized_name = raw_name.strip().lower().replace("/", ":").replace(".", ":")
+    name = normalized_name.rsplit(":", 1)[-1]
     if name == "run_command":
         cmd = args.get("command", "")
-        if not approve(f"run: {cmd}"):
+        print(f"  tool: run_command ({cmd})")
+        try:
+            mkdir_parts = shlex.split(cmd)
+        except ValueError:
+            mkdir_parts = []
+        if mkdir_parts[:2] == ["mkdir", "-p"] and len(mkdir_parts) > 2:
+            root = DOWNLOADS.resolve()
+            targets = [pathlib.Path(part).expanduser().resolve(strict=False) for part in mkdir_parts[2:]]
+            if all(target.is_relative_to(root) for target in targets) and all(target.exists() for target in targets):
+                return "exit_code=0\n(no action; requested directories already exist)"
+        if not approve(f"run: {cmd}", category="run_command"):
             return "User declined."
         try:
+            cwd = infer_command_cwd(cmd)
             p = subprocess.run(cmd, shell=True, capture_output=True,
-                               text=True, timeout=180)
+                               text=True, timeout=180, cwd=cwd)
             out = (p.stdout + p.stderr).strip()
-            return out[:MAX_FILE_CHARS] if out else "(no output)"
+            location = f"\nworking_directory={cwd}" if cwd else ""
+            return f"exit_code={p.returncode}{location}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
         except subprocess.TimeoutExpired:
             return "Command timed out."
-    if name == "read_file":
+    if name == "python_interpreter":
+        code = args.get("code", "")
+        print("  tool: python_interpreter")
+        if any(term in code for term in ("open(", "write_text(", "makedirs(", "mkdir(", "os.remove(", "unlink(")):
+            return "Error: use write_file for file creation and run_command for execution; python_interpreter is disabled for filesystem writes."
+        if not approve(f"run Python code ({len(code)} chars)", category="python_interpreter"):
+            return "User declined."
         try:
-            text = pathlib.Path(args["path"]).expanduser().read_text()
+            p = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                               text=True, timeout=180)
+            out = (p.stdout + p.stderr).strip()
+            return f"exit_code={p.returncode}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
+        except subprocess.TimeoutExpired:
+            return "Python execution timed out."
+    if name == "read_file":
+        print(f"  tool: read_file ({args.get('path', '')})")
+        target = pathlib.Path(args["path"]).expanduser()
+        if target.is_dir():
+            return (f"Error: {target} is a directory, not a file. "
+                    f"Use run_command with 'ls' or 'find' to see its contents.")
+        try:
+            text = target.read_text()
             note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
             print(f"  read: {args['path']} ({len(text)} chars)")
             return text[:MAX_FILE_CHARS] + note
@@ -468,14 +734,24 @@ def exec_tool(name, args):
             return f"Error: {e}"
     if name == "write_file":
         path = args.get("path", "")
-        content = args.get("content", "")
-        target = resolve_output_path(path)
+        content = args.get("content", args.get("text", ""))
+        print(f"  tool: write_file ({path})")
+        try:
+            target = resolve_output_path(path)
+        except ValueError as e:
+            return f"Error: {e}"
         old = ""
         if target.exists():
             try:
                 old = target.read_text(errors="replace")
             except Exception:
                 old = ""
+        if target.suffix == ".py" and target.exists() and "zcta" in old.lower() and re.search(r"\bzzcta\b", content, re.IGNORECASE):
+            return "Error: rejected suspicious overwrite; proposed Python content changes zcta to zzcta in an existing validated script. Inspect and preserve the existing file."
+        # Existing-file overwrites are gated by the interactive approve() prompt below
+        # (which shows the diff), not by guessing intent from the request's wording —
+        # that keyword-based pre-check silently blocked legitimate requests more than
+        # once and is not a reliable signal of what the user actually wants.
         diff = list(difflib.unified_diff(
             old.splitlines(), content.splitlines(),
             fromfile=f"{path} (current)", tofile=f"{path} (proposed)",
@@ -488,24 +764,78 @@ def exec_tool(name, args):
                 print(f"  ... ({len(diff) - 80} more diff lines)")
         else:
             print("  (no textual change)")
-        if not approve(f"write {len(content)} chars to {target}"):
+        if not approve(f"write {len(content)} chars to {target}", category="write_file"):
             return "User declined."
+        backup_path = backup_before_overwrite(target) if diff else None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-            return "Written."
+            note = f" (previous version backed up to {backup_path})" if backup_path else ""
+            return f"Written: {target} ({target.stat().st_size} bytes).{note}"
         except Exception as e:
             return f"Error: {e}"
     return "Unknown tool."
 
 
-# ---------- commands ----------
+# normalize_tool_name is imported from mlxlib (shared with mlxgui).
 
-def resolve_output_path(raw):
-    p = pathlib.Path(raw).expanduser()
-    if not p.is_absolute():
-        p = DOWNLOADS / p
-    return p
+
+def parse_text_tool_calls(content):
+    """Parse the narrow textual call syntax emitted by some Turbo adapters."""
+    if not content or "call:" not in content:
+        return []
+    patterns = (
+        ("run_command", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*run_command\s*\{\s*command:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("python_interpreter", r"call:python_interpreter\s*\{\s*code:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("write_file", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*write_file\s*\{\s*path:\s*(\"(?:\\.|[^\"])*\")\s*,\s*(?:content|text):\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("read_file", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*read_file\s*\{\s*path:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+    )
+    calls = []
+    for name, pattern in patterns:
+        for match in re.finditer(pattern, content, flags=re.DOTALL):
+            try:
+                value = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            if name == "run_command":
+                args = {"command": value}
+            elif name == "python_interpreter":
+                args = {"code": value}
+            elif name == "read_file":
+                args = {"path": value}
+            else:
+                second = re.search(r"(?:content|text):\s*(\"(?:\\.|[^\"])*\")", match.group(0), flags=re.DOTALL)
+                if not second:
+                    continue
+                try:
+                    args = {"path": value, "content": json.loads(second.group(1))}
+                except json.JSONDecodeError:
+                    continue
+            calls.append({"id": _unique_call_id("text_call"), "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args)}})
+    if not any(call["function"]["name"] == "python_interpreter" for call in calls):
+        marker = "call:python_interpreter{code:"
+        start = content.find(marker)
+        if start >= 0:
+            payload = content[start + len(marker):].strip()
+            if payload.startswith('"'):
+                payload = payload[1:]
+            # Turbo's text adapter closes this form with a quote and brace.
+            end = payload.rfind("}")
+            if end >= 0:
+                payload = payload[:end].rstrip()
+            if payload.endswith('"'):
+                payload = payload[:-1]
+            if payload:
+                payload = payload.replace('\\n', '\n').replace('\\"', '"')
+                calls.append({"id": _unique_call_id("text_call"), "type": "function",
+                              "function": {"name": "python_interpreter",
+                                            "arguments": json.dumps({"code": payload})}})
+    return calls
+
+
+# ---------- commands ----------
+# resolve_output_path is imported from mlxlib (shared with mlxgui).
 
 
 def markdown_to_text(markdown):
@@ -531,7 +861,8 @@ def paragraph_xml(text, style=None):
 
 
 def markdown_to_docx(path, title, markdown):
-    return formatted_markdown_to_docx(path, title, markdown)
+    if formatted_markdown_to_docx is not None:
+        return formatted_markdown_to_docx(path, title, markdown)
     body = [paragraph_xml(title, "Title")]
     body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
     for line in markdown.splitlines():
@@ -755,7 +1086,64 @@ def resource_recommendations(turns, last_in):
     return recommendations
 
 
-def do_paste(arg, messages, convert_mode):
+def focused_file_text(text, request_text):
+    codes = set(re.findall(r"\b\d{10,}\b", request_text or ""))
+    if len(codes) < 2:
+        return text
+    lines = text.splitlines()
+    matches = [line for line in lines if any(code in line for code in codes)]
+    if not matches:
+        return text
+    header = lines[:8]
+    return "\n".join(header + [line for line in matches if line not in header])
+
+
+def xlsx_matching_rows(path, request_text):
+    targets = set(re.findall(r"\b\d{10,}\b", request_text or ""))
+    if len(targets) < 2:
+        return None
+    ns = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root.findall("m:si", ns):
+                    shared.append("".join(node.text or "" for node in item.iter("{%s}t" % ns["m"])))
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            rows = []
+            for row in sheet.findall(".//m:sheetData/m:row", ns):
+                values = {}
+                for cell in row.findall("m:c", ns):
+                    value = cell.find("m:v", ns)
+                    text = "" if value is None else value.text or ""
+                    if cell.attrib.get("t") == "s" and text:
+                        text = shared[int(text)]
+                    column = re.match(r"[A-Z]+", cell.attrib.get("r", "")).group(0)
+                    values[column] = text
+                rows.append(values)
+            if not rows:
+                return None
+            headers = rows[0]
+            code_matches = []
+            for row in rows[1:]:
+                code = str(row.get("B", "")).strip()
+                if code in targets:
+                    code_matches.append(row)
+            if not code_matches:
+                return None
+            columns = sorted(headers, key=lambda name: (len(name), name))
+            def line(row):
+                return " | ".join(str(row.get(column, "")) for column in columns)
+            return "\n".join([line(headers), line({column: "---" for column in columns})] + [line(row) for row in code_matches])
+    except Exception:
+        return None
+
+
+def do_paste(arg, messages, convert_mode, request_text=None):
     raw = arg.strip().strip('"').strip("'")
     if not raw:
         print("usage: /paste <path-to-file>")
@@ -772,19 +1160,26 @@ def do_paste(arg, messages, convert_mode):
     except RuntimeError as e:
         print(f"({e})")
         return
-    clipped = text[:MAX_FILE_CHARS]
+    if p.suffix.lower() == ".xlsx" and request_text:
+        matched_rows = xlsx_matching_rows(p, request_text)
+        if matched_rows:
+            text = matched_rows
+            label = f"{p.name} (matched cost-center rows)"
+    focused = focused_file_text(text, request_text)
+    clipped = focused[:MAX_FILE_CHARS]
+    focused_note = " (filtered to requested cost centers)" if focused != text else ""
     note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
     messages.append({"role": "user",
                      "content": f"Contents of {label}:\n\n{clipped}"})
-    print(f"(pasted {label}: {len(clipped)} chars into context{note} — now ask about it)")
+    print(f"(pasted {label}: {len(clipped)} chars into context{focused_note}{note} — now ask about it)")
 
 
-def do_read(arg, messages, convert_mode):
+def do_read(arg, messages, convert_mode, request_text=None):
     raw = arg.strip().strip('"').strip("'")
     if not raw:
         print("usage: /read <path-to-file>")
         return
-    do_paste(raw, messages, convert_mode)
+    do_paste(raw, messages, convert_mode, request_text=request_text)
 
 
 def print_section(title, lines):
@@ -956,29 +1351,44 @@ def load_selected_files(messages, files, convert_mode, limit=8, char_budget=MAX_
     return labels
 
 
-def resolve_local_file_reference(text):
-    quoted = re.findall(r'["\']([^"\']+\.(?:txt|md|docx|pdf|doc|yaml|yml|json|csv|tsv))["\']', text, re.I)
-    bare = re.findall(r'(?<![A-Za-z0-9_./~-])([A-Za-z0-9_./~-]+\.(?:txt|md|docx|pdf|doc|yaml|yml|json|csv|tsv))', text, re.I)
+def resolve_file_token(token, allow_recursive_scan=True):
+    """Resolve an explicit path; refuse ambiguous bare filenames instead of guessing."""
+    p = pathlib.Path(token).expanduser()
+    if p.is_absolute() or p.parent != pathlib.Path("."):
+        options = [p] if p.is_absolute() else [pathlib.Path.cwd() / p, DOWNLOADS / p]
+        for option in options:
+            if option.exists() and option.is_file():
+                return option
+        return None
+    matches = []
+    for option in (pathlib.Path.cwd() / p, DOWNLOADS / p):
+        if option.exists() and option.is_file() and option not in matches:
+            matches.append(option)
+    if not matches and allow_recursive_scan:
+        try:
+            for option in DOWNLOADS.rglob(p.name):
+                if option.is_file() and option not in matches:
+                    matches.append(option)
+        except OSError:
+            pass
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_local_file_reference(text, allow_recursive_scan=True):
+    quoted = re.findall(r'[`"\']([^`"\']+\.(?:txt|md|docx|pdf|doc|pptx|xlsx|yaml|yml|json|csv|tsv))[`"\']', text, re.I)
+    bare = re.findall(r'(?<![A-Za-z0-9_./~-])([A-Za-z0-9_./~-]+\.(?:txt|md|docx|pdf|doc|pptx|xlsx|yaml|yml|json|csv|tsv))', text, re.I)
     candidates = quoted + bare
     checked = []
     for raw in candidates:
-        token = raw.strip().strip('"').strip("'").rstrip(".,:;")
+        token = raw.strip().strip('`').strip('"').strip("'").rstrip(".,:;")
         if not token:
             continue
-        p = pathlib.Path(token).expanduser()
-        options = [p]
-        if not p.is_absolute():
-            options.append(DOWNLOADS / p)
-            options.append(pathlib.Path.cwd() / p)
-        for option in options:
-            key = str(option)
-            if key in checked:
-                continue
-            checked.append(key)
-            if option.exists() and option.is_file():
-                return option
+        option = resolve_file_token(token, allow_recursive_scan=allow_recursive_scan)
+        if option and str(option) not in checked:
+            checked.append(str(option))
+            return option
     lowered = (text or "").lower()
-    if "downloads" in lowered:
+    if "downloads" in lowered and not (quoted or bare):
         for raw in bare:
             name = pathlib.Path(raw.strip().rstrip(".,:;")).name
             if not name:
@@ -986,20 +1396,179 @@ def resolve_local_file_reference(text):
             candidate = DOWNLOADS / name
             if candidate.exists() and candidate.is_file():
                 return candidate
+        for candidate in sorted(DOWNLOADS.rglob("*")):
+            if (
+                candidate.is_file()
+                and len(candidate.name) >= 6
+                and (
+                    candidate.suffix.lower() in CONVERTIBLE
+                    or candidate.suffix.lower() in REVIEWABLE_TEXT
+                )
+                and candidate.name.lower() in lowered
+            ):
+                return candidate
     return None
 
 
-def maybe_handle_natural_language_action(user, state, messages, convert_mode):
+def resolve_local_file_references(text, limit=12, allow_recursive_scan=True):
+    refs = []
+    checked = set()
+    quoted = re.findall(r'[`"\']([^`"\']+\.(?:txt|md|docx|pdf|doc|pptx|xlsx|yaml|yml|json|csv|tsv))[`"\']', text, re.I)
+    bare = re.findall(r'(?<![A-Za-z0-9_./~-])([A-Za-z0-9_./~-]+\.(?:txt|md|docx|pdf|doc|pptx|xlsx|yaml|yml|json|csv|tsv))', text, re.I)
+    lowered = (text or "").lower()
+    for raw in quoted + bare:
+        token = raw.strip().strip('`').strip('"').strip("'").rstrip(".,:;")
+        if not token:
+            continue
+        option = resolve_file_token(token, allow_recursive_scan=allow_recursive_scan)
+        if option and str(option) not in checked:
+            checked.add(str(option))
+            refs.append(option)
+        if len(refs) >= limit:
+            break
+    # Do not scan all of Downloads when an explicit filename was supplied.
+    # Generic names such as README.txt are not unique.
+    if not refs and "downloads" in lowered and not (quoted or bare):
+        for candidate in sorted(DOWNLOADS.rglob("*")):
+            if (
+                not candidate.is_file()
+                or len(candidate.name) < 6
+                or candidate.suffix.lower() not in CONVERTIBLE
+                and candidate.suffix.lower() not in REVIEWABLE_TEXT
+                or candidate.name.lower() not in lowered
+            ):
+                continue
+            refs.append(candidate)
+            if len(refs) >= limit:
+                break
+    return refs
+
+
+def resolve_local_folder_reference(text):
+    lowered = (text or "").lower()
+    if "manager resumes" in lowered:
+        candidate = DOWNLOADS / "Manager Resumes"
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    match = re.search(r'in\s+downloads/([A-Za-z0-9 _-]+)', text or "", re.I)
+    if match:
+        candidate = DOWNLOADS / match.group(1).strip()
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def detect_export_path(text):
+    patterns = [
+        r'(?:save|export)\s+(?:it\s+)?(?:to|as)\s+([~A-Za-z0-9_./ -]+\.(?:docx|md|txt|csv|xlsx))',
+    ]
+    for pattern in patterns:
+        found = re.findall(pattern, text or "", re.I)
+        for raw in found:
+            token = raw.strip().strip('"').strip("'").rstrip(".,:;")
+            if token:
+                return token
+    return None
+
+
+def direct_top_files_request(user):
+    """Handle the common Downloads size query without shell parsing or model tool loops."""
+    lowered = (user or "").lower()
+    if "downloads" not in lowered or "largest" not in lowered or "file" not in lowered:
+        return None
+    match = re.search(r"\btop\s+(\d+)\b", lowered)
+    if not match:
+        return None
+    count = max(1, min(int(match.group(1)), 100))
+    files = []
+    try:
+        for path in DOWNLOADS.iterdir():
+            if path.is_file():
+                try:
+                    files.append((path.stat().st_size, path.name))
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    files.sort(key=lambda item: (-item[0], item[1].lower()))
+    rows = files[:count]
+    if not rows:
+        return "No files found directly in Downloads."
+    return "\n".join(f"{index}. `{name}` ({size:,} bytes)" for index, (size, name) in enumerate(rows, 1))
+
+
+def maybe_handle_natural_language_action(user, state, messages, convert_mode, url, key, model, totals, backend, last_turn):
     lowered = (user or "").lower().strip()
     if not lowered:
         return False
+    direct_result = direct_top_files_request(user)
+    if direct_result:
+        print(direct_result)
+        messages.append({"role": "user", "content": user})
+        messages.append({"role": "assistant", "content": direct_result})
+        last_turn["in"] = 0
+        last_turn["out"] = 0
+        return True
     has_input_verb = any(re.search(rf'\b{re.escape(verb)}\b', lowered) for verb in INPUT_VERBS)
     has_output_verb = any(re.search(rf'\b{re.escape(verb)}\b', lowered) for verb in OUTPUT_VERBS)
-    local_file = resolve_local_file_reference(user or "")
-    if local_file and (has_input_verb or has_output_verb or "matrix" in lowered or "table" in lowered):
-        print(f"(routing to /read {local_file})")
-        do_read(str(local_file), messages, convert_mode)
-        state["last_paths"] = [local_file]
+    # A pure creation request ("create X with rows...") has no business auto-loading
+    # some unrelated same-named leftover file from elsewhere in Downloads into context.
+    local_files = resolve_local_file_references(user or "", allow_recursive_scan=has_input_verb)
+    local_file = local_files[0] if local_files else None
+    local_folder = resolve_local_folder_reference(user or "")
+    resume_heavy_request = (
+        ("downloads" in lowered or "download" in lowered)
+        and "resume" in lowered
+        and any(term in lowered for term in (
+            "review", "compare", "rank", "most experience", "most experienced",
+            "years of experience", "seniority", "strongest", "weakest", "list the one",
+        ))
+    )
+    if resume_heavy_request:
+        term = infer_filename_term(user) or "resume"
+        print(f"(routing to /namefind ~/Downloads {term})")
+        matches = do_namefind(f'"{DOWNLOADS}" "{term}"') or []
+        state["last_paths"] = matches
+        if not matches:
+            return True
+        content, turn_in, turn_out, elapsed = resume_compare_batched(
+            url, key, model, backend, [pathlib.Path(p) for p in matches], convert_mode, user
+        )
+        if not content:
+            return True
+        print()
+        print(content)
+        messages.append({"role": "user", "content": user})
+        messages.append({"role": "assistant", "content": content})
+        totals["in"] += turn_in
+        totals["out"] += turn_out
+        last_turn["in"] = turn_in
+        last_turn["out"] = turn_out
+        print_tokens("turn", turn_in, turn_out, elapsed=elapsed)
+        return True
+    if (local_files or local_folder) and (has_input_verb or has_output_verb or "matrix" in lowered or "table" in lowered):
+        loaded = []
+        file_filter_text = user
+        for previous in reversed(messages):
+            if previous.get("role") != "user":
+                continue
+            previous_text = previous.get("content", "")
+            if len(re.findall(r"\b\d{12}\b", previous_text)) >= 2:
+                file_filter_text = previous_text + "\n" + user
+                break
+        if local_files:
+            for path in local_files[:12]:
+                print(f"(routing to /read {path})")
+                do_read(str(path), messages, convert_mode, request_text=file_filter_text)
+                loaded.append(path)
+        elif local_folder:
+            files = reviewable_paths(local_folder)
+            if files:
+                labels = load_selected_files(messages, files, convert_mode, limit=12)
+                print(f"(loaded {len(labels)} file(s) from {local_folder})")
+                loaded.extend(files[:len(labels)])
+        state["last_paths"] = loaded
+        state["context_loaded"] = bool(loaded)
         messages.append({"role": "user", "content": f"Using the loaded file above, {user.strip()}"})
         return "continue_model"
     if "find files" in lowered and "download" in lowered and any(term in lowered for term in ("title", "name", "contain", "resume")):
@@ -1151,7 +1720,7 @@ def do_sshls(arg):
     except ValueError as e:
         print(f"({e})")
         return
-    if not approve(f"ssh ls {host}:{path}"):
+    if not approve(f"ssh ls {host}:{path}", category="ssh_read"):
         print("(declined)")
         return
     code, output = run_ssh_command(host, f"ls -la {shlex.quote(path)}")
@@ -1171,7 +1740,7 @@ def do_sshread(arg, messages):
     except ValueError as e:
         print(f"({e})")
         return
-    if not approve(f"ssh read {host}:{path}"):
+    if not approve(f"ssh read {host}:{path}", category="ssh_read"):
         print("(declined)")
         return
     code, output = run_ssh_command(host, f"cat {shlex.quote(path)}")
@@ -1200,7 +1769,7 @@ def do_sshfind(arg):
         print(f"({e})")
         return
     pattern = parts[1]
-    if not approve(f"ssh find {host}:{path} pattern {pattern}"):
+    if not approve(f"ssh find {host}:{path} pattern {pattern}", category="ssh_read"):
         print("(declined)")
         return
     remote_cmd = (
@@ -1238,7 +1807,7 @@ def do_sshwrite(arg):
             break
         lines.append(line)
     content = "\n".join(lines) + ("\n" if lines else "")
-    if not approve(f"ssh write {len(content)} chars to {host}:{path}"):
+    if not approve(f"ssh write {len(content)} chars to {host}:{path}", category="ssh_write"):
         print("(declined)")
         return
     remote_cmd = f"mkdir -p {shlex.quote(str(pathlib.PurePosixPath(path).parent))} && cat > {shlex.quote(path)}"
@@ -1250,7 +1819,7 @@ def do_sshwrite(arg):
 
 
 def write_remote_file(host, path, content):
-    if not approve(f"ssh write {len(content)} chars to {host}:{path}"):
+    if not approve(f"ssh write {len(content)} chars to {host}:{path}", category="ssh_write"):
         print("(declined)")
         return False
     remote_cmd = f"mkdir -p {shlex.quote(str(pathlib.PurePosixPath(path).parent))} && cat > {shlex.quote(path)}"
@@ -1268,7 +1837,7 @@ def write_remote_file_and_maybe_run(host, path, content, make_executable=False, 
         actions.append("chmod +x")
     if run_after:
         actions.append("run")
-    if not approve(f"ssh {'; '.join(actions)}"):
+    if not approve(f"ssh {'; '.join(actions)}", category="ssh_write"):
         print("(declined)")
         return False
     remote_parts = [
@@ -1305,7 +1874,7 @@ def do_sshrun(arg):
         return
     host = parts[0]
     command = " ".join(parts[1:])
-    if not approve(f"ssh run {host}: {command}"):
+    if not approve(f"ssh run {host}: {command}", category="ssh_run"):
         print("(declined)")
         return
     code, output = run_ssh_command(host, command)
@@ -1428,12 +1997,12 @@ def find_resume_files_in_downloads(limit=24):
 
 def local_path_hints(user_text):
     text = user_text or ""
-    hits = re.findall(r'(?:"([^"]+)"|\'([^\']+)\'|(~/[^\s]+)|(/Users/[^\s]+))', text)
+    hits = re.findall(r'(?:`([^`]+)`|"([^"]+)"|\'([^\']+)\'|(~/[^\s]+)|(/Users/[^\s]+))', text)
     paths = []
-    for quoted1, quoted2, tilde_path, abs_path in hits:
-        candidate = quoted1 or quoted2 or tilde_path or abs_path
+    for backtick, quoted1, quoted2, tilde_path, abs_path in hits:
+        candidate = backtick or quoted1 or quoted2 or tilde_path or abs_path
         if candidate:
-            paths.append(candidate)
+            paths.append(candidate.rstrip(".,:;"))
     lowered = text.lower()
     if "downloads" in lowered and not paths:
         paths.append(str(DOWNLOADS))
@@ -1463,13 +2032,20 @@ def infer_filename_term(user_text):
 
 def should_compare_resumes(user_text):
     lowered = (user_text or "").lower()
-    return "resume" in lowered and any(term in lowered for term in ("compare", "rank", "seniority", "strongest", "weakest"))
+    return "resume" in lowered and any(term in lowered for term in (
+        "compare", "rank", "seniority", "strongest", "weakest",
+        "most experience", "most experienced", "years of experience", "experience",
+    ))
 
 
 def should_name_search(user_text):
     lowered = (user_text or "").lower()
-    return any(term in lowered for term in ("which files", "find files", "list files", "files are in")) and (
-        "name" in lowered or "title" in lowered or "contain" in lowered or "resume" in lowered
+    return (
+        any(term in lowered for term in (
+            "which files", "find files", "list files", "files are in",
+            "all files containing", "files containing", "look in downloads for",
+        ))
+        and ("name" in lowered or "title" in lowered or "contain" in lowered or "resume" in lowered)
     )
 
 
@@ -1563,7 +2139,7 @@ def apply_agentic_preflight(user_text, messages, convert_mode):
                 host, path = parse_remote_spec(spec)
             except ValueError:
                 continue
-            if not approve(f"ssh read {host}:{path}"):
+            if not approve(f"ssh read {host}:{path}", category="ssh_read"):
                 notes.append("(agentic remote read declined)")
                 return notes
             code, output = run_ssh_command(host, f"cat {shlex.quote(path)}")
@@ -1665,7 +2241,7 @@ def append_loaded_file(messages, path, convert_mode):
     return f"{label}{note}"
 
 
-def do_resumecompare(arg, messages, convert_mode):
+def do_resumecompare(arg, messages, convert_mode, url, key, model, totals, backend, last_turn):
     try:
         parts = shlex.split(arg)
     except ValueError as e:
@@ -1685,33 +2261,33 @@ def do_resumecompare(arg, messages, convert_mode):
     if not files:
         print(f"(no resume-like files found in {target})")
         return False
-    labels = []
-    for path in files:
-        try:
-            labels.append(append_loaded_file(messages, path, convert_mode))
-        except RuntimeError as e:
-            print(f"({path.name}: {e})")
-    if not labels:
-        print("(no resume files could be loaded)")
-        return False
-    if jd_path:
-        try:
-            jd_label = append_loaded_file(messages, jd_path, convert_mode)
-            jd_note = f"\nUse the job description from {jd_label} as the evaluation standard."
-        except RuntimeError as e:
-            print(f"(job description not loaded: {e})")
-            jd_note = ""
-    else:
-        jd_note = ""
-    listed = "\n".join(f"- {label}" for label in labels)
-    messages.append({"role": "user", "content": (
-        "Using the loaded resumes, rank the candidates by name from strongest to weakest for the requested role or, "
+    user_request = (
+        "Using the resumes, rank the candidates by name from strongest to weakest for the requested role or, "
         "if no role is specified elsewhere in the conversation, by overall seniority and depth of relevant experience. "
         "For each candidate, give 2-4 short strengths and 1 short concern. Use candidate names, not filenames."
-        f"{jd_note}\n\nLoaded resume files:\n{listed}"
-    )})
-    print(f"(loaded {len(labels)} resume file(s) for comparison)")
-    return True
+    )
+    if jd_path:
+        try:
+            jd_text, jd_label = convert_file(jd_path, convert_mode)
+            user_request += f"\n\nUse the job description from {jd_label} as the evaluation standard.\n\n{jd_text[:MAX_FILE_CHARS]}"
+        except RuntimeError as e:
+            print(f"(job description not loaded: {e})")
+    content, turn_in, turn_out, elapsed = resume_compare_batched(
+        url, key, model, backend, files, convert_mode, user_request
+    )
+    if not content:
+        print("(no resume files could be summarized)")
+        return False
+    print()
+    print(content)
+    messages.append({"role": "user", "content": user_request})
+    messages.append({"role": "assistant", "content": content})
+    totals["in"] += turn_in
+    totals["out"] += turn_out
+    last_turn["in"] = turn_in
+    last_turn["out"] = turn_out
+    print_tokens("turn", turn_in, turn_out, elapsed=elapsed)
+    return False
 
 
 def do_yamlaudit(arg, messages, convert_mode):
@@ -1824,23 +2400,126 @@ def usage_counts(usage):
     return int(in_tokens or 0), int(out_tokens or 0)
 
 
-def print_tokens(label, in_tokens, out_tokens):
-    print(f"[tokens: in {in_tokens:,} / out {out_tokens:,}]", flush=True)
+def complete_once(url, key, model, messages, backend, max_tokens=MAX_RESPONSE_TOKENS):
+    payload = {
+        "model": model,
+        "messages": collapse_system_messages(messages) if is_turbo_backend(backend) else messages,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+    }
+    data = api(url, key, "/v1/chat/completions", payload)
+    choices = data.get("choices") or []
+    if not choices:
+        return "", {}
+    message = choices[0].get("message") or {}
+    return message.get("content", "") or "", data.get("usage") or {}
+
+
+def build_resume_batches(files, convert_mode, char_budget=MAX_BATCH_RESUME_CHARS, max_files=5):
+    batches = []
+    current = []
+    current_chars = 0
+    for path in files:
+        try:
+            text, label = convert_file(path, convert_mode)
+        except RuntimeError as e:
+            print(f"({path.name}: {e})")
+            continue
+        clipped = text[:MAX_FILE_CHARS]
+        size = len(clipped)
+        if current and (current_chars + size > char_budget or len(current) >= max_files):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append((path, label, clipped))
+        current_chars += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def summarize_resume_batch(url, key, model, backend, batch, batch_index, batch_total):
+    listed = "\n\n".join(f"Resume file: {label}\n\n{text}" for _, label, text in batch)
+    messages = [
+        {"role": "system", "content": (
+            "You are extracting structured summaries from resumes. "
+            "Do not omit candidates. Be concise and factual. "
+            "For each resume, output one bullet with: Name | Approx years of experience | Evidence | 1 short note."
+        )},
+        {"role": "user", "content": (
+            f"Summarize every resume in batch {batch_index}/{batch_total}. "
+            "Use candidate names, not filenames, when the name is available.\n\n"
+            f"{listed}"
+        )},
+    ]
+    return complete_once(url, key, model, messages, backend, max_tokens=1800)
+
+
+def resume_compare_batched(url, key, model, backend, files, convert_mode, user_request):
+    start = time.time()
+    batches = build_resume_batches(files, convert_mode)
+    if not batches:
+        return "", 0, 0, time.time() - start
+    batch_summaries = []
+    total_in = 0
+    total_out = 0
+    for index, batch in enumerate(batches, start=1):
+        print(f"(resume batch {index}/{len(batches)}: {len(batch)} file(s))")
+        summary, usage = summarize_resume_batch(url, key, model, backend, batch, index, len(batches))
+        in_tokens, out_tokens = usage_counts(usage)
+        total_in += in_tokens
+        total_out += out_tokens
+        if summary:
+            batch_summaries.append(f"Batch {index} summaries:\n{summary}")
+    if not batch_summaries:
+        return "", total_in, total_out, time.time() - start
+    final_messages = [
+        {"role": "system", "content": (
+            "You are combining batched resume summaries into one final answer. "
+            "Use only the provided summaries. Be concise and definitive."
+        )},
+        {"role": "user", "content": (
+            f"Using these batched resume summaries, respond to this request:\n{user_request}\n\n"
+            + "\n\n".join(batch_summaries)
+        )},
+    ]
+    final_content, usage = complete_once(url, key, model, final_messages, backend, max_tokens=1800)
+    in_tokens, out_tokens = usage_counts(usage)
+    total_in += in_tokens
+    total_out += out_tokens
+    return final_content, total_in, total_out, time.time() - start
+
+
+def print_tokens(label, in_tokens, out_tokens, elapsed=None):
+    rate = f" / {out_tokens / elapsed:.1f} tok/s" if elapsed and elapsed > 0 and out_tokens > 0 else ""
+    print(f"[tokens: in {in_tokens:,} / out {out_tokens:,}{rate}]", flush=True)
 
 
 # ---------- chat ----------
 
-def stream_once(url, key, model, messages, agentic_mode, backend):
-    """One streamed request. Returns (content, tool_calls, usage)."""
+def stream_once(url, key, model, messages, agentic_mode, backend, display_content=True):
+    """One streamed request. Returns (content, tool_calls, usage, stream_error).
+
+    stream_error is set when the server sends an error payload mid-stream
+    (e.g. its structured-output decoder chokes on a tool call the model
+    emitted despite no tools being declared for this turn) rather than
+    failing the initial HTTP request. Without checking for this, such a
+    response looks like an ordinary short/truncated answer.
+    """
     payload = {"model": model, "messages": request_messages_for_mode(messages, agentic_mode, backend),
                "max_tokens": MAX_RESPONSE_TOKENS, "stream": True,
-               "stream_options": {"include_usage": True}}
+               "stream_options": {"include_usage": True},
+               "repetition_penalty": DEFAULT_REPETITION_PENALTY}
     if agentic_mode:
         payload["tools"] = TOOLS
     content_parts = []
     calls = {}
     usage = {}
+    stream_error = None
     printed = False
+    repetition_detected = False
+    chunks_since_check = 0
     with urllib.request.urlopen(request(url, key, "/v1/chat/completions",
                                         payload), timeout=900) as r:
         for rawline in r:
@@ -1854,6 +2533,9 @@ def stream_once(url, key, model, messages, agentic_mode, backend):
                 chunk = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            if chunk.get("error"):
+                stream_error = chunk["error"]
+                break
             if chunk.get("usage"):
                 usage = chunk["usage"]
             choices = chunk.get("choices") or []
@@ -1862,11 +2544,22 @@ def stream_once(url, key, model, messages, agentic_mode, backend):
             delta = choices[0].get("delta") or {}
             piece = delta.get("content")
             if piece:
-                if not printed:
+                if display_content and not printed:
                     print()
                     printed = True
-                print(piece, end="", flush=True)
+                if display_content:
+                    print(piece, end="", flush=True)
                 content_parts.append(piece)
+                chunks_since_check += 1
+                # Check periodically rather than on every token — cheap enough at
+                # this cadence, and stopping within ~15 chunks of a stuck model
+                # falling into a repetition loop is what actually matters, not
+                # catching it on the exact first repeated character.
+                if chunks_since_check >= 15:
+                    chunks_since_check = 0
+                    if detect_repetition_loop("".join(content_parts)):
+                        repetition_detected = True
+                        break
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = calls.setdefault(idx, {"id": tc.get("id"),
@@ -1880,44 +2573,168 @@ def stream_once(url, key, model, messages, agentic_mode, backend):
                     slot["arguments"] += fn["arguments"]
     if printed:
         print()
+    if repetition_detected:
+        print("  (model generation fell into a repetition loop; stopped early)")
     tool_calls = [{"id": c["id"] or f"call_{i}", "type": "function",
                    "function": {"name": c["name"], "arguments": c["arguments"]}}
                   for i, c in sorted(calls.items())]
-    return "".join(content_parts), tool_calls, usage
+    content = "".join(content_parts)
+    if not tool_calls:
+        tool_calls = parse_text_tool_calls(content)
+        if tool_calls:
+            print("(compatibility: parsed textual tool call; structured tool calls are preferred)")
+    if not tool_calls:
+        tool_calls = parse_bare_json_tool_call(content)
+        if tool_calls:
+            print("(compatibility: parsed a bare function-name-plus-JSON tool call; structured tool calls are preferred)")
+    if not tool_calls:
+        tool_calls = parse_xml_tag_tool_call(content)
+        if tool_calls:
+            print("(compatibility: parsed an XML-tag-style tool call; structured tool calls are preferred)")
+    if not tool_calls:
+        tool_calls = parse_python_call_tool_call(content)
+        if tool_calls:
+            print("(compatibility: parsed a Python-call-style tool call; structured tool calls are preferred)")
+    # Text-adapter call syntax is protocol data, not assistant prose. Keeping it
+    # in the assistant message can make Turbo parse the same call a second time.
+    if tool_calls and "call:" in content:
+        content = ""
+    return content, tool_calls, usage, stream_error, repetition_detected
 
 
-def chat_turn(url, key, model, messages, totals, agentic_mode, backend):
+def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
+    turn_start = time.time()
     turn_in = 0
     turn_out = 0
+    retried_empty = False
+    repetition_streak = 0
+    tool_state = {"write": False, "run": False, "verify": False}
+    contract = contract or {}
+    last_tool_results = []
+    seen_tool_calls = {}
+    effective_agentic_mode = agentic_mode
+    retried_with_tools = False
     for _ in range(MAX_TOOL_STEPS):
-        content, tool_calls, usage = stream_once(url, key, model, messages, agentic_mode, backend)
+        content, tool_calls, usage, stream_error, repetition_detected = stream_once(
+            url, key, model, messages, effective_agentic_mode, backend,
+            display_content=not execution_required,
+        )
+        if repetition_detected:
+            repetition_streak += 1
+            if repetition_streak >= 2:
+                # It fell into the identical failure mode twice in a row for this
+                # request — further retries are very unlikely to help, and each one
+                # burns a full generation on garbage. Give up with an honest message
+                # instead of exhausting MAX_TOOL_STEPS on repeated dead ends.
+                print("(stopped: the model repeated the same generation-loop failure twice in a row; try rephrasing the request)")
+                totals["in"] += turn_in
+                totals["out"] += turn_out
+                print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
+                return turn_in, turn_out
+        else:
+            repetition_streak = 0
+        if stream_error:
+            # The model attempted a tool call the server couldn't resolve, most often
+            # because conversation history primed it to keep calling tools even on a
+            # turn where none were declared. Give it a real chance to use one before
+            # treating the truncated response as if it were a normal, complete answer.
+            if not effective_agentic_mode and not retried_with_tools:
+                retried_with_tools = True
+                effective_agentic_mode = True
+                print("(server rejected an unexpected tool call; retrying with tools enabled)")
+                continue
+            print(f"(server error mid-generation: {stream_error}; response below may be incomplete)")
         in_tokens, out_tokens = usage_counts(usage)
         turn_in += in_tokens
         turn_out += out_tokens
-        if not tool_calls and not content and in_tokens == 0 and out_tokens == 0:
-            print("(turn failed: server returned no output and no token usage; reduce loaded context or retry)")
-            return 0, 0
         if not tool_calls:
+            if not content and in_tokens == 0 and out_tokens == 0:
+                if not retried_empty:
+                    retried_empty = True
+                    print("(empty model response; retrying once)")
+                    continue
+                if last_tool_results:
+                    print("(model continuation failed; preserving tool results)")
+                    for result in last_tool_results:
+                        print(result)
+                else:
+                    print("(turn failed: server returned no output and no token usage; reduce loaded context or retry)")
+                return 0, 0
+            if execution_required and _ == 0:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": (
+                    "Execution required for this request. You did not call a tool. "
+                    "Do not report completion. Use run_command, read_file, or write_file now to perform the requested actions, "
+                    "then verify the exact output paths before responding."
+                )})
+                print("(model returned prose without performing the requested file operation; requesting tool execution)")
+                if SHOW_THINKING and content:
+                    print(f"  [thinking] {content}")
+                continue
+            unmet = [name for name, required in contract.items() if required and not tool_state.get(name)]
+            if execution_required and unmet:
+                if _ < MAX_TOOL_STEPS - 1:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": (
+                        "Do not claim completion. Required actions still lack evidence: " + ", ".join(unmet) +
+                        ". Use the appropriate tools and verify their results before responding."
+                    )})
+                    print(f"(verification incomplete: {', '.join(unmet)}; requesting missing tool actions)")
+                    if SHOW_THINKING and content:
+                        print(f"  [thinking] {content}")
+                    continue
+                print(f"(unverified: missing tool evidence for {', '.join(unmet)})")
+                return turn_in, turn_out
+            if execution_required:
+                print("(verified tool actions completed)")
+                if content:
+                    print(content)
             messages.append({"role": "assistant", "content": content})
             totals["in"] += turn_in
             totals["out"] += turn_out
-            print_tokens("turn", turn_in, turn_out)
+            print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
             return turn_in, turn_out
         messages.append({"role": "assistant", "content": content or None,
                          "tool_calls": tool_calls})
+        if SHOW_THINKING and content:
+            print(f"  [thinking] {content}")
+        repeated_failure = False
         for call in tool_calls:
-            fn = call["function"]["name"]
+            fn = normalize_tool_name(call["function"]["name"])
+            call["function"]["name"] = fn
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            result = exec_tool(fn, args)
+            call_key = (fn, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            if call_key in seen_tool_calls:
+                result = seen_tool_calls[call_key]
+                print("  (duplicate tool call suppressed; reusing prior result)")
+                if tool_result_failed(result):
+                    repeated_failure = True
+            else:
+                result = exec_tool(fn, args)
+                seen_tool_calls[call_key] = result
+            if fn == "write_file" and not tool_result_failed(result):
+                tool_state["write"] = True
+            if fn in {"run_command", "python_interpreter"} and not tool_result_failed(result):
+                tool_state["run"] = True
+            if fn == "read_file" or (fn in {"run_command", "python_interpreter"} and "stat " in (args.get("command", "") if isinstance(args, dict) else "")):
+                if not tool_result_failed(result):
+                    tool_state["verify"] = True
+            last_tool_results.append(result)
             messages.append({"role": "tool", "tool_call_id": call["id"],
                              "content": result})
+        if repeated_failure:
+            print("(stopped: the model repeated an already-failed tool call instead of adapting)")
+            totals["in"] += turn_in
+            totals["out"] += turn_out
+            print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
+            return turn_in, turn_out
     print("(stopped: too many tool steps — break the task into smaller pieces)")
     totals["in"] += turn_in
     totals["out"] += turn_out
-    print_tokens("turn", turn_in, turn_out)
+    print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
     return turn_in, turn_out
 
 
@@ -1925,8 +2742,19 @@ def trim(messages):
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if len(starts) > MAX_HISTORY_TURNS:
         cut = starts[-MAX_HISTORY_TURNS]
-        return [messages[0]] + messages[cut:]
-    return messages
+        messages = [messages[0]] + messages[cut:]
+    if sum(len(str(m.get("content") or "")) for m in messages) <= MAX_CONTEXT_CHARS:
+        return messages
+    system = messages[:1]
+    kept = []
+    total = sum(len(str(m.get("content") or "")) for m in system)
+    for message in reversed(messages[1:]):
+        size = len(str(message.get("content") or ""))
+        if kept and total + size > MAX_CONTEXT_CHARS:
+            break
+        kept.append(message)
+        total += size
+    return system + list(reversed(kept))
 
 
 def commands_only_from_help():
@@ -1943,6 +2771,70 @@ def verbs_text():
         "input verbs:  " + ", ".join(INPUT_VERBS) + "\n" +
         "output verbs: " + ", ".join(OUTPUT_VERBS)
     )
+
+
+def compact_refinement_context(messages, max_chars=9000):
+    """Provide only the recent user/assistant exchange needed to resolve follow-ups."""
+    parts = []
+    for message in messages[1:]:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        parts.append(f"{role.title()} message:\n{content[:4500]}")
+    return "\n\n".join(parts[-4:])[-max_chars:]
+
+
+def refine_request(url, key, model, backend, raw_request, context=""):
+    """Convert an ambiguous request into a compact executable request using limited context."""
+    refiner_system = (
+        "You are a prompt decoder, not the task solver. Rewrite the user's request into one precise prompt for another LLM.\n"
+        "Return only the rewritten prompt, with no preamble, analysis, or commentary.\n"
+        "Preserve every literal filename, path, number, code, quoted value, list item, and requested output column.\n"
+        "Do not invent missing inputs or facts. If the request refers to missing content, explicitly state that the input is missing.\n"
+        "Use the supplied recent context only to resolve references such as 'these', 'each', 'above', or 'the previous result'; "
+        "do not treat context as a new task unless the current request refers to it.\n"
+        "Resolve intent into: objective, resources, exact operation, constraints, preservation/order rules, and output format.\n"
+        "For matching or lookup tasks, require full-key matching and repeat any normalization rule exactly; never weaken it to suffix or similarity matching.\n"
+        "For local file listings or size rankings, recommend find with stat and byte-based sorting; never rely on ls with positional awk fields because filenames may contain spaces.\n"
+        "For file metadata such as creation dates, require stat on the exact files and never infer dates from names or prior text.\n"
+        "Keep the result compact and directly actionable."
+    )
+    prompt = raw_request
+    if context:
+        prompt = f"Recent conversation context (use only for resolving references):\n{context}\n\nCurrent request to refine:\n{raw_request}"
+    content, usage = complete_once(
+        url, key, model,
+        [{"role": "system", "content": refiner_system},
+         {"role": "user", "content": prompt}],
+        backend,
+        max_tokens=900,
+    )
+    return content.strip(), usage
+
+
+def request_refinement(url, key, model, backend, inline_request, last_user_request, messages, totals):
+    raw_request = inline_request.strip()
+    if not raw_request:
+        raw_request = last_user_request.strip()
+    if not raw_request:
+        raw_request = input("Request to refine: ").strip()
+    if not raw_request:
+        print("(refinement cancelled: no request supplied)")
+        return ""
+    refined, usage = refine_request(
+        url, key, model, backend, raw_request, compact_refinement_context(messages)
+    )
+    in_tokens, out_tokens = usage_counts(usage)
+    totals["in"] += in_tokens
+    totals["out"] += out_tokens
+    if not refined:
+        print("(refinement returned no text; using the original request)")
+        return raw_request
+    print("\nRefined request:")
+    print(refined)
+    print_tokens("refiner", in_tokens, out_tokens)
+    return refined
 
 
 def normalize_pasted_command(lines):
@@ -1976,6 +2868,10 @@ def read_user_command():
     user = normalize_pasted_command(lines).strip()
     if len(lines) > 1 and user:
         print("(normalized pasted multi-line input)")
+    if user.lower() == "mlxcli":
+        print("(you're already inside mlxcli — that won't be sent as a question. "
+              "Use /exit to quit, or /help for commands.)")
+        return ""
     return user
 
 
@@ -1984,6 +2880,11 @@ def do_where(backend, url, model, convert_mode, agentic_mode, state):
     remote_dir = state.get("current_remote_dir") or "(none)"
     last_remote_path = state.get("last_remote_path") or "(none)"
     print(f"backend: {backend}")
+    if is_turbo_backend(backend):
+        paths = backend_paths(backend)
+        print(f"server bin: {paths['server_bin']}")
+        print(f"model dir: {paths['model_dir']}")
+        print(f"log: {paths['log']}")
     print(f"url: {url}")
     print(f"model: {model}")
     print(f"convert: {convert_mode}")
@@ -1993,19 +2894,211 @@ def do_where(backend, url, model, convert_mode, agentic_mode, state):
     print(f"last remote path: {last_remote_path}")
 
 
-def do_tflog():
-    if not TURBO_SERVER_LOG.exists():
-        print(f"(no TurboFieldfare log found at {TURBO_SERVER_LOG})")
+def do_tflog(backend):
+    log_path = backend_paths(backend).get("log", TURBO_SERVER_LOG) if is_turbo_backend(backend) else TURBO_SERVER_LOG
+    if not log_path.exists():
+        print(f"(no {backend_label(backend)} log found at {log_path})")
         return
     try:
-        lines = TURBO_SERVER_LOG.read_text(errors="replace").splitlines()
+        lines = log_path.read_text(errors="replace").splitlines()
     except Exception as e:
-        print(f"(could not read TurboFieldfare log: {e})")
+        print(f"(could not read {backend_label(backend)} log: {e})")
         return
     tail = lines[-80:]
-    print(str(TURBO_SERVER_LOG) + ":")
+    print(str(log_path) + ":")
     for line in tail:
         print(line)
+
+
+def do_health(backend, url, key):
+    name = backend_label(backend)
+    print(f"backend: {backend}")
+    print(f"url: {url}")
+    if is_turbo_backend(backend):
+        paths = backend_paths(backend)
+        print(f"server binary: {'ok' if paths['server_bin'].exists() else 'missing'}")
+        print(f"model dir: {'ok' if paths['model_dir'].exists() else 'missing'}")
+        print(f"log file: {paths['log']}")
+    else:
+        print(f"omlx cli: {'ok' if OMLX_BIN.exists() else 'missing'}")
+    print(f"api reachable: {'yes' if server_up(url, key) else 'no'}")
+    try:
+        models = list_models(backend, url, key)
+        print(f"models: {', '.join(models[:4])}" + (" ..." if len(models) > 4 else ""))
+    except SystemExit as e:
+        print(str(e))
+
+
+def latest_assistant_content(messages):
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and message.get("content"):
+            return message["content"]
+    return ""
+
+
+def parse_markdown_table(markdown):
+    lines = [line.rstrip() for line in (markdown or "").splitlines()]
+    tables = []
+    i = 0
+    while i < len(lines) - 1:
+        if "|" not in lines[i] or "|" not in lines[i + 1]:
+            i += 1
+            continue
+        header = [cell.strip() for cell in lines[i].strip().strip("|").split("|")]
+        sep_cells = [cell.strip() for cell in lines[i + 1].strip().strip("|").split("|")]
+        if len(header) < 2 or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in sep_cells if cell):
+            i += 1
+            continue
+        rows = []
+        j = i + 2
+        while j < len(lines) and "|" in lines[j]:
+            row = [cell.strip() for cell in lines[j].strip().strip("|").split("|")]
+            if len(row) == len(header):
+                rows.append(row)
+                j += 1
+            else:
+                break
+        tables.append((header, rows))
+        i = j
+    return tables
+
+
+def write_csv_from_table(out, header, rows):
+    def esc(cell):
+        cell = cell.replace('"', '""')
+        return f'"{cell}"'
+    lines = [",".join(esc(c) for c in header)]
+    lines.extend(",".join(esc(c) for c in row) for row in rows)
+    out.write_text("\n".join(lines) + "\n")
+
+
+def col_letter(n):
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def write_xlsx_from_table(out, header, rows):
+    all_rows = [header] + rows
+    row_xml = []
+    for r_idx, row in enumerate(all_rows, start=1):
+        cells = []
+        for c_idx, value in enumerate(row, start=1):
+            ref = f"{col_letter(c_idx)}{r_idx}"
+            cells.append(
+                f'<c r="{ref}" t="inlineStr"><is><t>{escape(str(value))}</t></is></c>'
+            )
+        row_xml.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(row_xml)}</sheetData></worksheet>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '</Relationships>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+        '</Relationships>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+        '</Types>'
+    )
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="1"><font><sz val="11"/><name val="Aptos"/></font></fonts>'
+        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        '<borders count="1"><border/></borders>'
+        '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
+        '<cellXfs count="1"><xf xfId="0"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    core = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        '<dc:title>mlxcli Export</dc:title>'
+        f'<dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>'
+        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified>'
+        '</cp:coreProperties>'
+    )
+    app = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        '<Application>mlxcli</Application></Properties>'
+    )
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+        zf.writestr("xl/styles.xml", styles)
+        zf.writestr("docProps/core.xml", core)
+        zf.writestr("docProps/app.xml", app)
+
+
+def auto_export_latest(messages, raw_path):
+    content = latest_assistant_content(messages)
+    if not content:
+        print("(there is no model reply to export yet)")
+        return
+    out = resolve_output_path(raw_path.strip().strip('"'))
+    suffix = out.suffix.lower()
+    tables = parse_markdown_table(content)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if suffix == ".csv":
+            if not tables:
+                print("(no markdown table found in latest reply for csv export)")
+                return
+            write_csv_from_table(out, tables[0][0], tables[0][1])
+        elif suffix == ".xlsx":
+            if not tables:
+                print("(no markdown table found in latest reply for xlsx export)")
+                return
+            write_xlsx_from_table(out, tables[0][0], tables[0][1])
+        elif suffix == ".docx":
+            markdown_to_docx(out, "mlxcli Export", content)
+        elif suffix == ".md":
+            out.write_text(content)
+        elif suffix == ".txt":
+            out.write_text(markdown_to_text(content))
+        else:
+            out.write_text(content)
+        print(f"(auto-exported latest reply to {out})")
+    except Exception as e:
+        print(f"(couldn't auto-export: {e})")
 
 
 # ---------- main ----------
@@ -2013,37 +3106,82 @@ def do_tflog():
 def parse_args(argv):
     model = None
     system = load_system_prompt()
+    run_task = None
+    auto_yes = False
+    show_thinking = False
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
             system = argv[i + 1]
             i += 2
+        elif argv[i] in ("-r", "--run") and i + 1 < len(argv):
+            run_task = argv[i + 1]
+            i += 2
+        elif argv[i] in ("-y", "--yes"):
+            auto_yes = True
+            i += 1
+        elif argv[i] == "--thinking":
+            show_thinking = True
+            i += 1
         elif argv[i] in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
         else:
             model = argv[i]
             i += 1
-    return model, system
+    return model, system, run_task, auto_yes, show_thinking
 
 
 def main():
+    configure_readline()
     backend, url, key = load_cfg()
-    model_arg, system = parse_args(sys.argv[1:])
-    if not model_arg:
+    global SHOW_THINKING
+    model_arg, system, run_task, auto_yes, show_thinking = parse_args(sys.argv[1:])
+    if show_thinking:
+        SHOW_THINKING = True
+    if not model_arg and not run_task:
         selected_backend = pick_backend(backend)
         if selected_backend != backend:
             save_backend(selected_backend)
             backend, url, key = load_cfg()
+    stop_other_backend(backend)
     ensure_server(backend, url, key)
-    model = model_arg or pick_model(backend, url, key)
-    print(f"mlxcli — backend: {backend} — model: {model} — /help for commands")
+    model = model_arg or (list_models(backend, url, key)[0] if run_task else pick_model(backend, url, key))
     messages = [{"role": "system", "content": system}]
+    notes_path, notes_text = find_project_notes()
+    if notes_text:
+        messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+
+    if run_task:
+        # Headless one-shot mode: run a single task non-interactively and exit —
+        # for scripting, testing, or driving mlxcli without a live terminal.
+        if auto_yes:
+            ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
+        totals = {"in": 0, "out": 0}
+        messages.append({"role": "user", "content": run_task})
+        turn_mode = should_auto_enable_agentic(run_task) if requires_agentic_execution(run_task) else False
+        try:
+            chat_turn(
+                url, key, model, messages, totals, turn_mode, backend,
+                execution_required=requires_agentic_execution(run_task),
+                contract=execution_contract(run_task),
+            )
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:400]
+            print(f"[server error {e.code}] {body}")
+        except KeyboardInterrupt:
+            print("(interrupted)")
+        return
+
+    print(f"mlxcli — backend: {backend} ({backend_description(backend)}) — model: {model} — /help for commands")
+    if notes_text:
+        print(f"(loaded project notes from {notes_path})")
     totals = {"in": 0, "out": 0}
     last_turn = {"in": 0, "out": 0}
+    last_user_request = ""
     convert_mode = "auto"
     agentic_mode = False
-    state = {"last_paths": [], "current_remote": None, "current_remote_dir": None, "last_remote_path": None}
+    state = {"last_paths": [], "current_remote": None, "current_remote_dir": None, "last_remote_path": None, "context_loaded": False}
     while True:
         try:
             user = read_user_command().strip()
@@ -2052,6 +3190,23 @@ def main():
             break
         if not user:
             continue
+        if user.startswith("?"):
+            try:
+                user = request_refinement(
+                    url, key, model, backend, user[1:].strip(), last_user_request, messages, totals
+                )
+            except (EOFError, KeyboardInterrupt):
+                print("\n(request refinement cancelled)")
+                continue
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors="replace")[:400]
+                print(f"\n[refiner server error {e.code}] {body}")
+                continue
+            except Exception as e:
+                print(f"\n[refiner error] {e}")
+                continue
+            if not user:
+                continue
         if user in ("/exit", "/quit"):
             break
         if user == "/commands":
@@ -2069,7 +3224,7 @@ def main():
         if user.startswith("/backend "):
             selected = user.split(None, 1)[1].strip().lower()
             if selected not in SUPPORTED_BACKENDS:
-                print("usage: /backend omlx|turbofieldfare")
+                print("usage: /backend omlx|turbofieldfare|turbofieldfare-qwen")
                 continue
             try:
                 save_backend(selected)
@@ -2077,16 +3232,19 @@ def main():
                 print(f"[error] could not save backend: {e}")
                 continue
             backend, url, key = load_cfg()
+            stop_other_backend(backend)
             ensure_server(backend, url, key)
             model = model_arg or pick_model(backend, url, key)
             print(f"(backend: {backend}; model: {model})")
             continue
         if user == "/clear":
             messages = [{"role": "system", "content": system}]
+            last_user_request = ""
             state["last_paths"] = []
             state["current_remote"] = None
             state["current_remote_dir"] = None
             state["last_remote_path"] = None
+            state["context_loaded"] = False
             print("(history cleared)")
             continue
         if user == "/system":
@@ -2144,6 +3302,23 @@ def main():
             agentic_mode = mode == "on"
             print(f"(agentic mode: {'on' if agentic_mode else 'off'})")
             continue
+        if user == "/thinking":
+            print(f"(show thinking: {'on' if SHOW_THINKING else 'off'})")
+            continue
+        if user.startswith("/thinking "):
+            mode = user.split(None, 1)[1].strip().lower()
+            if mode not in {"on", "off"}:
+                print("usage: /thinking on|off")
+                continue
+            SHOW_THINKING = mode == "on"
+            print(f"(show thinking: {'on' if SHOW_THINKING else 'off'})")
+            continue
+        if user == "/notes":
+            if notes_text:
+                print(f"{notes_path}:\n{notes_text}")
+            else:
+                print("(no project notes loaded — looked for " + ", ".join(PROJECT_NOTES_FILENAMES) + f" in {pathlib.Path.cwd()})")
+            continue
         if user in ("/resources", "/resource"):
             do_resources(totals, messages, last_turn)
             continue
@@ -2162,7 +3337,10 @@ def main():
             do_mem()
             continue
         if user == "/tflog":
-            do_tflog()
+            do_tflog(backend)
+            continue
+        if user == "/health":
+            do_health(backend, url, key)
             continue
         if user == "/where":
             do_where(backend, url, model, convert_mode, agentic_mode, state)
@@ -2193,20 +3371,13 @@ def main():
                 except urllib.error.HTTPError as e:
                     body = e.read().decode(errors="replace")[:400]
                     print(f"\n[server error {e.code}] {body}")
+                except KeyboardInterrupt:
+                    print("\n(interrupted; returning to mlxcli prompt)")
                 except Exception as e:
                     print(f"\n[error] {e}")
             continue
         if user.startswith("/resumecompare"):
-            if do_resumecompare(user[len("/resumecompare"):], messages, convert_mode):
-                messages = trim(messages)
-                try:
-                    turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
-                    last_turn = {"in": turn_in, "out": turn_out}
-                except urllib.error.HTTPError as e:
-                    body = e.read().decode(errors="replace")[:400]
-                    print(f"\n[server error {e.code}] {body}")
-                except Exception as e:
-                    print(f"\n[error] {e}")
+            do_resumecompare(user[len("/resumecompare"):], messages, convert_mode, url, key, model, totals, backend, last_turn)
             continue
         if user.startswith("/yamlaudit"):
             if do_yamlaudit(user[len("/yamlaudit"):], messages, convert_mode):
@@ -2217,6 +3388,8 @@ def main():
                 except urllib.error.HTTPError as e:
                     body = e.read().decode(errors="replace")[:400]
                     print(f"\n[server error {e.code}] {body}")
+                except KeyboardInterrupt:
+                    print("\n(interrupted; returning to mlxcli prompt)")
                 except Exception as e:
                     print(f"\n[error] {e}")
             continue
@@ -2253,19 +3426,36 @@ def main():
         if user.startswith("/sshrun"):
             do_sshrun(user[7:])
             continue
+        request_agentic_mode = agentic_mode or should_auto_enable_agentic(user, messages)
+        if request_agentic_mode and not agentic_mode:
+            print("(agentic tools auto-enabled for this local-resource request)")
         if maybe_handle_remote_natural_language_action(user, state):
             continue
-        nl_result = maybe_handle_natural_language_action(user, state, messages, convert_mode)
+        state["context_loaded"] = False
+        last_user_request = user
+        pending_export_path = detect_export_path(user)
+        nl_result = maybe_handle_natural_language_action(user, state, messages, convert_mode, url, key, model, totals, backend, last_turn)
         if nl_result is True:
             continue
         if nl_result == "continue_model":
             messages = trim(messages)
             try:
-                turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
+                # Loaded-file turns already have their source in context; omit tools to avoid
+                # malformed Gemma tool-call output when the model only needs to summarize it.
+                turn_mode = request_agentic_mode if requires_agentic_execution(user) else False
+                turn_in, turn_out = chat_turn(
+                    url, key, model, messages, totals, turn_mode, backend,
+                    execution_required=requires_agentic_execution(user),
+                    contract=execution_contract(user),
+                )
                 last_turn = {"in": turn_in, "out": turn_out}
+                if pending_export_path:
+                    auto_export_latest(messages, pending_export_path)
             except urllib.error.HTTPError as e:
                 body = e.read().decode(errors="replace")[:400]
                 print(f"\n[server error {e.code}] {body}")
+            except KeyboardInterrupt:
+                print("\n(interrupted; returning to mlxcli prompt)")
             except Exception as e:
                 print(f"\n[error] {e}")
             continue
@@ -2274,11 +3464,26 @@ def main():
             selected_paths = state["last_paths"]
             if "resume" in user.lower():
                 selected_paths = [p for p in selected_paths if "resume" in pathlib.Path(p).name.lower()]
-            labels = load_selected_files(messages, selected_paths, convert_mode, limit=12)
-            if labels:
-                messages.append({"role": "user", "content": prompt_for_loaded_files(user, labels)})
-                print(f"(agentic loaded {len(labels)} file(s) from the last search results)")
-                handled_followup = True
+            if "resume" in user.lower() and selected_paths:
+                content, turn_in, turn_out, elapsed = resume_compare_batched(
+                    url, key, model, backend, [pathlib.Path(p) for p in selected_paths], convert_mode, user
+                )
+                if content:
+                    print()
+                    print(content)
+                    messages.append({"role": "user", "content": user})
+                    messages.append({"role": "assistant", "content": content})
+                    totals["in"] += turn_in
+                    totals["out"] += turn_out
+                    last_turn = {"in": turn_in, "out": turn_out}
+                    print_tokens("turn", turn_in, turn_out, elapsed=elapsed)
+                    handled_followup = True
+            if not handled_followup:
+                labels = load_selected_files(messages, selected_paths, convert_mode, limit=12)
+                if labels:
+                    messages.append({"role": "user", "content": prompt_for_loaded_files(user, labels)})
+                    print(f"(agentic loaded {len(labels)} file(s) from the last search results)")
+                    handled_followup = True
         if not handled_followup:
             messages.append({"role": "user", "content": user})
             if agentic_mode:
@@ -2286,11 +3491,20 @@ def main():
                     print(note)
         messages = trim(messages)
         try:
-            turn_in, turn_out = chat_turn(url, key, model, messages, totals, agentic_mode, backend)
+            turn_in, turn_out = chat_turn(
+                url, key, model, messages, totals, request_agentic_mode, backend,
+                execution_required=requires_agentic_execution(user),
+                contract=execution_contract(user),
+            )
             last_turn = {"in": turn_in, "out": turn_out}
+            if pending_export_path:
+                auto_export_latest(messages, pending_export_path)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
             print(f"\n[server error {e.code}] {body}")
+        except KeyboardInterrupt:
+            print("\n(interrupted; returning to mlxcli prompt)")
+            continue
         except Exception as e:
             print(f"\n[error] {e}")
 

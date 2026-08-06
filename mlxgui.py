@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Lightweight Tkinter chat GUI for oMLX with Markdown file import."""
+import difflib
 import json
 import os
 import pathlib
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -20,8 +22,25 @@ import html
 from html.parser import HTMLParser
 from datetime import datetime
 from xml.sax.saxutils import escape
-from tkinter import filedialog, messagebox, ttk
-from docx_export import markdown_to_docx as formatted_markdown_to_docx
+from tkinter import filedialog, messagebox, simpledialog, ttk
+try:
+    from docx_export import markdown_to_docx as formatted_markdown_to_docx
+except ImportError:
+    formatted_markdown_to_docx = None
+from mlxlib import (
+    DOWNLOADS, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
+    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
+    is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
+    execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
+    resolve_output_path, normalize_tool_name as gui_normalize_tool_name,
+    infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
+    backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
+    detect_repetition_loop as gui_detect_repetition_loop,
+    parse_bare_json_tool_call as gui_parse_bare_json_tool_call,
+    parse_xml_tag_tool_call as gui_parse_xml_tag_tool_call,
+    parse_python_call_tool_call as gui_parse_python_call_tool_call,
+    DEFAULT_REPETITION_PENALTY, _unique_call_id as gui_unique_call_id,
+)
 
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -29,9 +48,17 @@ SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
 GUI_DEFAULTS_PATH = pathlib.Path.home() / ".omlx" / "mlxgui_defaults.json"
 SESSIONS_DIR = pathlib.Path.home() / ".omlx" / "sessions"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
-MAX_FILE_CHARS = 8000
-MAX_HISTORY_TURNS = 12
-MAX_RESPONSE_TOKENS = 2500
+BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
+MODELS_ROOT = pathlib.Path.home() / "Models"
+TURBO_ROOT = MODELS_ROOT / "turbo-fieldfare"
+TURBO_SERVER_BIN = TURBO_ROOT / ".build" / "release" / "TurboFieldfareServer"
+TURBO_MODEL_DIR = TURBO_ROOT / "scratch" / "gemma4.gturbo"
+TURBO_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-server.log"
+TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-qwen"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TurboFieldfareServer"
+TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
+TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
+TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
 RESOURCE_REFRESH_MS = 5000
 RAG_MAX_FILES = 64
 RAG_MAX_CHUNKS = 4
@@ -42,14 +69,30 @@ RAG_CACHE_DIRNAME = ".mlxgui_rag_cache"
 RAG_CACHE_INDEX = "index.json"
 URL_MAX_FETCHES = 2
 URL_MAX_CHARS = 12000
-CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 CONVERT_MODES = ("auto", "all", "off")
-DOWNLOADS = pathlib.Path.home() / "Downloads"
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare", "turbofieldfare-qwen")
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac.\n"
     "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+    "Treat the user's supplied text, numbers, filenames, and codes as authoritative literal data. "
+    "Do not silently correct, normalize, truncate, expand, or substitute them unless explicitly asked.\n"
+    "When a request refers to content 'below', 'above', or 'in the pasted list', verify that the content is actually present. "
+    "If required input is missing, say exactly what is missing instead of guessing.\n"
+    "When a request names a category or target (e.g. 'my photos', 'my documents', 'my files') without stating where it lives, "
+    "ask which folder or path to use. Do not silently reuse a location mentioned in an earlier, unrelated request.\n"
+    "For file and spreadsheet tasks, use the named local resource when available, preserve text-formatted numeric values, "
+    "and follow requested columns, order, and output shape exactly. Distinguish source data from user-provided input data.\n"
+    "For exact-match tasks, compare the complete requested key and apply only the explicitly stated normalization rules; "
+    "never match a convenient suffix or a similar-looking value.\n"
+    "For local file listings or size rankings, use a filename-safe approach such as find with stat and sort by bytes; "
+    "do not parse ls output with positional awk fields because filenames may contain spaces.\n"
+    "For file metadata such as creation dates, use stat on the exact files and report the filesystem values; "
+    "do not infer dates from filenames or conversation text.\n"
     "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
     "Save created files in ~/Downloads unless the user gives another path.\n"
+    "For local file tasks, use the available tools and never claim a file was created, run, inspected, verified, or shared without tool evidence.\n"
+    "When running a local script against an absolute input file, use that input file's directory as the working directory unless another one is explicitly requested. Resolve relative outputs beside the input file.\n"
+    "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes.\n"
     "Keep replies brief and avoid repeating large imported text unless asked.\n"
     "Respect local LLM memory limits: summarize when possible, use only relevant imported context, and suggest Clear when old context is no longer needed.\n"
     "Be direct, respectful, and practical."
@@ -119,6 +162,75 @@ def load_cfg():
     return url, key
 
 
+def load_backend():
+    selected = os.environ.get("MLXCLI_BACKEND", "").strip().lower()
+    if selected in SUPPORTED_BACKENDS:
+        return selected
+    try:
+        selected = BACKEND_PATH.read_text().strip().lower()
+        if selected in SUPPORTED_BACKENDS:
+            return selected
+    except Exception:
+        pass
+    return "omlx"
+
+
+def save_backend(backend):
+    BACKEND_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BACKEND_PATH.write_text(backend + "\n")
+
+
+def is_turbo_backend(backend):
+    return backend in ("turbofieldfare", "turbofieldfare-qwen")
+
+
+def backend_label(backend):
+    return {
+        "omlx": "oMLX",
+        "turbofieldfare": "TurboFieldfare (Gemma 4)",
+        "turbofieldfare-qwen": "TurboFieldfare Qwen (Qwen 3.6)",
+    }.get(backend, backend)
+
+
+def backend_description(backend):
+    return {
+        "omlx": "General / Flexible",
+        "turbofieldfare": "Gemma 4 / General",
+        "turbofieldfare-qwen": "Qwen 3.6 / Coding",
+    }.get(backend, "")
+
+
+def backend_paths(backend):
+    if backend == "turbofieldfare-qwen":
+        return {
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_QWEN_MODEL_DIR,
+            "log": TURBO_QWEN_SERVER_LOG,
+            "url": "http://127.0.0.1:8081",
+        }
+    if backend == "turbofieldfare":
+        return {
+            "root": TURBO_ROOT,
+            "server_bin": TURBO_SERVER_BIN,
+            "model_dir": TURBO_MODEL_DIR,
+            "log": TURBO_SERVER_LOG,
+            "url": "http://127.0.0.1:8080",
+        }
+    return {}
+
+
+def load_backend_cfg(backend):
+    if backend == "omlx":
+        url, key = load_cfg()
+        return url, key
+    paths = backend_paths(backend)
+    return os.environ.get(
+        "TURBOFIELDFARE_QWEN_URL" if backend == "turbofieldfare-qwen" else "TURBOFIELDFARE_URL",
+        paths["url"],
+    ), os.environ.get("TURBOFIELDFARE_API_KEY", "")
+
+
 def load_system_prompt():
     try:
         saved = SYSTEM_PROMPT_PATH.read_text().strip()
@@ -172,20 +284,90 @@ def server_up(url, key):
         return False
 
 
-def ensure_server(url, key, status):
+def stop_omlx():
+    if not OMLX_BIN.exists():
+        return False
+    try:
+        result = subprocess.run([str(OMLX_BIN), "stop"], capture_output=True, text=True, timeout=30)
+    except Exception:
+        return False
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0 and ("stop" in output.lower() or not output.strip())
+
+
+def stop_turbo(backend):
+    paths = backend_paths(backend)
+    if not paths:
+        return False
+    pattern = str(paths["model_dir"])
+    try:
+        first = subprocess.run(["pkill", "-f", pattern], capture_output=True, text=True, timeout=15)
+        time.sleep(1)
+        probe = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=15)
+        if probe.returncode == 0:
+            second = subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, text=True, timeout=15)
+            return second.returncode == 0
+        return first.returncode == 0
+    except Exception:
+        return False
+
+
+def stop_other_backend(target_backend, status):
+    if target_backend == "omlx":
+        stopped = stop_turbo("turbofieldfare") or stop_turbo("turbofieldfare-qwen")
+        status("Stopped TurboFieldfare" if stopped else "TurboFieldfare was not running")
+    elif target_backend == "turbofieldfare":
+        stopped_omlx = stop_omlx()
+        stopped_qwen = stop_turbo("turbofieldfare-qwen")
+        status("Stopped oMLX and Turbo Qwen" if stopped_omlx or stopped_qwen else "Other backends were not running")
+    else:
+        stopped_omlx = stop_omlx()
+        stopped_gemma = stop_turbo("turbofieldfare")
+        status("Stopped oMLX and Turbo Gemma" if stopped_omlx or stopped_gemma else "Other backends were not running")
+
+
+def ensure_turbo_status_app():
+    try:
+        if TURBO_STATUS_APP.exists():
+            subprocess.run(["open", "-g", str(TURBO_STATUS_APP)], capture_output=True, text=True)
+    except Exception:
+        pass
+
+
+def ensure_server(backend, url, key, status):
+    if is_turbo_backend(backend):
+        ensure_turbo_status_app()
     if server_up(url, key):
         return True
-    status("Launching oMLX...")
-    subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
-    if OMLX_BIN.exists():
-        status("Starting oMLX server...")
-        subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
+    if is_turbo_backend(backend):
+        paths = backend_paths(backend)
+        if not paths["server_bin"].exists():
+            status(f"{backend_label(backend)} server is not built")
+            return False
+        if not paths["model_dir"].exists():
+            status(f"{backend_label(backend)} model is not installed")
+            return False
+        status(f"Starting {backend_label(backend)}...")
+        paths["log"].parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(paths["log"], "a")
+        log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
+        log_handle.flush()
+        subprocess.Popen(
+            [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1]],
+            cwd=paths["root"], stdout=log_handle, stderr=log_handle,
+        )
+    else:
+        status("Launching oMLX...")
+        subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
+        if OMLX_BIN.exists():
+            status("Starting oMLX server...")
+            subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
     for _ in range(30):
         time.sleep(2)
         if server_up(url, key):
-            status("oMLX is up")
+            status(f"{backend_label(backend)} is up")
             return True
-    status("oMLX server not reachable")
+    status(f"{backend_label(backend)} server not reachable")
     return False
 
 
@@ -416,13 +598,53 @@ def usage_counts(usage):
     return int(in_tokens or 0), int(out_tokens or 0)
 
 
-def is_code_request(text):
-    lowered = text.lower()
-    code_terms = (
-        "script", "code", "program", "python", "bash", "shell", "function",
-        "create a", "write a", "generate a",
-    )
-    return any(term in lowered for term in code_terms)
+PROMPT_REFINER_SYSTEM = (
+    "You are a prompt decoder, not the task solver. Rewrite the user's request into one precise prompt for another LLM.\n"
+    "Return only the rewritten prompt, with no preamble, analysis, or commentary.\n"
+    "Preserve every literal filename, path, number, code, quoted value, list item, and requested output column.\n"
+    "Do not invent missing inputs or facts. If the request refers to missing content, explicitly state that the input is missing.\n"
+    "Use the supplied recent context only to resolve references such as 'these', 'each', 'above', or 'the previous result'; "
+    "do not treat context as a new task unless the current request refers to it.\n"
+    "Resolve intent into: objective, resources, exact operation, constraints, preservation/order rules, and output format.\n"
+    "For matching or lookup tasks, require full-key matching and repeat any normalization rule exactly; never weaken it to suffix or similarity matching.\n"
+    "For local file listings or size rankings, recommend find with stat and byte-based sorting; never rely on ls with positional awk fields because filenames may contain spaces.\n"
+    "For file metadata such as creation dates, require stat on the exact files and never infer dates from names or prior text.\n"
+    "Keep the result compact and directly actionable."
+)
+
+
+def compact_refinement_context(messages, max_chars=9000):
+    parts = []
+    for message in messages[1:]:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        parts.append(f"{role.title()} message:\n{content[:4500]}")
+    return "\n\n".join(parts[-4:])[-max_chars:]
+
+
+def refine_prompt_once(url, key, model, raw_request, context=""):
+    prompt = raw_request
+    if context:
+        prompt = f"Recent conversation context (use only for resolving references):\n{context}\n\nCurrent request to refine:\n{raw_request}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": PROMPT_REFINER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 900,
+        "stream": False,
+        "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+    }
+    data = api(url, key, "/v1/chat/completions", payload)
+    choices = data.get("choices") or []
+    content = (choices[0].get("message") or {}).get("content", "") if choices else ""
+    return content.strip(), data.get("usage") or {}
+
+
+# gui_term_present and is_code_request are imported from mlxlib (shared with mlxcli).
 
 
 def request_messages_for_turn(messages, user_text):
@@ -807,8 +1029,54 @@ def trim(messages):
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if len(starts) > MAX_HISTORY_TURNS:
         cut = starts[-MAX_HISTORY_TURNS]
-        return [messages[0]] + messages[cut:]
-    return messages
+        messages = [messages[0]] + messages[cut:]
+    if sum(len(str(m.get("content") or "")) for m in messages) <= MAX_CONTEXT_CHARS:
+        return messages
+    system = messages[:1]
+    kept = []
+    total = sum(len(str(m.get("content") or "")) for m in system)
+    for message in reversed(messages[1:]):
+        size = len(str(message.get("content") or ""))
+        if kept and total + size > MAX_CONTEXT_CHARS:
+            break
+        kept.append(message)
+        total += size
+    return system + list(reversed(kept))
+
+
+# gui_should_auto_enable_agentic, gui_execution_contract, gui_tool_failed,
+# gui_normalize_tool_name, and gui_infer_command_cwd are imported from mlxlib
+# (shared with mlxcli).
+
+
+def parse_gui_text_tool_calls(content):
+    if not content or "call:" not in content:
+        return []
+    patterns = (
+        ("run_command", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*run_command\s*\{\s*command:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("read_file", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*read_file\s*\{\s*path:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("write_file", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*write_file\s*\{\s*path:\s*(\"(?:\\.|[^\"])*\")\s*,\s*(?:content|text):\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("python_interpreter", r"call:python_interpreter\s*\{\s*code:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+    )
+    calls = []
+    for name, pattern in patterns:
+        for match in re.finditer(pattern, content, flags=re.DOTALL):
+            try:
+                first = json.loads(match.group(1))
+                if name == "write_file":
+                    second = re.search(r"(?:content|text):\s*(\"(?:\\.|[^\"])*\")", match.group(0), flags=re.DOTALL)
+                    args = {"path": first, "content": json.loads(second.group(1))} if second else {}
+                elif name == "run_command":
+                    args = {"command": first}
+                elif name == "read_file":
+                    args = {"path": first}
+                else:
+                    args = {"code": first}
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            calls.append({"id": gui_unique_call_id("gui_text_call"), "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
 
 
 def markdown_to_text(markdown):
@@ -834,7 +1102,8 @@ def paragraph_xml(text, style=None):
 
 
 def markdown_to_docx(path, title, markdown):
-    return formatted_markdown_to_docx(path, title, markdown)
+    if formatted_markdown_to_docx is not None:
+        return formatted_markdown_to_docx(path, title, markdown)
     body = [paragraph_xml(title, "Title")]
     body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
     for line in markdown.splitlines():
@@ -920,15 +1189,20 @@ class MlxGui(tk.Tk):
         self.geometry("920x680")
         self.minsize(720, 500)
 
-        self.url, self.key = load_cfg()
+        self.backend = load_backend()
+        self.url, self.key = load_backend_cfg(self.backend)
         self.system_prompt = load_system_prompt()
         self.gui_defaults = load_gui_defaults()
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        notes_path, notes_text = find_project_notes()
+        if notes_text:
+            self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.events = queue.Queue()
         self.model_display_to_id = {}
         self.model_var = tk.StringVar()
+        self.backend_var = tk.StringVar(value=backend_label(self.backend))
         self.convert_var = tk.StringVar(value=self.gui_defaults["convert_mode"])
         self.chat_rag_folder_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Starting")
@@ -937,6 +1211,7 @@ class MlxGui(tk.Tk):
         self.memory_var = tk.StringVar(value="Resources: ...")
         self.working_var = tk.StringVar(value="")
         self.busy = False
+        self.refining = False
         self.last_user_text = ""
         self.current_stream_start = None
         self.current_stream_end = None
@@ -948,9 +1223,9 @@ class MlxGui(tk.Tk):
         self.pending_user_index = None
 
         self.build_ui()
+        self.after(80, self.choose_backend_on_launch)
         self.update_memory_indicator()
         self.start_resource_refresh()
-        threading.Thread(target=self.start_server_and_models, daemon=True).start()
         self.after(60, self.drain_events)
 
     def build_ui(self):
@@ -961,6 +1236,17 @@ class MlxGui(tk.Tk):
         ttk.Label(top, text="Model").pack(side="left")
         self.model_box = ttk.Combobox(top, textvariable=self.model_var, state="readonly", width=38)
         self.model_box.pack(side="left", padx=(6, 12))
+
+        ttk.Label(top, text="Backend").pack(side="left")
+        self.backend_box = ttk.Combobox(
+            top,
+            textvariable=self.backend_var,
+            state="readonly",
+            values=[backend_label(name) for name in SUPPORTED_BACKENDS],
+            width=25,
+        )
+        self.backend_box.pack(side="left", padx=(6, 12))
+        self.backend_box.bind("<<ComboboxSelected>>", self.backend_selection_changed)
 
         ttk.Button(top, text="New Chat", command=self.new_chat).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
@@ -1095,6 +1381,9 @@ class MlxGui(tk.Tk):
         self.input.bind("<<Paste>>", self.paste_into_input)
         self.bind_text_context_menu(self.input)
         ttk.Button(bottom, text="Paste", command=self.paste_into_input).pack(side="left", padx=(8, 0))
+        ttk.Button(bottom, text="Add File", command=self.insert_file_references).pack(side="left", padx=(8, 0))
+        self.refine_button = ttk.Button(bottom, text="Refine", command=self.refine_prompt)
+        self.refine_button.pack(side="left", padx=(8, 0))
         self.send_button = ttk.Button(bottom, text="Send", command=self.send)
         self.send_button.pack(side="left", padx=(8, 0))
 
@@ -1128,9 +1417,20 @@ class MlxGui(tk.Tk):
         edit.add_separator()
         edit.add_command(label="Clear Chat", command=self.clear_chat)
         menu.add_cascade(label="Edit", menu=edit)
+        tools_menu = tk.Menu(menu, tearoff=False)
+        tools_menu.add_command(label="Refine Prompt...", command=self.refine_prompt)
+        tools_menu.add_command(label="Add File Reference...", command=self.insert_file_references)
+        menu.add_cascade(label="Tools", menu=tools_menu)
         view = tk.Menu(menu, tearoff=False)
         view.add_command(label="Resources...", command=self.open_resources)
         menu.add_cascade(label="View", menu=view)
+        backend_menu = tk.Menu(menu, tearoff=False)
+        for backend in SUPPORTED_BACKENDS:
+            backend_menu.add_command(
+                label=f"{backend_label(backend)} - {backend_description(backend)}",
+                command=lambda name=backend: self.switch_backend(name),
+            )
+        menu.add_cascade(label="Backend", menu=backend_menu)
         defaults = tk.Menu(menu, tearoff=False)
         defaults.add_command(label="Settings...", command=self.open_settings)
         defaults.add_command(label="Restore Built-in Dialogue Defaults", command=self.restore_builtin_dialogue_defaults)
@@ -1259,6 +1559,49 @@ class MlxGui(tk.Tk):
 
     def open_dialogue_options(self):
         return self.open_settings()
+
+    def refine_prompt(self, request_text=None):
+        if self.busy or getattr(self, "refining", False):
+            return
+        raw_request = (request_text if request_text is not None else self.input.get("1.0", "end-1c")).strip()
+        if not raw_request:
+            raw_request = self.last_user_text.strip()
+        if not raw_request:
+            messagebox.showinfo(
+                "Refine Prompt",
+                "Enter a request in the prompt box first, or refine after sending a request.",
+                parent=self,
+            )
+            return
+        model = self.selected_model_id()
+        if not model:
+            messagebox.showinfo("No model", "Wait for models to load first.", parent=self)
+            return
+        self.refining = True
+        self.refine_button.configure(state="disabled")
+        self.status_var.set("Refining prompt")
+        self.start_working("Refining")
+        threading.Thread(
+            target=self.refine_prompt_worker,
+            args=(model, raw_request, compact_refinement_context(self.messages)),
+            daemon=True,
+        ).start()
+
+    def refine_prompt_worker(self, model, raw_request, context):
+        try:
+            refined, usage = refine_prompt_once(self.url, self.key, model, raw_request, context)
+            self.events.put(("refined", raw_request, refined, usage))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                detail = ""
+            message = f"HTTP {exc.code}: {exc.reason}"
+            if detail:
+                message += f" - {detail[:400]}"
+            self.events.put(("refine_error", message))
+        except Exception as exc:
+            self.events.put(("refine_error", str(exc)))
 
     def open_settings(self):
         win = tk.Toplevel(self)
@@ -1559,6 +1902,95 @@ class MlxGui(tk.Tk):
         self.working_var.set("Stopping")
         self.send_button.configure(state="normal")
 
+    def request_tool_approval(self, description):
+        event = threading.Event()
+        result = {"approved": False, "cancelled": False}
+        self.events.put(("approval", description, event, result))
+        while not event.wait(0.1):
+            if self.cancel_requested:
+                result["cancelled"] = True
+                return False
+        return result["approved"]
+
+    def execute_tool(self, name, args):
+        name = str(name or "").strip().lower().replace(".", ":").replace("/", ":").rsplit(":", 1)[-1]
+        if name == "run_command":
+            command = args.get("command", "")
+            try:
+                mkdir_parts = shlex.split(command)
+            except ValueError:
+                mkdir_parts = []
+            if mkdir_parts[:2] == ["mkdir", "-p"] and len(mkdir_parts) > 2:
+                root = DOWNLOADS.resolve()
+                targets = [pathlib.Path(part).expanduser().resolve(strict=False) for part in mkdir_parts[2:]]
+                if all(target.is_relative_to(root) for target in targets) and all(target.exists() for target in targets):
+                    return "exit_code=0\n(no action; requested directories already exist)"
+            if not self.request_tool_approval(f"Run command:\n{command}"):
+                return "User declined."
+            try:
+                cwd = gui_infer_command_cwd(command)
+                proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=180, cwd=cwd)
+                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                location = f"\nworking_directory={cwd}" if cwd else ""
+                return f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
+            except subprocess.TimeoutExpired:
+                return "Command timed out."
+        if name == "python_interpreter":
+            code = args.get("code", "")
+            if any(term in code for term in ("open(", "write_text(", "makedirs(", "mkdir(", "os.remove(", "unlink(")):
+                return "Error: use write_file for file creation and run_command for execution; python_interpreter is disabled for filesystem writes."
+            if not self.request_tool_approval(f"Run Python code ({len(code)} chars)"):
+                return "User declined."
+            try:
+                proc = subprocess.run(["python3", "-c", code], capture_output=True, text=True, timeout=180)
+                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                return f"exit_code={proc.returncode}\n{output or '(no output)'}"
+            except subprocess.TimeoutExpired:
+                return "Python execution timed out."
+        if name == "read_file":
+            path = pathlib.Path(args.get("path", "")).expanduser()
+            if path.is_dir():
+                return (f"Error: {path} is a directory, not a file. "
+                        f"Use run_command with 'ls' or 'find' to see its contents.")
+            try:
+                text = path.read_text(errors="replace")
+                return text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
+            except Exception as exc:
+                return f"Error: {exc}"
+        if name == "write_file":
+            raw_path = args.get("path", "")
+            content = args.get("content", args.get("text", ""))
+            target = resolve_output_path(raw_path)
+            old = ""
+            if target.exists():
+                try:
+                    old = target.read_text(errors="replace")
+                except Exception:
+                    old = ""
+                if target.suffix == ".py" and "zcta" in old.lower() and re.search(r"\bzzcta\b", content, re.IGNORECASE):
+                    return "Error: rejected suspicious overwrite; proposed Python content changes zcta to zzcta in an existing validated script. Inspect and preserve the existing file."
+            # Existing-file overwrites are gated by the approval dialog below (which
+            # shows a diff), not by guessing intent from the request's wording — that
+            # keyword-based pre-check silently blocked legitimate requests before.
+            preview = f"Write {len(content)} chars to:\n{target}"
+            if old and old != content:
+                diff_lines = list(difflib.unified_diff(
+                    old.splitlines(), content.splitlines(),
+                    fromfile="current", tofile="proposed", lineterm=""))[:40]
+                if diff_lines:
+                    preview += "\n\n" + "\n".join(diff_lines)
+            if not self.request_tool_approval(preview):
+                return "User declined."
+            backup_path = backup_before_overwrite(target) if (old and old != content) else None
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+                note = f" (previous version backed up to {backup_path})" if backup_path else ""
+                return f"Written: {target} ({target.stat().st_size} bytes).{note}"
+            except Exception as exc:
+                return f"Error: {exc}"
+        return f"Unknown tool: {name}"
+
     def finish_canceled_response(self, partial_text):
         if self.current_stream_start and self.current_stream_end and partial_text:
             self.style_assistant_range(self.current_stream_start, self.current_stream_end)
@@ -1812,7 +2244,7 @@ class MlxGui(tk.Tk):
         return "break"
 
     def start_server_and_models(self):
-        if not ensure_server(self.url, self.key, self.status):
+        if not ensure_server(self.backend, self.url, self.key, self.status):
             return
         try:
             models = list_models(self.url, self.key)
@@ -1822,6 +2254,60 @@ class MlxGui(tk.Tk):
         self.events.put(("models", models))
         self.status("Ready")
 
+    def choose_backend_on_launch(self):
+        choices = "\n".join(
+            f"{index}) {backend_label(name)} - {backend_description(name)}"
+            for index, name in enumerate(SUPPORTED_BACKENDS, 1)
+        )
+        selected = simpledialog.askstring(
+            "mlxgui Backend",
+            f"Choose backend (Enter for {backend_label(self.backend)}):\n\n{choices}",
+            initialvalue=str(SUPPORTED_BACKENDS.index(self.backend) + 1),
+            parent=self,
+        )
+        if selected is not None and selected.strip():
+            selected = selected.strip().lower()
+            if selected in SUPPORTED_BACKENDS:
+                self.backend = selected
+            else:
+                try:
+                    self.backend = SUPPORTED_BACKENDS[int(selected) - 1]
+                except (ValueError, IndexError):
+                    self.status_var.set("Invalid backend; using the previous backend")
+        self.backend_var.set(backend_label(self.backend))
+        self.url, self.key = load_backend_cfg(self.backend)
+        save_backend(self.backend)
+        stop_other_backend(self.backend, self.status)
+        threading.Thread(target=self.start_server_and_models, daemon=True).start()
+
+    def backend_selection_changed(self, _event=None):
+        selected_label = self.backend_var.get()
+        selected = next(
+            (name for name in SUPPORTED_BACKENDS if backend_label(name) == selected_label),
+            self.backend,
+        )
+        self.switch_backend(selected)
+
+    def switch_backend(self, backend):
+        if backend == self.backend:
+            return
+        if self.busy:
+            messagebox.showinfo("Backend", "Wait for the current response to finish before switching backends.")
+            self.backend_var.set(backend_label(self.backend))
+            return
+        self.backend = backend
+        self.backend_var.set(backend_label(backend))
+        self.url, self.key = load_backend_cfg(backend)
+        save_backend(backend)
+        self.model_var.set("")
+        self.model_box.configure(values=[])
+        self.status_var.set(f"Switching to {backend_label(backend)}...")
+        threading.Thread(target=self.restart_backend, daemon=True).start()
+
+    def restart_backend(self):
+        stop_other_backend(self.backend, self.status)
+        self.start_server_and_models()
+
     def import_files(self):
         paths = filedialog.askopenfilenames(
             title="Import one or more files",
@@ -1830,6 +2316,21 @@ class MlxGui(tk.Tk):
         if not paths:
             return
         self.import_paths(paths)
+
+    def insert_file_references(self):
+        paths = filedialog.askopenfilenames(
+            title="Select files to reference in your request",
+            initialdir=str(DOWNLOADS),
+        )
+        if not paths:
+            return
+        references = "\n".join(f"- {pathlib.Path(path)}" for path in paths)
+        existing = self.input.get("1.0", "end-1c").strip()
+        prefix = f"{existing}\n\n" if existing else ""
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", f"{prefix}Files:\n{references}\n")
+        self.input.focus_set()
+        self.status_var.set(f"Added {len(paths)} file reference(s) to the request")
 
     def import_paths(self, paths, source="imported"):
         mode = self.convert_var.get()
@@ -1991,9 +2492,13 @@ class MlxGui(tk.Tk):
         if not keep_rag:
             self.chat_rag_folder_var.set("")
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        notes_path, notes_text = find_project_notes()
+        if notes_text:
+            self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.last_user_text = ""
+        self.refining = False
         self.pending_user_index = None
         self.cancel_requested = False
         self.tokens_var.set("tokens: in 0 / out 0")
@@ -2029,10 +2534,14 @@ class MlxGui(tk.Tk):
         self.status_var.set("Cleared current chat")
 
     def send(self):
-        if self.busy:
+        if self.busy or self.refining:
             return
         text = self.input.get("1.0", "end-1c").strip()
         if not text:
+            return
+        if text.startswith("?"):
+            self.input.delete("1.0", "end")
+            self.refine_prompt(text[1:].strip() or None)
             return
         model = self.selected_model_id()
         if not model:
@@ -2066,67 +2575,194 @@ class MlxGui(tk.Tk):
             self.events.put(("append", f"\n[error] {context_error}\n"))
             self.events.put(("done", "", {}))
             return
-        payload = {
-            "model": model,
-            "messages": request_messages,
-            "max_tokens": MAX_RESPONSE_TOKENS,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        parts = []
-        usage = {}
-        try:
-            with urllib.request.urlopen(
-                request(self.url, self.key, "/v1/chat/completions", payload), timeout=900
-            ) as resp:
-                for rawline in resp:
-                    if self.cancel_requested:
-                        self.events.put(("canceled", "".join(parts)))
-                        return
-                    line = rawline.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    if chunk.get("usage"):
-                        usage = chunk["usage"]
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    piece = (choices[0].get("delta") or {}).get("content")
-                    if piece:
+        working_messages = list(request_messages)
+        agentic = gui_should_auto_enable_agentic(self.last_user_text)
+        contract = gui_execution_contract(self.last_user_text)
+        tool_state = {"write": False, "run": False, "verify": False}
+        seen_tool_calls = {}
+        retried_with_tools = False
+        repetition_streak = 0
+        if agentic:
+            working_messages.insert(1, {"role": "system", "content": (
+                "Agentic local-resource task: use tools for all file reads, writes, commands, and verification. "
+                "Do not simulate tool calls or claim completion without successful tool results and exact path evidence. "
+                "Do not repeat identical tool calls after a successful result; reuse the returned evidence, and preserve stronger existing file validation. write_file always shows the user a preview and asks for approval before an existing file is changed, so call it directly rather than staging a copy elsewhere first. "
+                "write_file creates parent directories, so do not issue a separate mkdir unless it is actually required."
+            )})
+        effective_agentic = agentic
+        for _step in range(MAX_TOOL_STEPS):
+            payload = {
+                "model": model, "messages": working_messages,
+                "max_tokens": MAX_RESPONSE_TOKENS, "stream": True,
+                "stream_options": {"include_usage": True},
+                "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+            }
+            if effective_agentic:
+                payload["tools"] = TOOLS
+            parts, calls, usage = [], {}, {}
+            stream_error = None
+            repetition_detected = False
+            chunks_since_check = 0
+            try:
+                with urllib.request.urlopen(request(self.url, self.key, "/v1/chat/completions", payload), timeout=900) as resp:
+                    for rawline in resp:
                         if self.cancel_requested:
                             self.events.put(("canceled", "".join(parts)))
                             return
-                        parts.append(piece)
-                        self.events.put(("append", piece))
-        except urllib.error.HTTPError as exc:
-            if self.cancel_requested:
-                self.events.put(("canceled", "".join(parts)))
+                        line = rawline.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("error"):
+                            stream_error = chunk["error"]
+                            break
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        piece = delta.get("content")
+                        if piece:
+                            parts.append(piece)
+                            if not effective_agentic:
+                                self.events.put(("append", piece))
+                            chunks_since_check += 1
+                            # Check periodically rather than on every token — cheap
+                            # at this cadence, and stopping within ~15 chunks of a
+                            # stuck model is what matters, not the exact first repeat.
+                            if chunks_since_check >= 15:
+                                chunks_since_check = 0
+                                if gui_detect_repetition_loop("".join(parts)):
+                                    repetition_detected = True
+                                    break
+                        for tool_call in delta.get("tool_calls") or []:
+                            index = tool_call.get("index", 0)
+                            slot = calls.setdefault(index, {"id": None, "name": "", "arguments": ""})
+                            slot["id"] = tool_call.get("id") or slot["id"]
+                            function = tool_call.get("function") or {}
+                            slot["name"] += function.get("name") or ""
+                            slot["arguments"] += function.get("arguments") or ""
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace").strip()[:400]
+                self.events.put(("append", f"\n[error] HTTP {exc.code}: {detail}\n"))
+                self.events.put(("done", "", usage))
+                return
+            except Exception as exc:
+                if self.cancel_requested:
+                    self.events.put(("canceled", "".join(parts)))
+                else:
+                    self.events.put(("append", f"\n[error] {exc}\n"))
+                    self.events.put(("done", "", usage))
+                return
+            if repetition_detected:
+                repetition_streak += 1
+                self.events.put(("status", "Model generation fell into a repetition loop; stopped early"))
+                if repetition_streak >= 2:
+                    # It fell into the identical failure mode twice in a row for
+                    # this request — further retries are very unlikely to help.
+                    self.events.put(("append", "\n[stopped: the model repeated the same generation-loop failure twice in a row; try rephrasing the request]\n"))
+                    self.events.put(("done", "", usage))
+                    return
             else:
+                repetition_streak = 0
+            if stream_error:
+                # The model attempted a tool call the server couldn't resolve, most often
+                # because conversation history primed it to keep calling tools even on a
+                # turn where none were declared. Give it a real chance to use one before
+                # treating the truncated response as if it were a normal, complete answer.
+                if not effective_agentic and not retried_with_tools:
+                    retried_with_tools = True
+                    effective_agentic = True
+                    self.events.put(("status", "Server rejected an unexpected tool call; retrying with tools enabled"))
+                    continue
+                self.events.put(("append", f"\n[server error mid-generation: {stream_error}; response above may be incomplete]\n"))
+            tool_calls = [{"id": slot["id"] or f"gui_call_{index}", "type": "function",
+                           "function": {"name": slot["name"], "arguments": slot["arguments"]}}
+                          for index, slot in sorted(calls.items())]
+            content = "".join(parts)
+            if not tool_calls and effective_agentic:
+                tool_calls = parse_gui_text_tool_calls(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility text tool call parsed"))
+            if not tool_calls and effective_agentic:
+                tool_calls = gui_parse_bare_json_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility bare-JSON tool call parsed"))
+            if not tool_calls and effective_agentic:
+                tool_calls = gui_parse_xml_tag_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility XML-tag tool call parsed"))
+            if not tool_calls and effective_agentic:
+                tool_calls = gui_parse_python_call_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility Python-call-style tool call parsed"))
+            if not tool_calls:
+                unmet = [name for name, required in contract.items() if required and not tool_state.get(name)]
+                if unmet and _step < MAX_TOOL_STEPS - 1:
+                    working_messages.append({"role": "assistant", "content": content})
+                    working_messages.append({"role": "user", "content": (
+                        "Do not claim completion. Missing tool evidence for: " + ", ".join(unmet) +
+                        ". Use the available tools and verify exact paths before responding."
+                    )})
+                    self.events.put(("status", f"Requesting missing tool actions: {', '.join(unmet)}"))
+                    continue
+                if unmet:
+                    self.events.put(("append", f"\n[unverified: missing tool evidence for {', '.join(unmet)}]\n"))
+                    self.events.put(("done", "", usage))
+                    return
+                if effective_agentic and content:
+                    self.events.put(("append", content))
+                self.events.put(("done", content, usage))
+                return
+            clean_content = "" if "call:" in content else content
+            assistant_tool_message = {"role": "assistant", "content": clean_content or None, "tool_calls": tool_calls}
+            working_messages.append(assistant_tool_message)
+            self.events.put(("tool_history", assistant_tool_message))
+            repeated_failure = False
+            for call in tool_calls:
+                call["function"]["name"] = gui_normalize_tool_name(call["function"]["name"])
                 try:
-                    detail = exc.read().decode("utf-8", errors="replace").strip()
-                except Exception:
-                    detail = ""
-                message = f"HTTP {exc.code}: {exc.reason}"
-                if detail:
-                    message += f" - {detail[:400]}"
-                self.events.put(("append", f"\n[error] {message}\n"))
-                self.events.put(("done", "", {}))
-            return
-        except Exception as exc:
-            if self.cancel_requested:
-                self.events.put(("canceled", "".join(parts)))
-            else:
-                self.events.put(("append", f"\n[error] {exc}\n"))
-                self.events.put(("done", "", {}))
-            return
-        self.events.put(("done", "".join(parts), usage))
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                self.events.put(("status", f"Running tool: {call['function']['name']}"))
+                call_key = (call["function"]["name"], json.dumps(args, sort_keys=True, ensure_ascii=False))
+                if call_key in seen_tool_calls:
+                    result = seen_tool_calls[call_key]
+                    self.events.put(("status", "Duplicate tool call suppressed; reusing prior result"))
+                    if gui_tool_failed(result):
+                        repeated_failure = True
+                else:
+                    result = self.execute_tool(call["function"]["name"], args)
+                    seen_tool_calls[call_key] = result
+                if self.cancel_requested:
+                    self.events.put(("canceled", content))
+                    return
+                if not gui_tool_failed(result):
+                    if call["function"]["name"] == "write_file":
+                        tool_state["write"] = True
+                    if call["function"]["name"] in {"run_command", "python_interpreter"}:
+                        tool_state["run"] = True
+                    if call["function"]["name"] == "read_file" or (
+                        call["function"]["name"] in {"run_command", "python_interpreter"}
+                        and "stat " in args.get("command", "")
+                    ):
+                        tool_state["verify"] = True
+                working_messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                self.events.put(("tool_history", working_messages[-1]))
+            if repeated_failure:
+                self.events.put(("append", "\n[stopped: the model repeated an already-failed tool call instead of adapting]\n"))
+                self.events.put(("done", "", usage))
+                return
+        self.events.put(("append", "\n[stopped: too many tool steps]\n"))
+        self.events.put(("done", "", {}))
 
     def selected_model_id(self):
         selected = self.model_var.get()
@@ -2137,8 +2773,40 @@ class MlxGui(tk.Tk):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
-                if kind == "append":
+                if kind == "approval":
+                    _kind, description, approval_event, approval_result = event
+                    if self.cancel_requested or approval_result.get("cancelled"):
+                        approval_result["approved"] = False
+                    else:
+                        approval_result["approved"] = messagebox.askyesno("Approve local tool action", description, parent=self)
+                    approval_event.set()
+                elif kind == "tool_history":
+                    self.messages.append(event[1])
+                elif kind == "append":
                     self.append_model_text(event[1])
+                elif kind == "refined":
+                    _raw_request, refined, usage = event[1], event[2], event[3]
+                    self.refining = False
+                    self.refine_button.configure(state="normal")
+                    self.stop_working()
+                    in_tokens, out_tokens = usage_counts(usage)
+                    self.totals["in"] += in_tokens
+                    self.totals["out"] += out_tokens
+                    if refined:
+                        self.input.delete("1.0", "end")
+                        self.input.insert("1.0", refined)
+                        self.input.focus_set()
+                        self.status_var.set(
+                            f"Prompt refined; review and press Send (in {in_tokens:,} / out {out_tokens:,})"
+                        )
+                    else:
+                        self.status_var.set("Refiner returned no text; original prompt retained")
+                elif kind == "refine_error":
+                    self.refining = False
+                    self.refine_button.configure(state="normal")
+                    self.stop_working()
+                    self.status_var.set("Prompt refinement failed")
+                    self.append(f"\n[refiner error] {event[1]}\n")
                 elif kind == "status":
                     self.status_var.set(event[1])
                 elif kind == "models":

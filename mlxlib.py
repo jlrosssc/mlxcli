@@ -1,0 +1,423 @@
+"""Shared logic for mlxcli and mlxgui.
+
+Both tools talk to the same local model servers (omlx, turbofieldfare,
+turbofieldfare-qwen) and need the same answers to "is this an agentic
+request", "what does this tool call actually do", and "which files count as
+reviewable code". Keeping that logic in one place means a fix made here
+applies to both interfaces at once, instead of the two independently
+maintained copies drifting apart and re-accumulating the same bugs.
+
+Constants and pure functions only — no Tkinter, no terminal I/O. Each caller
+keeps its own approval UI (a keypress prompt for mlxcli, a modal dialog for
+mlxgui) since those are fundamentally different interaction models.
+"""
+import json
+import pathlib
+import re
+import shutil
+import uuid
+from datetime import datetime
+
+DOWNLOADS = pathlib.Path.home() / "Downloads"
+
+MAX_FILE_CHARS = 8000
+MAX_HISTORY_TURNS = 12
+MAX_RESPONSE_TOKENS = 2500
+MAX_CONTEXT_CHARS = 60000
+MAX_TOOL_STEPS = 16
+
+# TurboFieldfareServer defaults repetition_penalty to 1 (i.e. off) when a
+# request doesn't specify one — confirmed in its own source
+# (Sources/TurboFieldfareServer/Core/OpenAIModels.swift: `request.repetitionPenalty ?? 1`).
+# Neither mlxcli nor mlxgui were ever setting it, which is the direct, confirmed
+# cause of a local model getting stuck regenerating an identical block verbatim
+# dozens of times (nothing was discouraging the repeat). 1.15 is a
+# commonly-used value that suppresses loops without over-penalizing the
+# legitimately repeated tokens ordinary code contains (braces, keywords, etc.).
+DEFAULT_REPETITION_PENALTY = 1.15
+
+CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
+
+REVIEWABLE_TEXT = {
+    ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".conf", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".sh",
+    ".zsh", ".bash", ".env", ".xml", ".html", ".css", ".sql", ".csv",
+    # Swift/Objective-C (Xcode/iOS/macOS projects), plus the other common
+    # languages a local coding model is realistically asked to work in.
+    ".swift", ".m", ".mm", ".h", ".hpp", ".c", ".cpp", ".cc", ".cs",
+    ".kt", ".kts", ".rb", ".php", ".vue", ".svelte", ".plist",
+}
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "run_command",
+        "description": "Run a shell command; returns stdout+stderr (truncated).",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a text file (truncated to 8000 chars).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Write a new file or overwrite an existing file. Shows the user a preview and asks for approval before writing.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"}}, "required": ["path", "content"]}}},
+]
+
+
+def term_present(term, lowered_text):
+    """Match a keyword as a real word, not a substring buried inside an unrelated
+    word — e.g. "test" inside a path like "testLocalAI", or "put" inside "input".
+    Terms that are themselves punctuation-anchored (like ".py") keep plain substring
+    matching, since the leading "." already prevents this kind of false positive."""
+    if term.replace(" ", "").isalnum():
+        return bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", lowered_text))
+    return term in lowered_text
+
+
+def is_code_request(text):
+    lowered = text.lower()
+    code_terms = (
+        "script", "code", "program", "python", "bash", "shell", "function",
+        "create a", "write a", "generate a",
+    )
+    return any(term_present(term, lowered) for term in code_terms)
+
+
+def requires_agentic_execution(text):
+    """Identify requests where a prose-only answer would falsely imply completion."""
+    lowered = (text or "").lower()
+    action_terms = (
+        "create", "write", "save", "run", "execute", "test", "export",
+        "generate files", "place the files", "put the files", "verify",
+        "confirm that", "list its byte size", "share the final files",
+        "open", "show", "view", "look at", "check", "list", "read",
+        "update", "modify", "edit", "add", "change",
+    )
+    target_terms = (
+        "file", "files", "directory", "folder", "path", "csv", "script",
+        "downloads", ".py", ".csv", "readme", "project",
+    )
+    # A literal filesystem path (e.g. pasted from Finder or a prior tool result) is
+    # itself an unambiguous signal to verify against the real filesystem, regardless
+    # of which verb (if any) accompanies it.
+    has_path_literal = bool(re.search(r"(?:^|\s)(~/\S+|/[A-Za-z0-9_][^\s]*)", text or ""))
+    return has_path_literal or (
+        any(term_present(term, lowered) for term in action_terms)
+        and any(term_present(term, lowered) for term in target_terms)
+    )
+
+
+def should_auto_enable_agentic(text, messages=None):
+    """Detect requests that require local tools without changing the user's mode setting."""
+    lowered = (text or "").lower()
+    local_target = (
+        bool(re.search(r"(?:^|\s)(?:~|/|\./|\.\./)[^\s]+", lowered))
+        or any(term_present(term, lowered) for term in (
+            "downloads", "download folder", "local file", "local folder", "filesystem",
+            "file system", "directory", "folder", "repository", "repo", "working tree",
+            ".xlsx", ".xls", ".csv", ".pdf", ".docx", ".md", ".py", "/users/",
+        ))
+    )
+    operation = any(term_present(term, lowered) for term in (
+        "list", "show", "find", "search", "read", "open", "inspect", "review", "compare",
+        "check", "audit", "look up", "lookup", "largest", "smallest", "size", "space", "run", "execute",
+        "create", "write", "edit", "modify", "update", "add", "change", "save", "export",
+        "clean", "tidy", "organize", "organise", "sort out", "declutter",
+        "free up", "back up", "backup", "what's using", "whats using", "what's taking",
+    ))
+    if local_target and operation:
+        return True
+    if messages and any(term_present(term, lowered) for term in ("file", "files", "creation date", "created", "metadata", "timestamp")):
+        recent = "\n".join(
+            (message.get("content") or "") for message in messages[-6:]
+            if message.get("role") in {"user", "assistant"}
+        ).lower()
+        return any(term in recent for term in ("downloads", "local file", "file listing", "largest files"))
+    return False
+
+
+def execution_contract(text):
+    lowered = (text or "").lower()
+    # A literal filesystem path is itself an unambiguous target, same as in
+    # requires_agentic_execution — a request built entirely around an absolute
+    # path (very common: paths pasted from Finder or a prior tool result) won't
+    # necessarily contain the literal word "file" or "path" anywhere in the text.
+    has_path_literal = bool(re.search(r"(?:^|\s)(~/\S+|/[A-Za-z0-9_][^\s]*)", text or ""))
+    target = has_path_literal or any(term_present(term, lowered) for term in ("file", "files", "directory", "folder", "path", "csv", "script", "downloads"))
+    return {
+        "write": target and any(term_present(term, lowered) for term in ("create", "write", "save", "generate", "place", "put", "update", "modify", "edit", "add", "change")),
+        "run": target and any(term_present(term, lowered) for term in ("run", "execute", "test")),
+        "verify": target and any(term_present(term, lowered) for term in ("verify", "inspect", "confirm", "byte size", "exists")),
+    }
+
+
+def tool_result_failed(result):
+    lowered = (result or "").lower()
+    match = re.search(r"exit_code=(-?\d+)", lowered)
+    return (match and int(match.group(1)) != 0) or any(
+        term in lowered for term in ("error:", "not found", "timed out", "user declined")
+    )
+
+
+def resolve_output_path(raw):
+    # A relative path (no directory given) defaults to Downloads for convenience.
+    # An absolute path is honored as-is — the diff/preview + approval prompt in
+    # write_file is the actual safety gate, not a fixed directory restriction,
+    # since the latter silently blocks legitimate writes to project files elsewhere.
+    p = pathlib.Path(raw).expanduser()
+    if not p.is_absolute():
+        p = DOWNLOADS / p
+    return p.resolve(strict=False)
+
+
+def normalize_tool_name(name):
+    return str(name or "").strip().lower().replace("/", ":").replace(".", ":").rsplit(":", 1)[-1]
+
+
+def infer_command_cwd(command):
+    """Keep relative script outputs beside an absolute local input file."""
+    for raw in re.findall(r"(?<![A-Za-z0-9])(/Users/[^\s'\"`]+)", command or ""):
+        path = pathlib.Path(raw.rstrip(".,:;()"))
+        if path.suffix.lower() in {".csv", ".tsv", ".json", ".xlsx", ".txt"} and path.exists():
+            return str(path.parent)
+    return None
+
+
+def detect_repetition_loop(text):
+    """True if the tail of `text` looks like a degenerate generation loop — the
+    same block of text repeated verbatim three times in a row. Local models
+    occasionally get stuck in this failure mode (observed: a Qwen backend
+    repeating an identical "<antThinking>...</antThinking>" block, ~220+ chars
+    each, dozens of times rather than producing a real response). Catching it
+    lets a turn abort early instead of burning the full token budget
+    generating garbage, every retry, for a prompt the model has gotten stuck on.
+
+    The minimum block size (100 chars) is deliberately well above a single
+    line of ordinary code: legitimate SwiftUI/JSX/CSS-style code very
+    routinely repeats a short line verbatim three-plus times in a row on
+    purpose (e.g. four consecutive `GridItem(.flexible()),` entries for a
+    4-column grid, ~43 chars each) — that's correct output, not a stuck model,
+    and a lower floor here false-positived on exactly that during testing.
+
+    Checks block sizes from large to small so a big repeated unit is found
+    before a smaller coincidental repeat inside it gets matched instead."""
+    stripped = (text or "").strip()
+    if len(stripped) < 300:
+        return False
+    # Start a few chars above the naive len//3 estimate: stripping leading/
+    # trailing whitespace off the whole text can shave a char or two off just
+    # the first/last repeat, nudging the true period slightly above len//3.
+    for block_len in range(len(stripped) // 3 + 5, 99, -1):
+        tail = stripped[-block_len * 3:]
+        if len(tail) < block_len * 3:
+            continue
+        a, b, c = tail[:block_len], tail[block_len:block_len * 2], tail[block_len * 2:]
+        if a == b == c and a.strip():
+            return True
+    return False
+
+
+KNOWN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter")
+
+
+def _unique_call_id(prefix):
+    """A globally-unique synthetic tool_call id, not just unique within one
+    parser invocation. Using a plain per-call-list counter (call_0, call_1, ...)
+    meant the same id recurred across different turns of the same
+    conversation, since each parser call restarts counting from 0 — and the
+    server's own history validator rejects a conversation containing a
+    repeated tool_call id with "invalid or duplicate historical tool call",
+    confirmed directly from a live run."""
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def parse_bare_json_tool_call(content):
+    """Some backends occasionally emit a tool call as plain text: the bare
+    function name on its own line, followed by a raw JSON object of arguments —
+    not this project's `call:name{...}` text-adapter syntax (see
+    parse_text_tool_calls in mlxcli/mlxgui), and not a real structured
+    tool_calls API response either. Observed directly from a Qwen backend:
+    'write_file\\n{"path": "...", "content": "..."}'. Recognize it anyway
+    rather than discarding an otherwise well-formed call just because of its
+    shape — the alternative is the model's whole response getting treated as
+    prose, retried, and often regenerating the same large output again."""
+    if not content:
+        return []
+    calls = []
+    for m in re.finditer(r"\b(" + "|".join(KNOWN_TOOL_NAMES) + r")\b", content):
+        name = m.group(1)
+        brace_pos = content.find("{", m.end())
+        if brace_pos == -1:
+            continue
+        # Only the tool name and whitespace/newlines may separate it from the
+        # opening brace — avoids matching the word "write_file" turning up
+        # incidentally in ordinary prose elsewhere in the response.
+        if content[m.end():brace_pos].strip():
+            continue
+        try:
+            args, _ = json.JSONDecoder().raw_decode(content[brace_pos:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(args, dict):
+            continue
+        calls.append({"id": _unique_call_id("bare_call"), "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
+
+
+def parse_xml_tag_tool_call(content):
+    """Some backends occasionally emit a tool call as XML-style tags instead of
+    real structured tool_calls or this project's other text-adapter conventions:
+    <toolname><argname>value</argname></toolname>. Observed directly from a Qwen
+    backend for read_file and run_command, repeated across every retry of a
+    stuck turn. Recognize it so a well-formed attempt doesn't get discarded as
+    prose and force yet another expensive regeneration."""
+    if not content:
+        return []
+    calls = []
+    for name in KNOWN_TOOL_NAMES:
+        for m in re.finditer(rf"<{name}>(.*?)</{name}>", content, re.DOTALL | re.IGNORECASE):
+            inner = m.group(1)
+            args = {}
+            for arg_match in re.finditer(r"<(\w+)>\s*(.*?)\s*</\1>", inner, re.DOTALL):
+                args[arg_match.group(1)] = arg_match.group(2).strip()
+            if args:
+                calls.append({"id": _unique_call_id("xml_call"), "type": "function",
+                              "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
+
+
+def _coerce_python_literal(raw):
+    if raw == "True":
+        return True
+    if raw == "False":
+        return False
+    if raw == "None":
+        return None
+    try:
+        return float(raw) if "." in raw else int(raw)
+    except ValueError:
+        return raw
+
+
+def _parse_python_call_args(text, pos):
+    """Parse `key='value', key2=123)` starting right after the opening paren,
+    tracking quote state so a comma or paren *inside* a quoted value (very
+    likely in a write_file `content` argument full of code) doesn't get
+    mistaken for the argument separator or the call's closing paren.
+    Returns (args_dict, end_pos), or (None, pos) if the syntax doesn't hold up."""
+    args = {}
+    n = len(text)
+    i = pos
+    while i < n:
+        while i < n and text[i] in " \t\r\n,":
+            i += 1
+        if i < n and text[i] == ")":
+            return args, i + 1
+        key_start = i
+        while i < n and (text[i].isalnum() or text[i] == "_"):
+            i += 1
+        if i == key_start:
+            return None, pos
+        key = text[key_start:i]
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n or text[i] != "=":
+            return None, pos
+        i += 1
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return None, pos
+        if text[i] in "'\"":
+            quote = text[i]
+            i += 1
+            value_chars = []
+            while i < n and text[i] != quote:
+                if text[i] == "\\" and i + 1 < n:
+                    escapes = {"n": "\n", "t": "\t", "r": "\r", "'": "'", '"': '"', "\\": "\\"}
+                    value_chars.append(escapes.get(text[i + 1], text[i + 1]))
+                    i += 2
+                else:
+                    value_chars.append(text[i])
+                    i += 1
+            if i >= n:
+                return None, pos
+            i += 1
+            args[key] = "".join(value_chars)
+        else:
+            val_start = i
+            while i < n and text[i] not in ",)":
+                i += 1
+            args[key] = _coerce_python_literal(text[val_start:i].strip())
+    return None, pos
+
+
+def parse_python_call_tool_call(content):
+    """Some backends occasionally emit a tool call as Python-style function-call
+    syntax instead of real structured tool_calls or this project's other
+    text-adapter conventions: name(key='value', key2='value2'). Observed
+    directly from a Qwen backend for read_file and run_command. Recognize it
+    so a well-formed attempt doesn't get discarded as prose — the alternative
+    the model reached for once several attempts of this went unrecognized was
+    to give up and hallucinate an unrelated excuse ("agentic mode is
+    disabled") for why nothing was happening."""
+    if not content:
+        return []
+    calls = []
+    for name in KNOWN_TOOL_NAMES:
+        for m in re.finditer(rf"\b{name}\s*\(", content):
+            args, _end = _parse_python_call_args(content, m.end())
+            if args is None:
+                continue
+            calls.append({"id": _unique_call_id("pycall"), "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
+
+
+BACKUP_DIR = pathlib.Path.home() / ".omlx" / "backups"
+
+
+def backup_before_overwrite(target):
+    """Save a timestamped copy of an existing file before it gets overwritten, so
+    a bad agentic edit can always be recovered. Backups are centralized under
+    ~/.omlx/backups (flattened path + timestamp) rather than left beside the
+    original file, so project directories don't accumulate stray .bak files that
+    an IDE might pick up. Returns the backup path, or None if there was nothing
+    to back up or the backup couldn't be written (never blocks the write itself)."""
+    if not target.exists():
+        return None
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        flat_name = str(target).lstrip("/").replace("/", "_")
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup_path = BACKUP_DIR / f"{flat_name}.{stamp}.bak"
+        shutil.copy2(target, backup_path)
+        return backup_path
+    except Exception:
+        return None
+
+
+# Conventional filenames checked (in order) for project-local instructions —
+# lets a user persist project-specific guidance ("write directly to this path,
+# don't stage in Downloads first") once, instead of repeating it every prompt.
+PROJECT_NOTES_FILENAMES = (".mlxcli-notes.md", "AGENTS.md", "CLAUDE.md")
+
+
+def find_project_notes(start_dir=None):
+    """Look for a project-local instructions file in the given directory
+    (default: cwd), trying each conventional filename in turn. Returns
+    (path, text) for the first one found, or (None, None)."""
+    base = pathlib.Path(start_dir or pathlib.Path.cwd())
+    for name in PROJECT_NOTES_FILENAMES:
+        candidate = base / name
+        if candidate.exists() and candidate.is_file():
+            try:
+                return candidate, candidate.read_text(errors="replace").strip()
+            except Exception:
+                continue
+    return None, None
