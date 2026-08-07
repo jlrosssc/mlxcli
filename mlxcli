@@ -13,7 +13,7 @@ Usage:
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
-  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /clear  /help  /exit
+  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /clear  /help  /exit
 """
 import atexit
 import difflib
@@ -54,6 +54,9 @@ from mlxlib import (
     detect_repetition_loop, parse_bare_json_tool_call, parse_xml_tag_tool_call,
     parse_python_call_tool_call, DEFAULT_REPETITION_PENALTY,
     _unique_call_id, suggest_better_backend,
+    load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
+    MODEL_SETTING_BOUNDS, clamp_model_setting,
+    record_last_artifact, last_artifact_system_note,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -204,6 +207,8 @@ HELP = """Commands:
   /models         list models the server offers
   /tflog          show the last lines of the TurboFieldfare server log
   /health         show selected backend health and basic readiness
+  /modelsettings  show/edit sampling params for the current backend (temperature, top_p, top_k,
+                  repetition_penalty, max_tokens); "set <key> <value>" to change, "reset" to restore defaults
   /resources      show dialogue pressure, token totals, and Mac memory status
   /mem            show RAM status, Metal cap, and top memory users
   /where          show current model, modes, and remote context
@@ -212,6 +217,7 @@ HELP = """Commands:
   /tokens         show running token totals for this mlxcli session
   /save [file]    save transcript as markdown (default: ~/Downloads/mlxcli-<timestamp>.md)
   /export [file]  save latest model reply as .docx, .md, or .txt (default: ~/Downloads/mlxcli-reply-<timestamp>.docx)
+  /copy           copy the latest reply's last code block (or full reply if none) to the clipboard
   /clear          wipe conversation history
   /commands       list slash commands only
   /help           this text
@@ -239,6 +245,7 @@ def configure_readline():
         return
     try:
         readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind("set enable-bracketed-paste on")
         readline.parse_and_bind('"\\e[A": previous-history')
         readline.parse_and_bind('"\\e[B": next-history')
         readline.parse_and_bind('"\\e[C": forward-char')
@@ -2388,6 +2395,25 @@ def do_export(arg, messages):
         print(f"(couldn't export: {e})")
 
 
+def do_copy(messages):
+    content = ""
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and message.get("content"):
+            content = message["content"]
+            break
+    if not content:
+        print("(there is no model reply to copy yet)")
+        return
+    blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", content, re.S)
+    payload = blocks[-1].rstrip("\n") if blocks else content
+    try:
+        subprocess.run(["pbcopy"], input=payload.encode(), check=True)
+        label = "last code block" if blocks else "full reply"
+        print(f"(copied {label} — {len(payload)} chars — to clipboard)")
+    except Exception as e:
+        print(f"(couldn't copy: {e})")
+
+
 def usage_counts(usage):
     if not usage:
         return 0, 0
@@ -2401,12 +2427,16 @@ def usage_counts(usage):
 
 
 def complete_once(url, key, model, messages, backend, max_tokens=MAX_RESPONSE_TOKENS):
+    settings = load_model_settings(backend)
     payload = {
         "model": model,
         "messages": collapse_system_messages(messages) if is_turbo_backend(backend) else messages,
         "max_tokens": max_tokens,
         "stream": False,
-        "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+        "temperature": settings["temperature"],
+        "top_p": settings["top_p"],
+        "top_k": settings["top_k"],
+        "repetition_penalty": settings["repetition_penalty"],
     }
     data = api(url, key, "/v1/chat/completions", payload)
     choices = data.get("choices") or []
@@ -2507,10 +2537,14 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
     failing the initial HTTP request. Without checking for this, such a
     response looks like an ordinary short/truncated answer.
     """
+    settings = load_model_settings(backend)
     payload = {"model": model, "messages": request_messages_for_mode(messages, agentic_mode, backend),
-               "max_tokens": MAX_RESPONSE_TOKENS, "stream": True,
+               "max_tokens": settings["max_tokens"], "stream": True,
                "stream_options": {"include_usage": True},
-               "repetition_penalty": DEFAULT_REPETITION_PENALTY}
+               "temperature": settings["temperature"],
+               "top_p": settings["top_p"],
+               "top_k": settings["top_k"],
+               "repetition_penalty": settings["repetition_penalty"]}
     if agentic_mode:
         payload["tools"] = TOOLS
     content_parts = []
@@ -2717,6 +2751,12 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
                 seen_tool_calls[call_key] = result
             if fn == "write_file" and not tool_result_failed(result):
                 tool_state["write"] = True
+                written_match = re.match(r"^Written: (.+?) \(", result)
+                if written_match:
+                    current_user_text = next(
+                        (m.get("content") for m in reversed(messages) if m.get("role") == "user"), ""
+                    )
+                    record_last_artifact(written_match.group(1), current_user_text)
             if fn in {"run_command", "python_interpreter"} and not tool_result_failed(result):
                 tool_state["run"] = True
             if fn == "read_file" or (fn in {"run_command", "python_interpreter"} and "stat " in (args.get("command", "") if isinstance(args, dict) else "")):
@@ -2838,14 +2878,24 @@ def request_refinement(url, key, model, backend, inline_request, last_user_reque
 
 
 def normalize_pasted_command(lines):
-    cleaned = [line.strip() for line in lines if line.strip()]
-    if not cleaned:
+    # A whole paste can arrive as a single input()-returned string containing
+    # embedded bare-CR or CRLF line endings (no real \n for input() to split
+    # on), so re-normalize line endings across the joined text before
+    # re-splitting. Leading whitespace per line is preserved so indentation-
+    # sensitive pastes (YAML, code, etc.) survive intact.
+    combined = "\n".join(lines).replace("\r\n", "\n").replace("\r", "\n")
+    raw = combined.split("\n")
+    while raw and not raw[0].strip():
+        raw.pop(0)
+    while raw and not raw[-1].strip():
+        raw.pop()
+    if not raw:
         return ""
-    if len(cleaned) == 1:
-        return cleaned[0]
-    if cleaned[0].startswith("/"):
-        return cleaned[0]
-    return " ".join(cleaned)
+    if len(raw) == 1:
+        return raw[0].strip()
+    if raw[0].strip().startswith("/"):
+        return raw[0].strip()
+    return "\n".join(raw)
 
 
 def read_user_command():
@@ -2927,6 +2977,42 @@ def do_health(backend, url, key):
         print(f"models: {', '.join(models[:4])}" + (" ..." if len(models) > 4 else ""))
     except SystemExit as e:
         print(str(e))
+
+
+def do_model_settings(backend, arg):
+    arg = arg.strip()
+    settings = load_model_settings(backend)
+    if not arg:
+        print(f"Model settings — {backend_label(backend)}:")
+        for key in MODEL_SETTING_DEFAULTS:
+            lo, hi = MODEL_SETTING_BOUNDS[key]
+            marker = "" if settings[key] == MODEL_SETTING_DEFAULTS[key] else "  (overridden)"
+            print(f"  {key:<20} {settings[key]}{marker}   [{lo}..{hi}]")
+        print("usage: /modelsettings set <key> <value>   /modelsettings reset")
+        return
+    if arg == "reset":
+        save_model_settings(backend, dict(MODEL_SETTING_DEFAULTS))
+        print(f"(reset model settings for {backend_label(backend)} to defaults)")
+        return
+    parts = arg.split(None, 2)
+    if len(parts) == 3 and parts[0] == "set":
+        key, raw_value = parts[1], parts[2]
+        if key not in MODEL_SETTING_DEFAULTS:
+            print(f"unknown setting: {key} (expected one of {', '.join(MODEL_SETTING_DEFAULTS)})")
+            return
+        try:
+            value = int(raw_value) if key in ("top_k", "max_tokens") else float(raw_value)
+        except ValueError:
+            print(f"invalid value for {key}: {raw_value}")
+            return
+        value = clamp_model_setting(key, value)
+        settings[key] = value
+        save_model_settings(backend, settings)
+        print(f"({key} = {value} for {backend_label(backend)})")
+        return
+    print("usage: /modelsettings                       show current values\n"
+          "       /modelsettings set <key> <value>      change and save one value\n"
+          "       /modelsettings reset                  restore defaults")
 
 
 def latest_assistant_content(messages):
@@ -3151,6 +3237,9 @@ def main():
     notes_path, notes_text = find_project_notes()
     if notes_text:
         messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+    artifact_note = last_artifact_system_note()
+    if artifact_note:
+        messages.append({"role": "system", "content": artifact_note})
 
     if run_task:
         # Headless one-shot mode: run a single task non-interactively and exit —
@@ -3244,6 +3333,9 @@ def main():
             continue
         if user == "/clear":
             messages = [{"role": "system", "content": system}]
+            artifact_note = last_artifact_system_note()
+            if artifact_note:
+                messages.append({"role": "system", "content": artifact_note})
             last_user_request = ""
             state["last_paths"] = []
             state["current_remote"] = None
@@ -3347,6 +3439,9 @@ def main():
         if user == "/health":
             do_health(backend, url, key)
             continue
+        if user == "/modelsettings" or user.startswith("/modelsettings "):
+            do_model_settings(backend, user[len("/modelsettings"):])
+            continue
         if user == "/where":
             do_where(backend, url, model, convert_mode, agentic_mode, state)
             continue
@@ -3363,6 +3458,9 @@ def main():
             continue
         if user.startswith("/export"):
             do_export(user[7:], messages)
+            continue
+        if user == "/copy":
+            do_copy(messages)
             continue
         if user.startswith("/paste"):
             do_paste(user[6:], messages, convert_mode)

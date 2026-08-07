@@ -36,6 +36,110 @@ MAX_TOOL_STEPS = 16
 # legitimately repeated tokens ordinary code contains (braces, keywords, etc.).
 DEFAULT_REPETITION_PENALTY = 1.15
 
+# Per-backend sampling overrides, editable from mlxcli (/modelsettings) and
+# mlxgui (Model Settings...). Unset keys fall back to these defaults, which
+# mirror what TurboFieldfareServer itself defaults to when a field is absent
+# (Sources/TurboFieldfareServer/Core/OpenAIModels.swift) so "no override
+# saved yet" behaves identically to today.
+MODEL_SETTINGS_PATH = pathlib.Path.home() / ".omlx" / "model_settings.json"
+
+MODEL_SETTING_DEFAULTS = {
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "top_k": 64,
+    "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+    "max_tokens": MAX_RESPONSE_TOKENS,
+}
+
+MODEL_SETTING_BOUNDS = {
+    "temperature": (0.0, 2.0),
+    "top_p": (0.01, 1.0),
+    "top_k": (1, 256),
+    "repetition_penalty": (1.0, 2.0),
+    "max_tokens": (64, 8000),
+}
+
+
+def load_model_settings(backend):
+    """Saved overrides for `backend`, merged over MODEL_SETTING_DEFAULTS."""
+    settings = dict(MODEL_SETTING_DEFAULTS)
+    try:
+        saved = json.loads(MODEL_SETTINGS_PATH.read_text())
+        for key, value in (saved.get(backend) or {}).items():
+            if key in settings:
+                settings[key] = value
+    except Exception:
+        pass
+    return settings
+
+
+def save_model_settings(backend, settings):
+    all_settings = {}
+    try:
+        all_settings = json.loads(MODEL_SETTINGS_PATH.read_text())
+    except Exception:
+        pass
+    all_settings[backend] = {
+        key: value for key, value in settings.items() if key in MODEL_SETTING_DEFAULTS
+    }
+    MODEL_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MODEL_SETTINGS_PATH.write_text(json.dumps(all_settings, indent=2) + "\n")
+
+
+def clamp_model_setting(key, value):
+    lo, hi = MODEL_SETTING_BOUNDS.get(key, (None, None))
+    if lo is None:
+        return value
+    return max(lo, min(hi, value))
+
+
+# Remembers the path (not the content) of the last file mlxcli/mlxgui wrote,
+# so a later "update it" / "fix the header" / "resave" request can be
+# resolved to a real path without the user re-pasting it, and without
+# keeping the file's content sitting in the conversation context. Survives
+# /clear and app restarts since it's a tiny file on disk, not chat history.
+LAST_ARTIFACT_PATH = pathlib.Path.home() / ".omlx" / "last_artifact.json"
+
+
+def record_last_artifact(path, task_summary):
+    try:
+        LAST_ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_ARTIFACT_PATH.write_text(json.dumps({
+            "path": str(path),
+            "task": (task_summary or "").strip()[:300],
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def load_last_artifact():
+    try:
+        data = json.loads(LAST_ARTIFACT_PATH.read_text())
+        if data.get("path"):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def last_artifact_system_note():
+    """A short system-message reminding the model where the last saved file
+    lives, without loading its content — read_file can pull it in on demand
+    if the user's next request seems to reference it."""
+    artifact = load_last_artifact()
+    if not artifact:
+        return None
+    return (
+        f"Most recently saved/edited local file: {artifact['path']} "
+        f"(from: \"{artifact['task']}\"). If the user's next request sounds like it refers "
+        f"to that file (\"update it\", \"fix the header\", \"regenerate it\", \"amend\", "
+        f"\"resave\", no explicit path given), read that file first with read_file to see "
+        f"its current contents before making changes, rather than asking the user for the "
+        f"path again."
+    )
+
+
 CONVERTIBLE = {".docx", ".pdf", ".pptx", ".xlsx", ".doc"}
 
 REVIEWABLE_TEXT = {
@@ -100,6 +204,7 @@ def requires_agentic_execution(text):
     target_terms = (
         "file", "files", "directory", "folder", "path", "csv", "script",
         "downloads", ".py", ".csv", "readme", "project",
+        "spreadsheet", "workbook", "excel", ".xlsx", ".xls", ".docx", ".pdf",
     )
     # A literal filesystem path (e.g. pasted from Finder or a prior tool result) is
     # itself an unambiguous signal to verify against the real filesystem, regardless
@@ -120,6 +225,7 @@ def should_auto_enable_agentic(text, messages=None):
             "downloads", "download folder", "local file", "local folder", "filesystem",
             "file system", "directory", "folder", "repository", "repo", "working tree",
             ".xlsx", ".xls", ".csv", ".pdf", ".docx", ".md", ".py", "/users/",
+            "spreadsheet", "workbook", "excel",
         ))
     )
     operation = any(term_present(term, lowered) for term in (

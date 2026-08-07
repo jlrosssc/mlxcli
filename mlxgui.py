@@ -27,6 +27,10 @@ try:
     from docx_export import markdown_to_docx as formatted_markdown_to_docx
 except ImportError:
     formatted_markdown_to_docx = None
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from mlxlib import (
     DOWNLOADS, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
@@ -42,6 +46,9 @@ from mlxlib import (
     parse_python_call_tool_call as gui_parse_python_call_tool_call,
     DEFAULT_REPETITION_PENALTY, _unique_call_id as gui_unique_call_id,
     suggest_better_backend as gui_suggest_better_backend,
+    load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
+    MODEL_SETTING_BOUNDS, clamp_model_setting,
+    record_last_artifact, last_artifact_system_note,
 )
 
 
@@ -61,7 +68,9 @@ TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TurboFieldfare
 TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
 TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
 TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
+MLXGUI_ICON_PATH = pathlib.Path(__file__).resolve().parent / "mlxgui_icon.png"
 RESOURCE_REFRESH_MS = 5000
+STATS_REFRESH_MS = 1500
 RAG_MAX_FILES = 64
 RAG_MAX_CHUNKS = 4
 RAG_CHUNK_CHARS = 1800
@@ -1027,6 +1036,157 @@ def system_resource_lines():
     return lines
 
 
+def _sysctl_int(name):
+    try:
+        out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip())
+    except Exception:
+        return None
+
+
+_ECORE_COUNT = None
+
+
+def _ecore_count():
+    global _ECORE_COUNT
+    if _ECORE_COUNT is None:
+        levels = _sysctl_int("hw.nperflevels") or 0
+        _ECORE_COUNT = (_sysctl_int("hw.perflevel1.logicalcpu") or 0) if levels >= 2 else 0
+    return _ECORE_COUNT
+
+
+def read_cpu_split():
+    """(e_fraction, p_fraction) usage, each 0..1 or None if unavailable.
+
+    Apple Silicon enumerates the efficiency cluster first in per-core
+    ordering (same convention oMLX's Mach-tick sampler relies on), so a
+    plain index split against hw.perflevel1.logicalcpu approximates the
+    E/P breakdown without needing raw Mach ticks.
+    """
+    if psutil is None:
+        return None, None
+    try:
+        percore = psutil.cpu_percent(percpu=True)
+    except Exception:
+        return None, None
+    if not percore:
+        return None, None
+    e_count = _ecore_count()
+    if not e_count or e_count >= len(percore):
+        avg = sum(percore) / len(percore) / 100
+        return avg, avg
+    e_vals = percore[:e_count]
+    p_vals = percore[e_count:]
+    e_frac = (sum(e_vals) / len(e_vals) / 100) if e_vals else None
+    p_frac = (sum(p_vals) / len(p_vals) / 100) if p_vals else None
+    return e_frac, p_frac
+
+
+def read_gpu_stats():
+    """(usage_fraction, memory_in_use_bytes) from the IOAccelerator
+    PerformanceStatistics dictionary — the same public IOKit registry entry
+    oMLX's SystemStatsSampler reads."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-r", "-c", "IOAccelerator", "-d", "1"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None, None
+    match = re.search(r'"PerformanceStatistics"\s*=\s*\{([^}]*)\}', out)
+    if not match:
+        return None, None
+    block = match.group(1)
+    util_m = re.search(r'"Device Utilization %"\s*=\s*(\d+)', block)
+    mem_m = re.search(r'"In use system memory"\s*=\s*(\d+)', block)
+    usage = min(1.0, int(util_m.group(1)) / 100) if util_m else None
+    memory = int(mem_m.group(1)) if mem_m else None
+    return usage, memory
+
+
+def read_memory_breakdown():
+    """Wired/active/compressed/free bytes, matching oMLX's Memory panel
+    categorization (vm_stat is the userspace-safe stand-in for
+    vm_statistics64 here)."""
+    total = _sysctl_int("hw.memsize") or 0
+    result = {"total": total, "wired": 0, "active": 0, "compressed": 0, "free": 0}
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return result
+    page_match = re.search(r"page size of (\d+)", vm)
+    page = int(page_match.group(1)) if page_match else 16384
+
+    def pages(label):
+        found = re.search(label + r":\s+(\d+)", vm)
+        return int(found.group(1)) * page if found else 0
+
+    result["wired"] = pages("Pages wired down")
+    result["active"] = pages("Pages active")
+    result["compressed"] = pages("Pages occupied by compressor")
+    used = result["wired"] + result["active"] + result["compressed"]
+    result["free"] = max(total - used, 0) if total else 0
+    return result
+
+
+def read_load_and_uptime():
+    try:
+        loads = os.getloadavg()
+    except Exception:
+        loads = None
+    uptime = None
+    boottime = _sysctl_int("kern.boottime")
+    if boottime:
+        uptime = max(0, time.time() - boottime)
+    elif psutil is not None:
+        try:
+            uptime = max(0, time.time() - psutil.boot_time())
+        except Exception:
+            uptime = None
+    return loads, uptime
+
+
+def read_thermal_state():
+    """Best-effort stand-in for ProcessInfo.thermalState — pmset's therm
+    report is the closest unprivileged signal available from Python."""
+    try:
+        out = subprocess.run(["pmset", "-g", "therm"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return "Unknown"
+    speed_m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
+    sched_m = re.search(r"CPU_Scheduler_Limit\s*=\s*(\d+)", out)
+    speed = int(speed_m.group(1)) if speed_m else 100
+    sched = int(sched_m.group(1)) if sched_m else 100
+    limit = min(speed, sched)
+    if limit >= 100:
+        return "Nominal"
+    if limit >= 80:
+        return "Fair"
+    if limit >= 50:
+        return "Serious"
+    return "Critical"
+
+
+def format_bytes_gb(num_bytes):
+    gb = num_bytes / 1_000_000_000
+    if gb >= 1:
+        return f"{gb:.2f} GB"
+    return f"{num_bytes / 1_000_000:.0f} MB"
+
+
+def format_uptime(seconds):
+    if seconds is None:
+        return "–"
+    minutes = int(seconds) // 60
+    hours = minutes // 60
+    days = hours // 24
+    if days >= 1:
+        return f"{days}d {hours % 24}h"
+    if hours >= 1:
+        return f"{hours}h {minutes % 60}m"
+    return f"{max(0, minutes)}m"
+
+
 def trim(messages):
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if len(starts) > MAX_HISTORY_TURNS:
@@ -1199,6 +1359,9 @@ class MlxGui(tk.Tk):
         notes_path, notes_text = find_project_notes()
         if notes_text:
             self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+        artifact_note = last_artifact_system_note()
+        if artifact_note:
+            self.messages.append({"role": "system", "content": artifact_note})
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.events = queue.Queue()
@@ -1232,6 +1395,7 @@ class MlxGui(tk.Tk):
 
     def build_ui(self):
         self.build_menu()
+        self.build_hero()
         top = ttk.Frame(self, padding=(10, 8))
         top.pack(fill="x")
 
@@ -1254,6 +1418,7 @@ class MlxGui(tk.Tk):
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Import", command=self.import_files).pack(side="left")
         ttk.Button(top, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Model Settings", command=self.open_model_settings).pack(side="left", padx=(6, 0))
         ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
         ttk.Label(top, textvariable=self.resource_var).pack(side="right", padx=(0, 12))
 
@@ -1395,6 +1560,258 @@ class MlxGui(tk.Tk):
         ttk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
         ttk.Label(status_bar, textvariable=self.memory_var, anchor="e").pack(side="right", padx=(12, 0))
 
+    def build_hero(self):
+        hero = ttk.Frame(self, padding=(14, 10, 14, 2))
+        hero.pack(fill="x")
+
+        self._hero_icon = None
+        try:
+            icon = tk.PhotoImage(file=str(MLXGUI_ICON_PATH))
+            if icon.width() > 48:
+                factor = max(1, icon.width() // 48)
+                icon = icon.subsample(factor, factor)
+            self._hero_icon = icon
+            ttk.Label(hero, image=icon).pack(side="left", padx=(0, 12))
+        except Exception:
+            pass
+
+        hero_text = ttk.Frame(hero)
+        hero_text.pack(side="left", fill="x", expand=True)
+        title_row = ttk.Frame(hero_text)
+        title_row.pack(anchor="w")
+        ttk.Label(
+            title_row, text="mlxgui",
+            font=tkfont.Font(family="Helvetica", size=18, weight="bold"),
+        ).pack(side="left")
+        self.status_dot = tk.Canvas(title_row, width=12, height=12, highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(10, 4))
+        self._status_dot_item = self.status_dot.create_oval(2, 2, 10, 10, fill="#9a9a9a", outline="")
+        self.server_status_var = tk.StringVar(value="Checking...")
+        ttk.Label(title_row, textvariable=self.server_status_var, foreground="#666666").pack(side="left")
+        self.hero_subtitle_var = tk.StringVar(value="")
+        ttk.Label(hero_text, textvariable=self.hero_subtitle_var, foreground="#888888").pack(anchor="w")
+
+        ttk.Button(hero, text="System Stats...", command=self.open_system_stats).pack(side="right", anchor="ne")
+        self.update_hero_subtitle()
+
+    def update_hero_subtitle(self):
+        self.hero_subtitle_var.set(f"{backend_label(self.backend)}  ·  {self.url}")
+
+    def update_hero_status(self, reachable):
+        color = "#2ecc71" if reachable else "#9a9a9a"
+        text = "Connected" if reachable else "Unreachable"
+        try:
+            self.status_dot.itemconfigure(self._status_dot_item, fill=color)
+        except Exception:
+            pass
+        self.server_status_var.set(text)
+
+    def open_system_stats(self):
+        win = tk.Toplevel(self)
+        win.title("System Stats")
+        win.geometry("340x560")
+        win.transient(self)
+        win.resizable(False, False)
+
+        mono = tkfont.Font(family="Menlo", size=11)
+        bold = tkfont.Font(family="Helvetica", size=11, weight="bold")
+        small = tkfont.Font(family="Helvetica", size=9)
+
+        container = ttk.Frame(win, padding=14)
+        container.pack(fill="both", expand=True)
+
+        def section(title):
+            ttk.Label(container, text=title.upper(), font=bold, foreground="#2f6fed").pack(
+                anchor="center", pady=(10, 4)
+            )
+
+        def bar_row(label_text, color):
+            row = ttk.Frame(container)
+            row.pack(fill="x", pady=(2, 0))
+            ttk.Label(row, text=label_text, font=small).pack(side="left")
+            value_var = tk.StringVar(value="–")
+            ttk.Label(row, textvariable=value_var, font=mono).pack(side="right")
+            canvas = tk.Canvas(container, height=8, highlightthickness=0)
+            canvas.pack(fill="x", pady=(1, 6))
+            return value_var, canvas, color
+
+        def draw_bar(canvas, fraction, color):
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 1)
+            height = 8
+            canvas.create_rectangle(0, 0, width, height, fill="#e6e6e6", outline="")
+            if fraction is not None:
+                fill_w = max(3, width * min(1, max(0, fraction)))
+                canvas.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
+
+        section("CPU")
+        e_val, e_canvas, e_color = bar_row("E-cores", "#f0932b")
+        p_val, p_canvas, p_color = bar_row("P-cores", "#2f6fed")
+        cpu_caption = tk.StringVar(value="")
+        ttk.Label(container, textvariable=cpu_caption, font=small, foreground="#999999").pack(anchor="w")
+        thermal_row = ttk.Frame(container)
+        thermal_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(thermal_row, text="Thermal", font=small).pack(side="left")
+        thermal_val = tk.StringVar(value="–")
+        ttk.Label(thermal_row, textvariable=thermal_val, font=mono).pack(side="right")
+        load_row = ttk.Frame(container)
+        load_row.pack(fill="x")
+        ttk.Label(load_row, text="Load avg", font=small).pack(side="left")
+        load_val = tk.StringVar(value="–")
+        ttk.Label(load_row, textvariable=load_val, font=mono).pack(side="right")
+        uptime_row = ttk.Frame(container)
+        uptime_row.pack(fill="x")
+        ttk.Label(uptime_row, text="Uptime", font=small).pack(side="left")
+        uptime_val = tk.StringVar(value="–")
+        ttk.Label(uptime_row, textvariable=uptime_val, font=mono).pack(side="right")
+
+        section("GPU")
+        gpu_val, gpu_canvas, gpu_color = bar_row("GPU", "#20bf6b")
+        gpu_mem_val, gpu_mem_canvas, gpu_mem_color = bar_row("GPU memory", "#22a6b3")
+
+        section("Memory")
+        mem_summary = tk.StringVar(value="–")
+        ttk.Label(container, textvariable=mem_summary, font=mono).pack(anchor="w")
+        seg_canvas = tk.Canvas(container, height=10, highlightthickness=0)
+        seg_canvas.pack(fill="x", pady=(4, 8))
+        legend = ttk.Frame(container)
+        legend.pack(fill="x")
+        legend_vars = {}
+        for key, color, label_text in [
+            ("wired", "#2f6fed", "Wired"),
+            ("active", "#eb4d4b", "Active"),
+            ("compressed", "#a55eea", "Compressed"),
+            ("free", "#c8c8c8", "Free"),
+        ]:
+            row = ttk.Frame(legend)
+            row.pack(fill="x", pady=1)
+            dot = tk.Canvas(row, width=8, height=8, highlightthickness=0)
+            dot.pack(side="left", padx=(0, 6))
+            dot.create_oval(0, 0, 8, 8, fill=color, outline="")
+            ttk.Label(row, text=label_text, font=small).pack(side="left")
+            value_var = tk.StringVar(value="–")
+            ttk.Label(row, textvariable=value_var, font=mono).pack(side="right")
+            legend_vars[key] = value_var
+
+        state = {"after": None}
+
+        def refresh():
+            e_frac, p_frac = read_cpu_split()
+            draw_bar(e_canvas, e_frac, e_color)
+            draw_bar(p_canvas, p_frac, p_color)
+            e_val.set(f"{e_frac * 100:.0f}%" if e_frac is not None else "–")
+            p_val.set(f"{p_frac * 100:.0f}%" if p_frac is not None else "–")
+            cpu_caption.set("E (amber) / P (blue) usage")
+            thermal_val.set(read_thermal_state())
+            loads, uptime = read_load_and_uptime()
+            load_val.set(" · ".join(f"{v:.2f}" for v in loads) if loads else "–")
+            uptime_val.set(format_uptime(uptime))
+
+            gpu_frac, gpu_mem_bytes = read_gpu_stats()
+            draw_bar(gpu_canvas, gpu_frac, gpu_color)
+            gpu_val.set(f"{gpu_frac * 100:.0f}%" if gpu_frac is not None else "–")
+            mem = read_memory_breakdown()
+            gpu_mem_frac = (gpu_mem_bytes / mem["total"]) if gpu_mem_bytes and mem["total"] else None
+            draw_bar(gpu_mem_canvas, gpu_mem_frac, gpu_mem_color)
+            gpu_mem_val.set(format_bytes_gb(gpu_mem_bytes) + " in use" if gpu_mem_bytes else "–")
+
+            used = mem["wired"] + mem["active"] + mem["compressed"]
+            mem_summary.set(
+                f"{format_bytes_gb(used)} / {mem['total'] / 1_000_000_000:.0f} GB"
+                f"  ({used / mem['total'] * 100:.0f}%)" if mem["total"] else "–"
+            )
+            seg_canvas.delete("all")
+            width = max(seg_canvas.winfo_width(), 1)
+            x = 0
+            total = mem["total"] or 1
+            for key, color in [("wired", "#2f6fed"), ("active", "#eb4d4b"), ("compressed", "#a55eea")]:
+                seg_w = width * mem[key] / total
+                if seg_w > 0.5:
+                    seg_canvas.create_rectangle(x, 0, x + seg_w, 10, fill=color, outline="")
+                    x += seg_w
+            seg_canvas.create_rectangle(x, 0, width, 10, fill="#e6e6e6", outline="")
+            for key in ("wired", "active", "compressed", "free"):
+                legend_vars[key].set(format_bytes_gb(mem[key]))
+
+            state["after"] = win.after(STATS_REFRESH_MS, refresh)
+
+        def on_close():
+            if state["after"] is not None:
+                win.after_cancel(state["after"])
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.after(50, refresh)
+
+    def open_model_settings(self):
+        backend = self.backend
+        settings = load_model_settings(backend)
+        win = tk.Toplevel(self)
+        win.title(f"Model Settings — {backend_label(backend)}")
+        win.geometry("420x360")
+        win.transient(self)
+        win.resizable(False, False)
+
+        container = ttk.Frame(win, padding=16)
+        container.pack(fill="both", expand=True)
+        ttk.Label(
+            container,
+            text=f"Sampling parameters for {backend_label(backend)}. Saved per backend.",
+            wraplength=380,
+        ).pack(anchor="w", pady=(0, 12))
+
+        fields = [
+            ("temperature", "Temperature", "Higher = more varied output"),
+            ("top_p", "Top P", "Nucleus sampling cutoff"),
+            ("top_k", "Top K", "Candidate-token cutoff (integer)"),
+            ("repetition_penalty", "Repetition Penalty", "> 1.0 discourages verbatim repeats"),
+            ("max_tokens", "Max Tokens", "Response length cap (integer)"),
+        ]
+        entry_vars = {}
+        for key, label_text, hint in fields:
+            row = ttk.Frame(container)
+            row.pack(fill="x", pady=4)
+            label_col = ttk.Frame(row)
+            label_col.pack(side="left", fill="x", expand=True)
+            ttk.Label(label_col, text=label_text).pack(anchor="w")
+            ttk.Label(label_col, text=hint, foreground="#888888", font=("Helvetica", 9)).pack(anchor="w")
+            var = tk.StringVar(value=str(settings[key]))
+            entry_vars[key] = var
+            ttk.Entry(row, textvariable=var, width=10, justify="right").pack(side="right")
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(container, textvariable=status_var, foreground="#c0392b").pack(anchor="w", pady=(6, 0))
+
+        def parse_and_clamp(key, raw):
+            is_int = key in ("top_k", "max_tokens")
+            value = int(raw) if is_int else float(raw)
+            return clamp_model_setting(key, value)
+
+        def do_save():
+            updated = dict(settings)
+            for key, var in entry_vars.items():
+                try:
+                    updated[key] = parse_and_clamp(key, var.get().strip())
+                except ValueError:
+                    status_var.set(f"Invalid value for {key}: {var.get()!r}")
+                    return
+            save_model_settings(backend, updated)
+            for key, var in entry_vars.items():
+                var.set(str(updated[key]))
+            status_var.set(f"Saved. Bounds: {', '.join(f'{k} {MODEL_SETTING_BOUNDS[k][0]}..{MODEL_SETTING_BOUNDS[k][1]}' for k in ('temperature', 'top_p', 'top_k'))}")
+
+        def do_reset():
+            for key, var in entry_vars.items():
+                var.set(str(MODEL_SETTING_DEFAULTS[key]))
+            save_model_settings(backend, dict(MODEL_SETTING_DEFAULTS))
+            status_var.set("Reset to defaults and saved.")
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="Reset to Defaults", command=do_reset).pack(side="left")
+        ttk.Button(buttons, text="Save", command=do_save).pack(side="right")
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right", padx=(0, 8))
+
     def build_menu(self):
         menu = tk.Menu(self)
         file_menu = tk.Menu(menu, tearoff=False)
@@ -1425,6 +1842,8 @@ class MlxGui(tk.Tk):
         menu.add_cascade(label="Tools", menu=tools_menu)
         view = tk.Menu(menu, tearoff=False)
         view.add_command(label="Resources...", command=self.open_resources)
+        view.add_command(label="System Stats...", command=self.open_system_stats)
+        view.add_command(label="Model Settings...", command=self.open_model_settings)
         menu.add_cascade(label="View", menu=view)
         backend_menu = tk.Menu(menu, tearoff=False)
         for backend in SUPPORTED_BACKENDS:
@@ -1889,7 +2308,22 @@ class MlxGui(tk.Tk):
     def refresh_resources_live(self):
         self.resource_after = None
         self.update_memory_indicator()
+        self.check_server_status_async()
         self.start_resource_refresh()
+
+    def check_server_status_async(self):
+        url, key = self.url, self.key
+
+        def worker():
+            reachable = False
+            try:
+                with urllib.request.urlopen(request(url, key, "/v1/models"), timeout=3):
+                    reachable = True
+            except Exception:
+                reachable = False
+            self.events.put(("server_status", reachable))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def handle_escape(self, _event=None):
         if self.busy:
@@ -1987,6 +2421,7 @@ class MlxGui(tk.Tk):
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
+                record_last_artifact(target, self.last_user_text)
                 note = f" (previous version backed up to {backup_path})" if backup_path else ""
                 return f"Written: {target} ({target.stat().st_size} bytes).{note}"
             except Exception as exc:
@@ -2304,6 +2739,7 @@ class MlxGui(tk.Tk):
         self.model_var.set("")
         self.model_box.configure(values=[])
         self.status_var.set(f"Switching to {backend_label(backend)}...")
+        self.update_hero_subtitle()
         threading.Thread(target=self.restart_backend, daemon=True).start()
 
     def restart_backend(self):
@@ -2497,6 +2933,9 @@ class MlxGui(tk.Tk):
         notes_path, notes_text = find_project_notes()
         if notes_text:
             self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+        artifact_note = last_artifact_system_note()
+        if artifact_note:
+            self.messages.append({"role": "system", "content": artifact_note})
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.last_user_text = ""
@@ -2596,12 +3035,16 @@ class MlxGui(tk.Tk):
                 "write_file creates parent directories, so do not issue a separate mkdir unless it is actually required."
             )})
         effective_agentic = agentic
+        model_settings = load_model_settings(self.backend)
         for _step in range(MAX_TOOL_STEPS):
             payload = {
                 "model": model, "messages": working_messages,
-                "max_tokens": MAX_RESPONSE_TOKENS, "stream": True,
+                "max_tokens": model_settings["max_tokens"], "stream": True,
                 "stream_options": {"include_usage": True},
-                "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+                "temperature": model_settings["temperature"],
+                "top_p": model_settings["top_p"],
+                "top_k": model_settings["top_k"],
+                "repetition_penalty": model_settings["repetition_penalty"],
             }
             if effective_agentic:
                 payload["tools"] = TOOLS
@@ -2829,6 +3272,8 @@ class MlxGui(tk.Tk):
                     self.append(f"\n[refiner error] {event[1]}\n")
                 elif kind == "status":
                     self.status_var.set(event[1])
+                elif kind == "server_status":
+                    self.update_hero_status(event[1])
                 elif kind == "models":
                     models = event[1]
                     labels = [model_label(model) for model in models]
