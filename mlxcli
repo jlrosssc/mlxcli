@@ -10,10 +10,16 @@ Usage:
   mlxcli --run "task" [-y]   headless one-shot mode: run a single task, print the
                              result, and exit (no REPL). -y/--yes auto-approves
                              all tool categories for the run (for scripting/CI).
+  mlxcli --run "task" -y --verify "shell command"
+                             after the model claims completion, run this command as
+                             a correctness check (cwd: the default directory). Exit
+                             code 0 = pass. On failure, its output is fed back to the
+                             model as a new turn (up to 3 attempts) instead of trusting
+                             the model's own claim of success.
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
-  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /clear  /help  /exit
+  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /clear  /help  /exit
 """
 import atexit
 import difflib
@@ -45,11 +51,14 @@ try:
 except ImportError:
     formatted_markdown_to_docx = None
 from mlxlib import (
-    DOWNLOADS, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
+    load_default_dir, save_default_dir, DEFAULT_DIR_CONFIG_PATH,
+    MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
+    python_syntax_error, missing_local_imports,
+    find_entry_point_candidates, smoke_test_python_app, run_verify_command,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop, parse_bare_json_tool_call, parse_xml_tag_tool_call,
     parse_python_call_tool_call, DEFAULT_REPETITION_PENALTY,
@@ -57,6 +66,7 @@ from mlxlib import (
     load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
+    caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -102,7 +112,7 @@ DEFAULT_SYSTEM = (
     "do not infer dates from filenames or conversation text.\n"
     "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
     "Use tools only when the task requires reading/writing files or running commands.\n"
-    "Save created files in ~/Downloads unless the user gives another path.\n"
+    f"Save created files in {load_default_dir()} unless the user gives another path.\n"
     "Execution contract: if the user asks you to create, write, run, test, export, verify, or share local files, you MUST use the available tools. "
     "Never simulate tool output or claim that files were created, executed, inspected, verified, or shared based only on your response. "
     "After writing files, use a tool to check the exact paths and report only the paths, sizes, and results returned by tools. "
@@ -127,7 +137,7 @@ PRESET_SYSTEMS = {
         "Use bullets only when they improve scanning.\n"
         "Ask a clarifying question only when the missing detail blocks useful work.\n"
         "Respect local LLM memory limits: use only relevant imported context, summarize instead of quoting, and suggest /clear when old context is no longer needed.\n"
-        "Save created files in ~/Downloads unless the user gives another path.\n"
+        f"Save created files in {load_default_dir()} unless the user gives another path.\n"
         "Be direct, respectful, and practical."
     ),
     "code": (
@@ -137,7 +147,7 @@ PRESET_SYSTEMS = {
         "Prefer simple, efficient standard-library solutions unless a dependency is clearly better.\n"
         "Mention important assumptions and edge cases briefly.\n"
         "Respect local LLM memory limits and avoid repeating large context.\n"
-        "Save created files in ~/Downloads unless the user gives another path."
+        f"Save created files in {load_default_dir()} unless the user gives another path."
     ),
     "docs": (
         "You are a concise writing assistant running locally on the user's Mac.\n"
@@ -146,7 +156,7 @@ PRESET_SYSTEMS = {
         "Use clear headings, short paragraphs, and practical formatting.\n"
         "Avoid long quoted source text unless the user asks for it.\n"
         "Respect local LLM memory limits by summarizing imported material.\n"
-        "Save created files in ~/Downloads unless the user gives another path."
+        f"Save created files in {load_default_dir()} unless the user gives another path."
     ),
 }
 CODE_REQUEST_SYSTEM = (
@@ -206,6 +216,7 @@ HELP = """Commands:
   /model          switch models (picker; history kept)
   /models         list models the server offers
   /tflog          show the last lines of the TurboFieldfare server log
+  /errorlog [n]   show the last n mlxcli/mlxgui chat-turn errors (default 20; ~/.omlx/error.log)
   /health         show selected backend health and basic readiness
   /modelsettings  show/edit sampling params for the current backend (temperature, top_p, top_k,
                   repetition_penalty, max_tokens); "set <key> <value>" to change, "reset" to restore defaults
@@ -215,8 +226,11 @@ HELP = """Commands:
   /verbs          show natural-language input/output verbs the router recognizes
   ? [request]     refine a request with a short, stateless prompt decoder
   /tokens         show running token totals for this mlxcli session
-  /save [file]    save transcript as markdown (default: ~/Downloads/mlxcli-<timestamp>.md)
-  /export [file]  save latest model reply as .docx, .md, or .txt (default: ~/Downloads/mlxcli-reply-<timestamp>.docx)
+  /save [file]    save transcript as markdown (default: <default dir>/mlxcli-<timestamp>.md)
+  /export [file]  save latest model reply as .docx, .md, or .txt (default: <default dir>/mlxcli-reply-<timestamp>.docx)
+  /defaultdir     show the default directory used for saving and searching
+  /defaultdir PATH
+                  change the default directory (persists; created if missing)
   /copy           copy the latest reply's last code block (or full reply if none) to the clipboard
   /clear          wipe conversation history
   /commands       list slash commands only
@@ -514,6 +528,10 @@ def ensure_server(backend, url, key):
         log_handle.flush()
         subprocess.Popen(
             [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", paths["port"],
+             # 65536 (the documented max tier) was tested directly and hangs on this
+             # machine's 18GB RAM: the process goes into uninterruptible sleep with the
+             # system nearly out of free pages, thrashing on expert-weight disk I/O
+             # instead of generating. 32768 is the highest tier confirmed to work.
              "--max-context", "32768"],
             cwd=paths["root"],
             stdout=log_handle,
@@ -697,7 +715,7 @@ def exec_tool(name, args):
         except ValueError:
             mkdir_parts = []
         if mkdir_parts[:2] == ["mkdir", "-p"] and len(mkdir_parts) > 2:
-            root = DOWNLOADS.resolve()
+            root = load_default_dir().resolve()
             targets = [pathlib.Path(part).expanduser().resolve(strict=False) for part in mkdir_parts[2:]]
             if all(target.is_relative_to(root) for target in targets) and all(target.exists() for target in targets):
                 return "exit_code=0\n(no action; requested directories already exist)"
@@ -778,7 +796,22 @@ def exec_tool(name, args):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
             note = f" (previous version backed up to {backup_path})" if backup_path else ""
-            return f"Written: {target} ({target.stat().st_size} bytes).{note}"
+            result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
+            if target.suffix == ".py":
+                syntax_error = python_syntax_error(content)
+                if syntax_error:
+                    return (f"{result} Error: this file has a Python syntax error and will not run "
+                            f"({syntax_error}) — likely truncated mid-generation. Rewrite it completely with write_file.")
+                missing = missing_local_imports(target)
+                if missing:
+                    plural = "s" if len(missing) > 1 else ""
+                    return (f"{result} Warning: this file imports {', '.join(missing)}, which "
+                            f"{'are' if plural else 'is'} neither a standard-library module nor installed, and "
+                            f"{'have' if plural else 'has'} no matching file yet in {target.parent}. "
+                            "If it's meant to be a local module, write it now with write_file. If it's a "
+                            "third-party package, install it first with run_command (pip install ...) or state "
+                            "that it's a required dependency — do not report completion either way until resolved.")
+            return result
         except Exception as e:
             return f"Error: {e}"
     return "Unknown tool."
@@ -1362,18 +1395,18 @@ def resolve_file_token(token, allow_recursive_scan=True):
     """Resolve an explicit path; refuse ambiguous bare filenames instead of guessing."""
     p = pathlib.Path(token).expanduser()
     if p.is_absolute() or p.parent != pathlib.Path("."):
-        options = [p] if p.is_absolute() else [pathlib.Path.cwd() / p, DOWNLOADS / p]
+        options = [p] if p.is_absolute() else [pathlib.Path.cwd() / p, load_default_dir() / p]
         for option in options:
             if option.exists() and option.is_file():
                 return option
         return None
     matches = []
-    for option in (pathlib.Path.cwd() / p, DOWNLOADS / p):
+    for option in (pathlib.Path.cwd() / p, load_default_dir() / p):
         if option.exists() and option.is_file() and option not in matches:
             matches.append(option)
     if not matches and allow_recursive_scan:
         try:
-            for option in DOWNLOADS.rglob(p.name):
+            for option in load_default_dir().rglob(p.name):
                 if option.is_file() and option not in matches:
                     matches.append(option)
         except OSError:
@@ -1400,10 +1433,10 @@ def resolve_local_file_reference(text, allow_recursive_scan=True):
             name = pathlib.Path(raw.strip().rstrip(".,:;")).name
             if not name:
                 continue
-            candidate = DOWNLOADS / name
+            candidate = load_default_dir() / name
             if candidate.exists() and candidate.is_file():
                 return candidate
-        for candidate in sorted(DOWNLOADS.rglob("*")):
+        for candidate in sorted(load_default_dir().rglob("*")):
             if (
                 candidate.is_file()
                 and len(candidate.name) >= 6
@@ -1436,7 +1469,7 @@ def resolve_local_file_references(text, limit=12, allow_recursive_scan=True):
     # Do not scan all of Downloads when an explicit filename was supplied.
     # Generic names such as README.txt are not unique.
     if not refs and "downloads" in lowered and not (quoted or bare):
-        for candidate in sorted(DOWNLOADS.rglob("*")):
+        for candidate in sorted(load_default_dir().rglob("*")):
             if (
                 not candidate.is_file()
                 or len(candidate.name) < 6
@@ -1454,12 +1487,12 @@ def resolve_local_file_references(text, limit=12, allow_recursive_scan=True):
 def resolve_local_folder_reference(text):
     lowered = (text or "").lower()
     if "manager resumes" in lowered:
-        candidate = DOWNLOADS / "Manager Resumes"
+        candidate = load_default_dir() / "Manager Resumes"
         if candidate.exists() and candidate.is_dir():
             return candidate
     match = re.search(r'in\s+downloads/([A-Za-z0-9 _-]+)', text or "", re.I)
     if match:
-        candidate = DOWNLOADS / match.group(1).strip()
+        candidate = load_default_dir() / match.group(1).strip()
         if candidate.exists() and candidate.is_dir():
             return candidate
     return None
@@ -1489,7 +1522,7 @@ def direct_top_files_request(user):
     count = max(1, min(int(match.group(1)), 100))
     files = []
     try:
-        for path in DOWNLOADS.iterdir():
+        for path in load_default_dir().iterdir():
             if path.is_file():
                 try:
                     files.append((path.stat().st_size, path.name))
@@ -1533,8 +1566,8 @@ def maybe_handle_natural_language_action(user, state, messages, convert_mode, ur
     )
     if resume_heavy_request:
         term = infer_filename_term(user) or "resume"
-        print(f"(routing to /namefind ~/Downloads {term})")
-        matches = do_namefind(f'"{DOWNLOADS}" "{term}"') or []
+        print(f"(routing to /namefind {load_default_dir()} {term})")
+        matches = do_namefind(f'"{load_default_dir()}" "{term}"') or []
         state["last_paths"] = matches
         if not matches:
             return True
@@ -1580,8 +1613,8 @@ def maybe_handle_natural_language_action(user, state, messages, convert_mode, ur
         return "continue_model"
     if "find files" in lowered and "download" in lowered and any(term in lowered for term in ("title", "name", "contain", "resume")):
         term = infer_filename_term(user) or "resume"
-        print(f"(routing to /namefind ~/Downloads {term})")
-        matches = do_namefind(f'"{DOWNLOADS}" "{term}"')
+        print(f"(routing to /namefind {load_default_dir()} {term})")
+        matches = do_namefind(f'"{load_default_dir()}" "{term}"')
         state["last_paths"] = matches or []
         return True
     remote_match = re.search(r'find all\s+(\.[A-Za-z0-9]+)\s+files?\s+at\s+([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)', lowered)
@@ -1676,6 +1709,23 @@ def run_ssh_command_with_input(host, command, input_text):
     )
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output.strip()
+
+
+def do_errorlog(arg):
+    n = 20
+    raw = arg.strip()
+    if raw:
+        try:
+            n = max(1, int(raw))
+        except ValueError:
+            pass
+    lines = tail_error_log(n)
+    if not lines:
+        print(f"(no errors logged yet — {ERROR_LOG_PATH})")
+        return
+    print(f"{ERROR_LOG_PATH} (last {len(lines)}):")
+    for line in lines:
+        print(line)
 
 
 def do_gitstatus(arg):
@@ -1985,7 +2035,7 @@ def maybe_handle_remote_natural_language_action(user, state):
 
 
 def find_resume_files_in_downloads(limit=24):
-    root = DOWNLOADS
+    root = load_default_dir()
     results = []
     for path in sorted(root.rglob("*")):
         if len(results) >= limit:
@@ -2012,7 +2062,7 @@ def local_path_hints(user_text):
             paths.append(candidate.rstrip(".,:;"))
     lowered = text.lower()
     if "downloads" in lowered and not paths:
-        paths.append(str(DOWNLOADS))
+        paths.append(str(load_default_dir()))
     return list(dict.fromkeys(paths))
 
 
@@ -2080,7 +2130,7 @@ def apply_agentic_preflight(user_text, messages, convert_mode):
     if should_compare_resumes(user_text):
         paths = local_path_hints(user_text)
         files = []
-        for hint in paths or [str(DOWNLOADS)]:
+        for hint in paths or [str(load_default_dir())]:
             target = pathlib.Path(hint).expanduser()
             if target.is_dir():
                 files.extend([p for p in reviewable_paths(target) if "resume" in p.name.lower()][:12])
@@ -2102,7 +2152,7 @@ def apply_agentic_preflight(user_text, messages, convert_mode):
 
     if should_name_search(user_text):
         term = infer_filename_term(user_text)
-        roots = local_path_hints(user_text) or [str(DOWNLOADS)]
+        roots = local_path_hints(user_text) or [str(load_default_dir())]
         results = []
         if term:
             for root in roots[:3]:
@@ -2254,13 +2304,13 @@ def do_resumecompare(arg, messages, convert_mode, url, key, model, totals, backe
     except ValueError as e:
         print(f"(couldn't parse /resumecompare arguments: {e})")
         return False
-    target = pathlib.Path(parts[0]).expanduser() if parts else DOWNLOADS
+    target = pathlib.Path(parts[0]).expanduser() if parts else load_default_dir()
     jd_path = pathlib.Path(parts[1]).expanduser() if len(parts) > 1 else None
     if target.is_file():
         files = [target]
     elif target.is_dir():
         files = [p for p in reviewable_paths(target) if "resume" in p.name.lower()][:12]
-        if not files and target == DOWNLOADS:
+        if not files and target == load_default_dir():
             files = find_resume_files_in_downloads(limit=12)
     else:
         print(f"(path not found: {target})")
@@ -2345,7 +2395,7 @@ def do_save(arg, messages, model):
         out = resolve_output_path(raw)
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = DOWNLOADS / f"mlxcli-{stamp}.md"
+        out = load_default_dir() / f"mlxcli-{stamp}.md"
     lines = [f"# mlxcli session — {time.strftime('%Y-%m-%d %H:%M')} — model: {model}\n"]
     for m in messages:
         role = m.get("role")
@@ -2376,7 +2426,7 @@ def do_export(arg, messages):
         out = resolve_output_path(raw)
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = DOWNLOADS / f"mlxcli-reply-{stamp}.docx"
+        out = load_default_dir() / f"mlxcli-reply-{stamp}.docx"
     if not out.suffix:
         out = out.with_suffix(".docx")
     try:
@@ -2637,6 +2687,40 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
 
 
 def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
+    # Guard the whole turn (all agentic tool-call retries included, not just
+    # one HTTP request) so a long local generation can't get killed by the
+    # Mac going to sleep mid-turn.
+    with caffeinate_guard():
+        return _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required, contract)
+
+
+def offer_smoke_test(written_py_paths):
+    """After a turn writes one or more Python files, offer to briefly launch
+    whichever of them look like entry points — catches import-time/runtime
+    crashes that py_compile can't see (missing deps, bad wiring between
+    files). Interactive only: skipped outright if stdin isn't a real
+    terminal, so a headless --run never blocks waiting for an answer."""
+    if not written_py_paths or not sys.stdin.isatty():
+        return
+    candidates = find_entry_point_candidates(written_py_paths)
+    if not candidates:
+        return
+    names = ", ".join(p.name for p in candidates)
+    try:
+        answer = input(f"(run a smoke test on {names} now, to catch startup errors py_compile can't see? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer not in ("y", "yes"):
+        return
+    for path in candidates:
+        print(f"  smoke-testing {path.name}...")
+        ok, message = smoke_test_python_app(path)
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}] {path.name}: {message}")
+
+
+def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
     turn_start = time.time()
     turn_in = 0
     turn_out = 0
@@ -2645,6 +2729,7 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
     tool_state = {"write": False, "run": False, "verify": False}
     contract = contract or {}
     last_tool_results = []
+    written_py_paths = []
     seen_tool_calls = {}
     effective_agentic_mode = agentic_mode
     retried_with_tools = False
@@ -2660,6 +2745,7 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
                 # request — further retries are very unlikely to help, and each one
                 # burns a full generation on garbage. Give up with an honest message
                 # instead of exhausting MAX_TOOL_STEPS on repeated dead ends.
+                log_error("chat_turn", f"repetition loop stopped twice in a row (backend={backend}, model={model})")
                 print("(stopped: the model repeated the same generation-loop failure twice in a row; try rephrasing the request)")
                 totals["in"] += turn_in
                 totals["out"] += turn_out
@@ -2677,6 +2763,7 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
                 effective_agentic_mode = True
                 print("(server rejected an unexpected tool call; retrying with tools enabled)")
                 continue
+            log_error("chat_turn", f"server error mid-generation (backend={backend}, model={model}): {stream_error}")
             print(f"(server error mid-generation: {stream_error}; response below may be incomplete)")
         in_tokens, out_tokens = usage_counts(usage)
         turn_in += in_tokens
@@ -2692,6 +2779,8 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
                     for result in last_tool_results:
                         print(result)
                 else:
+                    msg_chars = sum(len(m.get("content") or "") for m in messages)
+                    log_error("chat_turn", f"turn failed: server returned no output and no token usage (backend={backend}, model={model}, agentic={effective_agentic_mode}, execution_required={execution_required}, messages={len(messages)}, msg_chars={msg_chars}, step={_})")
                     print("(turn failed: server returned no output and no token usage; reduce loaded context or retry)")
                 return 0, 0
             if execution_required and _ == 0:
@@ -2723,6 +2812,7 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
                 print("(verified tool actions completed)")
                 if content:
                     print(content)
+            offer_smoke_test(written_py_paths)
             messages.append({"role": "assistant", "content": content})
             totals["in"] += turn_in
             totals["out"] += turn_out
@@ -2757,6 +2847,8 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
                         (m.get("content") for m in reversed(messages) if m.get("role") == "user"), ""
                     )
                     record_last_artifact(written_match.group(1), current_user_text)
+                    if written_match.group(1).endswith(".py"):
+                        written_py_paths.append(written_match.group(1))
             if fn in {"run_command", "python_interpreter"} and not tool_result_failed(result):
                 tool_state["run"] = True
             if fn == "read_file" or (fn in {"run_command", "python_interpreter"} and "stat " in (args.get("command", "") if isinstance(args, dict) else "")):
@@ -2766,11 +2858,13 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
             messages.append({"role": "tool", "tool_call_id": call["id"],
                              "content": result})
         if repeated_failure:
+            log_error("chat_turn", f"stopped: repeated already-failed tool call (backend={backend}, model={model})")
             print("(stopped: the model repeated an already-failed tool call instead of adapting)")
             totals["in"] += turn_in
             totals["out"] += turn_out
             print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
             return turn_in, turn_out
+    log_error("chat_turn", f"stopped: too many tool steps (backend={backend}, model={model})")
     print("(stopped: too many tool steps — break the task into smaller pieces)")
     totals["in"] += turn_in
     totals["out"] += turn_out
@@ -3195,6 +3289,7 @@ def parse_args(argv):
     run_task = None
     auto_yes = False
     show_thinking = False
+    verify_command = None
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
@@ -3209,20 +3304,23 @@ def parse_args(argv):
         elif argv[i] == "--thinking":
             show_thinking = True
             i += 1
+        elif argv[i] == "--verify" and i + 1 < len(argv):
+            verify_command = argv[i + 1]
+            i += 2
         elif argv[i] in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
         else:
             model = argv[i]
             i += 1
-    return model, system, run_task, auto_yes, show_thinking
+    return model, system, run_task, auto_yes, show_thinking, verify_command
 
 
 def main():
     configure_readline()
     backend, url, key = load_cfg()
     global SHOW_THINKING
-    model_arg, system, run_task, auto_yes, show_thinking = parse_args(sys.argv[1:])
+    model_arg, system, run_task, auto_yes, show_thinking, verify_command = parse_args(sys.argv[1:])
     if show_thinking:
         SHOW_THINKING = True
     if not model_arg and not run_task:
@@ -3232,7 +3330,17 @@ def main():
             backend, url, key = load_cfg()
     stop_other_backend(backend)
     ensure_server(backend, url, key)
-    model = model_arg or (list_models(backend, url, key)[0] if run_task else pick_model(backend, url, key))
+    available_models = list_models(backend, url, key)
+    if model_arg and model_arg not in available_models:
+        # The positional arg is a *model* id, not a backend name — passing a
+        # backend name here (an easy mistake, since /backend takes one) used to
+        # silently send a request for a nonexistent model and surface as a
+        # confusing 404 mid-generation instead of a clear error up front.
+        print(f"(model '{model_arg}' not found on backend '{backend}'; available: {', '.join(available_models) or 'none'})")
+        if run_task:
+            sys.exit(1)
+        model_arg = None
+    model = model_arg or (available_models[0] if run_task else pick_model(backend, url, key))
     messages = [{"role": "system", "content": system}]
     notes_path, notes_text = find_project_notes()
     if notes_text:
@@ -3252,19 +3360,44 @@ def main():
             print(f"(suggestion: {backend_suggestion})")
         messages.append({"role": "user", "content": run_task})
         turn_mode = should_auto_enable_agentic(run_task) if requires_agentic_execution(run_task) else False
-        try:
-            chat_turn(
-                url, key, model, messages, totals, turn_mode, backend,
-                execution_required=requires_agentic_execution(run_task),
-                contract=execution_contract(run_task),
-            )
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")[:400]
-            print(f"[server error {e.code}] {body}")
-        except urllib.error.URLError as e:
-            print(f"[connection error] {e.reason}")
-        except KeyboardInterrupt:
-            print("(interrupted)")
+        max_verify_attempts = 3 if verify_command else 1
+        for attempt in range(1, max_verify_attempts + 1):
+            try:
+                chat_turn(
+                    url, key, model, messages, totals, turn_mode, backend,
+                    execution_required=requires_agentic_execution(run_task),
+                    contract=execution_contract(run_task),
+                )
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors="replace")[:400]
+                log_error("chat_turn", f"HTTP {e.code} (backend={backend}, model={model}): {body}")
+                print(f"[server error {e.code}] {body}")
+                return
+            except urllib.error.URLError as e:
+                log_error("chat_turn", f"connection error (backend={backend}, model={model}): {e.reason}")
+                print(f"[connection error] {e.reason}")
+                return
+            except KeyboardInterrupt:
+                print("(interrupted)")
+                return
+            if not verify_command:
+                return
+            passed, output = run_verify_command(verify_command)
+            if passed:
+                print(f"(verification passed, attempt {attempt}/{max_verify_attempts}: {verify_command})")
+                return
+            print(f"(verification FAILED, attempt {attempt}/{max_verify_attempts}: {verify_command})")
+            if output:
+                print(output)
+            if attempt == max_verify_attempts:
+                log_error("chat_turn", f"verification exhausted after {max_verify_attempts} attempts (backend={backend}, model={model}): {verify_command}")
+                print(f"(giving up after {max_verify_attempts} verification attempts)")
+                return
+            messages.append({"role": "user", "content": (
+                f"Verification failed. Running `{verify_command}` did not succeed:\n{output}\n"
+                "Fix the code so this verification command passes, then report completion again — "
+                "do not claim the task is done until it does."
+            )})
         return
 
     print(f"mlxcli — backend: {backend} ({backend_description(backend)}) — model: {model} — /help for commands")
@@ -3473,10 +3606,12 @@ def main():
                     last_turn = {"in": turn_in, "out": turn_out}
                 except urllib.error.HTTPError as e:
                     body = e.read().decode(errors="replace")[:400]
+                    log_error("chat_turn", f"HTTP {e.code} (backend={backend}, model={model}): {body}")
                     print(f"\n[server error {e.code}] {body}")
                 except KeyboardInterrupt:
                     print("\n(interrupted; returning to mlxcli prompt)")
                 except Exception as e:
+                    log_error("chat_turn", f"{type(e).__name__} (backend={backend}, model={model}): {e}")
                     print(f"\n[error] {e}")
             continue
         if user.startswith("/resumecompare"):
@@ -3490,10 +3625,12 @@ def main():
                     last_turn = {"in": turn_in, "out": turn_out}
                 except urllib.error.HTTPError as e:
                     body = e.read().decode(errors="replace")[:400]
+                    log_error("chat_turn", f"HTTP {e.code} (backend={backend}, model={model}): {body}")
                     print(f"\n[server error {e.code}] {body}")
                 except KeyboardInterrupt:
                     print("\n(interrupted; returning to mlxcli prompt)")
                 except Exception as e:
+                    log_error("chat_turn", f"{type(e).__name__} (backend={backend}, model={model}): {e}")
                     print(f"\n[error] {e}")
             continue
         if user.startswith("/read"):
@@ -3507,6 +3644,20 @@ def main():
             continue
         if user == "/ls" or user.startswith("/ls "):
             do_ls(user[3:])
+            continue
+        if user == "/errorlog" or user.startswith("/errorlog "):
+            do_errorlog(user[len("/errorlog"):])
+            continue
+        if user == "/defaultdir":
+            print(f"(default directory: {load_default_dir()})")
+            continue
+        if user.startswith("/defaultdir "):
+            raw = user[len("/defaultdir "):].strip().strip('"').strip("'")
+            try:
+                new_dir = save_default_dir(raw)
+                print(f"(default directory set to: {new_dir})")
+            except Exception as e:
+                print(f"(failed to set default directory: {e})")
             continue
         if user == "/gitstatus" or user.startswith("/gitstatus "):
             do_gitstatus(user[10:])
@@ -3559,10 +3710,12 @@ def main():
                     auto_export_latest(messages, pending_export_path)
             except urllib.error.HTTPError as e:
                 body = e.read().decode(errors="replace")[:400]
+                log_error("chat_turn", f"HTTP {e.code} (backend={backend}, model={model}): {body}")
                 print(f"\n[server error {e.code}] {body}")
             except KeyboardInterrupt:
                 print("\n(interrupted; returning to mlxcli prompt)")
             except Exception as e:
+                log_error("chat_turn", f"{type(e).__name__} (backend={backend}, model={model}): {e}")
                 print(f"\n[error] {e}")
             continue
         handled_followup = False
@@ -3607,11 +3760,13 @@ def main():
                 auto_export_latest(messages, pending_export_path)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
+            log_error("chat_turn", f"HTTP {e.code} (backend={backend}, model={model}): {body}")
             print(f"\n[server error {e.code}] {body}")
         except KeyboardInterrupt:
             print("\n(interrupted; returning to mlxcli prompt)")
             continue
         except Exception as e:
+            log_error("chat_turn", f"{type(e).__name__} (backend={backend}, model={model}): {e}")
             print(f"\n[error] {e}")
 
 

@@ -32,13 +32,14 @@ try:
 except ImportError:
     psutil = None
 from mlxlib import (
-    DOWNLOADS, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
+    load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
     is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
     requires_agentic_execution as gui_requires_agentic_execution,
     execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
     resolve_output_path, normalize_tool_name as gui_normalize_tool_name,
     infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
+    python_syntax_error, missing_local_imports,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop as gui_detect_repetition_loop,
     parse_bare_json_tool_call as gui_parse_bare_json_tool_call,
@@ -49,6 +50,7 @@ from mlxlib import (
     load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
+    caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
 )
 
 
@@ -100,7 +102,7 @@ DEFAULT_SYSTEM = (
     "For file metadata such as creation dates, use stat on the exact files and report the filesystem values; "
     "do not infer dates from filenames or conversation text.\n"
     "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
-    "Save created files in ~/Downloads unless the user gives another path.\n"
+    f"Save created files in {load_default_dir()} unless the user gives another path.\n"
     "For local file tasks, use the available tools and never claim a file was created, run, inspected, verified, or shared without tool evidence.\n"
     "When running a local script against an absolute input file, use that input file's directory as the working directory unless another one is explicitly requested. Resolve relative outputs beside the input file.\n"
     "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes.\n"
@@ -119,7 +121,7 @@ PRESET_SYSTEMS = {
         "Use bullets only when they improve scanning.\n"
         "Ask a clarifying question only when the missing detail blocks useful work.\n"
         "Respect local LLM memory limits: use only relevant imported context, summarize instead of quoting, and suggest Clear when old context is no longer needed.\n"
-        "Save created files in ~/Downloads unless the user gives another path.\n"
+        f"Save created files in {load_default_dir()} unless the user gives another path.\n"
         "Be direct, respectful, and practical."
     ),
     "Code-Focused": (
@@ -129,7 +131,7 @@ PRESET_SYSTEMS = {
         "Prefer simple, efficient standard-library solutions unless a dependency is clearly better.\n"
         "Mention important assumptions and edge cases briefly.\n"
         "Respect local LLM memory limits and avoid repeating large context.\n"
-        "Save created files in ~/Downloads unless the user gives another path."
+        f"Save created files in {load_default_dir()} unless the user gives another path."
     ),
     "Document Drafting": (
         "You are a concise writing assistant running locally on the user's Mac.\n"
@@ -138,7 +140,7 @@ PRESET_SYSTEMS = {
         "Use clear headings, short paragraphs, and practical formatting.\n"
         "Avoid long quoted source text unless the user asks for it.\n"
         "Respect local LLM memory limits by summarizing imported material.\n"
-        "Save created files in ~/Downloads unless the user gives another path."
+        f"Save created files in {load_default_dir()} unless the user gives another path."
     ),
 }
 CODE_REQUEST_SYSTEM = (
@@ -364,7 +366,11 @@ def ensure_server(backend, url, key, status):
         log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
         log_handle.flush()
         subprocess.Popen(
-            [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1]],
+            [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
+             # 65536 hangs on this machine (confirmed: server goes into uninterruptible
+             # sleep, system nearly out of free pages, thrashing on expert-weight disk
+             # I/O). 32768 is the highest tier confirmed to actually work.
+             "--max-context", "32768"],
             cwd=paths["root"], stdout=log_handle, stderr=log_handle,
         )
     else:
@@ -2020,8 +2026,10 @@ class MlxGui(tk.Tk):
             message = f"HTTP {exc.code}: {exc.reason}"
             if detail:
                 message += f" - {detail[:400]}"
+            log_error("refine_prompt", f"(backend={self.backend}, model={model}) {message}")
             self.events.put(("refine_error", message))
         except Exception as exc:
+            log_error("refine_prompt", f"{type(exc).__name__} (backend={self.backend}, model={model}): {exc}")
             self.events.put(("refine_error", str(exc)))
 
     def open_settings(self):
@@ -2076,7 +2084,7 @@ class MlxGui(tk.Tk):
         rag_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
 
         def browse_rag_folder():
-            folder = filedialog.askdirectory(title="Select RAG folder", initialdir=str(DOWNLOADS))
+            folder = filedialog.askdirectory(title="Select RAG folder", initialdir=str(load_default_dir()))
             if folder:
                 self.chat_rag_folder_var.set(folder)
                 self.status_var.set(f"Set chat RAG folder to {folder}")
@@ -2357,7 +2365,7 @@ class MlxGui(tk.Tk):
             except ValueError:
                 mkdir_parts = []
             if mkdir_parts[:2] == ["mkdir", "-p"] and len(mkdir_parts) > 2:
-                root = DOWNLOADS.resolve()
+                root = load_default_dir().resolve()
                 targets = [pathlib.Path(part).expanduser().resolve(strict=False) for part in mkdir_parts[2:]]
                 if all(target.is_relative_to(root) for target in targets) and all(target.exists() for target in targets):
                     return "exit_code=0\n(no action; requested directories already exist)"
@@ -2423,7 +2431,22 @@ class MlxGui(tk.Tk):
                 target.write_text(content)
                 record_last_artifact(target, self.last_user_text)
                 note = f" (previous version backed up to {backup_path})" if backup_path else ""
-                return f"Written: {target} ({target.stat().st_size} bytes).{note}"
+                result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
+                if target.suffix == ".py":
+                    syntax_error = python_syntax_error(content)
+                    if syntax_error:
+                        return (f"{result} Error: this file has a Python syntax error and will not run "
+                                f"({syntax_error}) — likely truncated mid-generation. Rewrite it completely with write_file.")
+                    missing = missing_local_imports(target)
+                    if missing:
+                        plural = "s" if len(missing) > 1 else ""
+                        return (f"{result} Warning: this file imports {', '.join(missing)}, which "
+                                f"{'are' if plural else 'is'} neither a standard-library module nor installed, and "
+                                f"{'have' if plural else 'has'} no matching file yet in {target.parent}. "
+                                "If it's meant to be a local module, write it now with write_file. If it's a "
+                                "third-party package, install it first with run_command (pip install ...) or state "
+                                "that it's a required dependency — do not report completion either way until resolved.")
+                return result
             except Exception as exc:
                 return f"Error: {exc}"
         return f"Unknown tool: {name}"
@@ -2581,7 +2604,7 @@ class MlxGui(tk.Tk):
             name = "omlx-mlxcli-mlxgui-setup"
         else:
             name = "mlxgui-reply"
-        return DOWNLOADS / f"{name}-{stamp}.docx"
+        return load_default_dir() / f"{name}-{stamp}.docx"
 
     def save_docx_content(self, content, target=None):
         target = pathlib.Path(target or self.default_docx_path()).expanduser()
@@ -2749,7 +2772,7 @@ class MlxGui(tk.Tk):
     def import_files(self):
         paths = filedialog.askopenfilenames(
             title="Import one or more files",
-            initialdir=str(DOWNLOADS),
+            initialdir=str(load_default_dir()),
         )
         if not paths:
             return
@@ -2758,7 +2781,7 @@ class MlxGui(tk.Tk):
     def insert_file_references(self):
         paths = filedialog.askopenfilenames(
             title="Select files to reference in your request",
-            initialdir=str(DOWNLOADS),
+            initialdir=str(load_default_dir()),
         )
         if not paths:
             return
@@ -2799,7 +2822,7 @@ class MlxGui(tk.Tk):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = filedialog.asksaveasfilename(
             title="Export latest model reply",
-            initialdir=str(DOWNLOADS),
+            initialdir=str(load_default_dir()),
             initialfile=f"mlxgui-reply-{stamp}.docx",
             defaultextension=".docx",
             filetypes=[
@@ -3005,6 +3028,12 @@ class MlxGui(tk.Tk):
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
 
     def stream_reply(self, model):
+        # Guard the whole turn (all agentic tool-call retries included) so a
+        # long local generation can't get killed by the Mac going to sleep.
+        with caffeinate_guard():
+            self._stream_reply_body(model)
+
+    def _stream_reply_body(self, model):
         request_messages, context_status, context_error = request_messages_with_context(
             self.messages,
             self.last_user_text,
@@ -3100,6 +3129,7 @@ class MlxGui(tk.Tk):
                             slot["arguments"] += function.get("arguments") or ""
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace").strip()[:400]
+                log_error("gui_chat_turn", f"HTTP {exc.code} (backend={self.backend}, model={payload.get('model')}): {detail}")
                 self.events.put(("append", f"\n[error] HTTP {exc.code}: {detail}\n"))
                 self.events.put(("done", "", usage))
                 return
@@ -3107,6 +3137,7 @@ class MlxGui(tk.Tk):
                 if self.cancel_requested:
                     self.events.put(("canceled", "".join(parts)))
                 else:
+                    log_error("gui_chat_turn", f"{type(exc).__name__} (backend={self.backend}, model={payload.get('model')}): {exc}")
                     self.events.put(("append", f"\n[error] {exc}\n"))
                     self.events.put(("done", "", usage))
                 return

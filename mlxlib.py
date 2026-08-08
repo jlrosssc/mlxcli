@@ -11,14 +11,48 @@ Constants and pure functions only — no Tkinter, no terminal I/O. Each caller
 keeps its own approval UI (a keypress prompt for mlxcli, a modal dialog for
 mlxgui) since those are fundamentally different interaction models.
 """
+import ast
+import contextlib
+import importlib.util
 import json
+import logging
+import os
 import pathlib
 import re
 import shutil
+import subprocess
+import sys
 import uuid
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
-DOWNLOADS = pathlib.Path.home() / "Downloads"
+DEFAULT_DIR_CONFIG_PATH = pathlib.Path.home() / ".omlx" / "default_dir.txt"
+DEFAULT_DIR_FALLBACK = pathlib.Path.home() / "LocalAI"
+
+
+def load_default_dir():
+    """The default directory mlxcli/mlxgui save to and search under when the
+    user doesn't give an explicit path. Configurable via save_default_dir
+    (persisted in DEFAULT_DIR_CONFIG_PATH); falls back to ~/LocalAI. Created
+    on disk if it doesn't exist yet, so callers can always treat it as real."""
+    try:
+        raw = DEFAULT_DIR_CONFIG_PATH.read_text().strip()
+        path = pathlib.Path(raw).expanduser() if raw else DEFAULT_DIR_FALLBACK
+    except Exception:
+        path = DEFAULT_DIR_FALLBACK
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def save_default_dir(path):
+    path = pathlib.Path(path).expanduser().resolve(strict=False)
+    path.mkdir(parents=True, exist_ok=True)
+    DEFAULT_DIR_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_DIR_CONFIG_PATH.write_text(str(path) + "\n")
+    return path
 
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
@@ -116,11 +150,55 @@ def record_last_artifact(path, task_summary):
 def load_last_artifact():
     try:
         data = json.loads(LAST_ARTIFACT_PATH.read_text())
-        if data.get("path"):
+        # A path that's since been moved/deleted is worse than no note at all —
+        # it tells the model to read_file a location that no longer exists,
+        # confusing an otherwise unrelated turn with a dead reference.
+        if data.get("path") and pathlib.Path(data["path"]).exists():
             return data
     except Exception:
         pass
     return None
+
+
+ERROR_LOG_PATH = pathlib.Path.home() / ".omlx" / "error.log"
+
+_error_logger = None
+
+
+def _get_error_logger():
+    global _error_logger
+    if _error_logger is not None:
+        return _error_logger
+    ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("mlxcli.errors")
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+    if not logger.handlers:
+        # 1MB per file, 2 backups kept (~3MB / roughly thousands of entries)
+        # — enough to debug a session after the fact without growing unbounded.
+        handler = RotatingFileHandler(ERROR_LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(handler)
+    _error_logger = logger
+    return logger
+
+
+def log_error(source, message):
+    """Append a timestamped error to ~/.omlx/error.log. Best-effort — a logging
+    failure should never interrupt the actual chat/tool flow that hit the error."""
+    try:
+        _get_error_logger().error("[%s] %s", source, str(message).strip()[:2000])
+    except Exception:
+        pass
+
+
+def tail_error_log(n=20):
+    """Last n log lines, oldest first. Returns [] if the log doesn't exist yet."""
+    try:
+        lines = ERROR_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        return lines[-n:]
+    except Exception:
+        return []
 
 
 def last_artifact_system_note():
@@ -175,11 +253,13 @@ TOOLS = [
 def term_present(term, lowered_text):
     """Match a keyword as a real word, not a substring buried inside an unrelated
     word — e.g. "test" inside a path like "testLocalAI", or "put" inside "input".
-    Terms that are themselves punctuation-anchored (like ".py") keep plain substring
-    matching, since the leading "." already prevents this kind of false positive."""
+    Terms that are themselves punctuation-anchored (like ".py") skip the leading
+    boundary check (the "." already prevents most false positives there), but
+    still require a trailing boundary — short extensions like ".c" or ".m" are
+    otherwise a real risk of matching inside an unrelated ".com"/".me"/etc."""
     if term.replace(" ", "").isalnum():
         return bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", lowered_text))
-    return term in lowered_text
+    return bool(re.search(re.escape(term) + r"(?![A-Za-z0-9])", lowered_text))
 
 
 def is_code_request(text):
@@ -199,12 +279,19 @@ def requires_agentic_execution(text):
         "generate files", "place the files", "put the files", "verify",
         "confirm that", "list its byte size", "share the final files",
         "open", "show", "view", "look at", "check", "list", "read",
-        "update", "modify", "edit", "add", "change",
+        "update", "modify", "edit", "add", "change", "build", "set up",
     )
     target_terms = (
-        "file", "files", "directory", "folder", "path", "csv", "script",
-        "downloads", ".py", ".csv", "readme", "project",
-        "spreadsheet", "workbook", "excel", ".xlsx", ".xls", ".docx", ".pdf",
+        "file", "files", "directory", "folder", "path", "script",
+        "downloads", "readme", "project",
+        "spreadsheet", "workbook", "excel",
+        "app", "application", "program", "python", "database",
+        "website", "webpage", "web app", "api", "server", "notebook",
+        "presentation", "slides", "document", "game",
+        # Any extension mlxcli/mlxgui already knows how to read, convert, or
+        # review is itself an unambiguous local-target signal — one source of
+        # truth instead of a hand-maintained duplicate subset that drifts.
+        *REVIEWABLE_TEXT, *CONVERTIBLE,
     )
     # A literal filesystem path (e.g. pasted from Finder or a prior tool result) is
     # itself an unambiguous signal to verify against the real filesystem, regardless
@@ -224,8 +311,12 @@ def should_auto_enable_agentic(text, messages=None):
         or any(term_present(term, lowered) for term in (
             "downloads", "download folder", "local file", "local folder", "filesystem",
             "file system", "directory", "folder", "repository", "repo", "working tree",
-            ".xlsx", ".xls", ".csv", ".pdf", ".docx", ".md", ".py", "/users/",
+            "/users/",
             "spreadsheet", "workbook", "excel",
+            "script", "project", "app", "application", "program", "python", "database",
+            "website", "webpage", "web app", "api", "server", "notebook",
+            "presentation", "slides", "document", "game",
+            *REVIEWABLE_TEXT, *CONVERTIBLE,
         ))
     )
     operation = any(term_present(term, lowered) for term in (
@@ -234,6 +325,7 @@ def should_auto_enable_agentic(text, messages=None):
         "create", "write", "edit", "modify", "update", "add", "change", "save", "export",
         "clean", "tidy", "organize", "organise", "sort out", "declutter",
         "free up", "back up", "backup", "what's using", "whats using", "what's taking",
+        "build", "set up",
     ))
     if local_target and operation:
         return True
@@ -269,14 +361,135 @@ def tool_result_failed(result):
     )
 
 
+def python_syntax_error(source):
+    """None if source parses as valid Python; otherwise a short "line N: message"
+    description of the SyntaxError. Catches a write_file call that got cut off
+    mid-generation (e.g. hit max_tokens mid-string) before it's reported as a
+    successful write."""
+    try:
+        ast.parse(source)
+        return None
+    except SyntaxError as e:
+        return f"line {e.lineno}: {e.msg}"
+
+
+def missing_local_imports(py_path):
+    """Top-level import names in py_path that look like local sibling modules
+    (not stdlib, not installed) but have no matching file next to py_path —
+    the exact shape of `from gui import X` when gui.py was never written.
+    Returns a sorted list of missing names; [] if the file parses clean or
+    doesn't parse at all (a syntax error is reported separately)."""
+    py_path = pathlib.Path(py_path)
+    try:
+        tree = ast.parse(py_path.read_text(errors="replace"))
+    except Exception:
+        return []
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+    missing = []
+    for name in sorted(names):
+        if name in sys.stdlib_module_names:
+            continue
+        try:
+            found = importlib.util.find_spec(name) is not None
+        except Exception:
+            found = True  # ambiguous — don't flag a name we can't resolve cleanly
+        if found:
+            continue
+        sibling_file = py_path.parent / f"{name}.py"
+        sibling_pkg = py_path.parent / name / "__init__.py"
+        if not sibling_file.exists() and not sibling_pkg.exists():
+            missing.append(name)
+    return missing
+
+
+def find_entry_point_candidates(py_paths):
+    """Which of these just-written .py files look like a runnable entry point
+    (has `if __name__ == "__main__":`) — for offering a post-build smoke test.
+    Deduplicates and skips paths that no longer exist."""
+    candidates = []
+    seen = set()
+    for raw in py_paths:
+        path = pathlib.Path(raw)
+        key = str(path)
+        if key in seen or not path.exists():
+            continue
+        seen.add(key)
+        try:
+            text = path.read_text(errors="replace")
+        except Exception:
+            continue
+        if re.search(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]\s*:', text):
+            candidates.append(path)
+    return candidates
+
+
+def smoke_test_python_app(path, timeout=4):
+    """Launch `python3 path` briefly to catch startup crashes that py_compile
+    can't see — missing runtime dependencies, import-time exceptions, etc.
+    A process still running after `timeout` seconds is treated as a pass (it
+    started without crashing and is presumably sitting in an event loop) and
+    gets terminated; a clean exit(0) within the window is also a pass; a
+    nonzero exit is a fail, returned with the captured stderr tail."""
+    path = pathlib.Path(path)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(path)],
+            cwd=str(path.parent),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except Exception as e:
+        return False, f"Could not launch: {e}"
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+        return True, f"Still running after {timeout}s with no crash (likely a GUI/event-loop app) — terminated for the test."
+    if proc.returncode == 0:
+        return True, "Exited cleanly (code 0)."
+    tail = "\n".join((stderr or "").strip().splitlines()[-15:])
+    return False, f"Exited with code {proc.returncode}.\n{tail}"
+
+
+def run_verify_command(command, timeout=60):
+    """Run a shell command as a correctness check — e.g. after a headless
+    --run task claims completion, prove it rather than trust the model's own
+    claim. Returns (passed, output_tail): passed is True only on exit code 0;
+    output_tail is the last ~40 lines of combined stdout+stderr, meant to be
+    fed straight back to the model as a concrete failure signal to fix."""
+    try:
+        proc = subprocess.run(
+            command, shell=True, cwd=str(load_default_dir()),
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Verification command timed out after {timeout}s."
+    except Exception as e:
+        return False, f"Could not run verification command: {e}"
+    output = (proc.stdout or "") + (proc.stderr or "")
+    tail = "\n".join(output.strip().splitlines()[-40:])
+    return proc.returncode == 0, tail
+
+
 def resolve_output_path(raw):
-    # A relative path (no directory given) defaults to Downloads for convenience.
-    # An absolute path is honored as-is — the diff/preview + approval prompt in
-    # write_file is the actual safety gate, not a fixed directory restriction,
-    # since the latter silently blocks legitimate writes to project files elsewhere.
+    # A relative path (no directory given) defaults to the configured default
+    # directory for convenience. An absolute path is honored as-is — the
+    # diff/preview + approval prompt in write_file is the actual safety gate,
+    # not a fixed directory restriction, since the latter silently blocks
+    # legitimate writes to project files elsewhere.
     p = pathlib.Path(raw).expanduser()
     if not p.is_absolute():
-        p = DOWNLOADS / p
+        p = load_default_dir() / p
     return p.resolve(strict=False)
 
 
@@ -506,6 +719,34 @@ def backup_before_overwrite(target):
         return backup_path
     except Exception:
         return None
+
+
+@contextlib.contextmanager
+def caffeinate_guard():
+    """Prevent idle sleep for exactly the duration of an in-flight turn (a local
+    generation, including any agentic tool-call retries, can run for minutes),
+    so it can't get killed by the Mac going to sleep. Scoped to the active
+    request/turn only, not the whole app session, via a `caffeinate -i` child
+    process that starts on entry and is normally stopped on exit via the
+    try/finally below — but that cleanup is cooperative Python code, which a
+    `kill -9` on this process skips entirely, orphaning caffeinate to block
+    idle sleep forever. `-w <our own pid>` is the OS-level backstop: caffeinate
+    watches that pid directly and exits on its own the moment it's gone, no
+    cooperation required, so even a hard kill can't leak it."""
+    proc = None
+    try:
+        proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+    except Exception:
+        proc = None
+    try:
+        yield
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
 
 
 # Conventional filenames checked (in order) for project-local instructions —
