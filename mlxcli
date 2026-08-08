@@ -19,7 +19,7 @@ Usage:
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
-  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /clear  /help  /exit
+  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
 """
 import atexit
 import difflib
@@ -67,6 +67,8 @@ from mlxlib import (
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
     caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
+    rag_remote_config, rag_remote_request, rag_remote_search, rag_remote_list,
+    rag_remote_upload, rag_remote_update, rag_remote_delete,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -231,11 +233,25 @@ HELP = """Commands:
   /defaultdir     show the default directory used for saving and searching
   /defaultdir PATH
                   change the default directory (persists; created if missing)
+  /rag status      show configured remote RAG server and collection
+  /rag list [C]    list remote documents, optionally scoped to collection C
+  /rag search Q    search the remote RAG repository
+  /rag upload PATH [C]
+                  upload a local document to the remote RAG repository
+  /rag update ID PATH
+                  replace a remote document with the contents of PATH
+  /rag delete ID   delete a remote document by UUID
   /copy           copy the latest reply's last code block (or full reply if none) to the clipboard
   /clear          wipe conversation history
   /commands       list slash commands only
   /help           this text
   /exit           quit"""
+
+RAG_REMOTE_SYSTEM = (
+    "You have been given excerpts retrieved from the user's remote RAG repository. "
+    "Use them as source material, cite the document title when useful, and do not invent facts "
+    "that are not supported by the excerpts."
+)
 
 INPUT_VERBS = (
     "read", "review", "load", "open", "summarize", "summarise", "analyze", "analyse",
@@ -1726,6 +1742,76 @@ def do_errorlog(arg):
     print(f"{ERROR_LOG_PATH} (last {len(lines)}):")
     for line in lines:
         print(line)
+
+
+def remote_rag_context(messages, user_text, limit=4):
+    url, key, collection = rag_remote_config()
+    if not url:
+        return False
+    data = rag_remote_search(user_text, url, key, collection, limit=limit)
+    results = data.get("results") or []
+    if not results:
+        print(f"(remote RAG: no matches in {collection or 'all collections'})")
+        return False
+    lines = [
+        f"Remote RAG server: {url}",
+        f"Remote RAG collection: {collection or '(all collections)'}",
+        "Relevant source excerpts:",
+    ]
+    labels = []
+    for result in results:
+        label = f"{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}"
+        labels.append(label)
+        lines.append(f"\n[{label}]\n{result.get('content', '')}")
+    insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+    messages.insert(insert_at, {"role": "system", "content": RAG_REMOTE_SYSTEM})
+    messages.insert(insert_at + 1, {"role": "system", "content": "\n".join(lines)})
+    print(f"(remote RAG: used {len(results)} excerpt(s) from {', '.join(labels)})")
+    return True
+
+
+def do_rag(arg):
+    url, key, configured_collection = rag_remote_config()
+    if not url or not key:
+        print("Remote RAG is not configured. Set RAG_URL and RAG_API_KEY (optionally RAG_COLLECTION).")
+        return
+    parts = shlex.split(arg.strip()) if arg.strip() else ["status"]
+    command = parts[0].lower()
+    collection = configured_collection
+    if command == "list" and len(parts) > 1:
+        collection = parts[1]
+    if command == "upload" and len(parts) > 2:
+        collection = parts[2]
+    try:
+        if command == "status":
+            print(rag_remote_request("GET", f"{url}/health", key))
+        elif command == "list":
+            data = rag_remote_list(url, key, collection)
+            for doc in data.get("documents", []):
+                print(f"{doc.get('id')}  {doc.get('title') or doc.get('filename')}  {doc.get('metadata', {})}")
+            print(f"({len(data.get('documents', []))} document(s))")
+        elif command == "search":
+            query_parts = parts[1:]
+            if len(query_parts) >= 2 and query_parts[0] == "--collection":
+                collection, query_parts = query_parts[1], query_parts[2:]
+            query = " ".join(query_parts)
+            data = rag_remote_search(query, url, key, collection)
+            for result in data.get("results", []):
+                print(f"\n[{result.get('title')}] chunk {result.get('chunk_index')} score={result.get('score')}\n{result.get('content', '')[:1200]}")
+        elif command == "upload" and len(parts) >= 2:
+            path = pathlib.Path(parts[1]).expanduser()
+            data = rag_remote_upload(path, url, key, collection)
+            print(f"uploaded {data.get('id')} ({data.get('chunks')} chunks)")
+        elif command == "update" and len(parts) >= 3:
+            path = pathlib.Path(parts[2]).expanduser()
+            data = rag_remote_update(parts[1], path.read_text(errors="replace"), url, key, collection, filename=path.name)
+            print(f"updated {data.get('id')} ({data.get('chunks')} chunks)")
+        elif command == "delete" and len(parts) >= 2:
+            print(rag_remote_delete(parts[1], url, key))
+        else:
+            print("usage: /rag status | list [collection] | search [collection] QUERY | upload PATH [collection] | update ID PATH | delete ID")
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
+        print(f"[remote RAG error] {exc}")
 
 
 def do_gitstatus(arg):
@@ -3358,6 +3444,7 @@ def main():
         backend_suggestion = suggest_better_backend(backend, run_task)
         if backend_suggestion:
             print(f"(suggestion: {backend_suggestion})")
+        remote_rag_context(messages, run_task)
         messages.append({"role": "user", "content": run_task})
         turn_mode = should_auto_enable_agentic(run_task) if requires_agentic_execution(run_task) else False
         max_verify_attempts = 3 if verify_command else 1
@@ -3744,6 +3831,7 @@ def main():
                     print(f"(agentic loaded {len(labels)} file(s) from the last search results)")
                     handled_followup = True
         if not handled_followup:
+            remote_rag_context(messages, user)
             messages.append({"role": "user", "content": user})
             if agentic_mode:
                 for note in apply_agentic_preflight(user, messages, convert_mode):

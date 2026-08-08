@@ -23,6 +23,19 @@ chmod +x ~/bin/mlxgui
 `mlxcli` reads the oMLX API key from `~/.omlx/settings.json` by default. You can
 override the server with `OMLX_URL` and the key with `OMLX_API_KEY`.
 
+Optional remote RAG support is configured separately from the model server:
+
+```bash
+export RAG_URL=http://192.168.1.7:8090
+export RAG_API_KEY='your-server-generated-key'
+export RAG_COLLECTION=historical-us-census   # optional topic scope
+```
+
+`mlxgui.py` automatically retrieves excerpts from that remote repository for
+each chat turn. `mlxcli` also provides `/rag status`, `/rag list`, `/rag search`,
+`/rag upload`, `/rag update`, and `/rag delete`. `RAG_URL` must not replace
+`OMLX_URL`; they are different services.
+
 ## Usage
 
 ```bash

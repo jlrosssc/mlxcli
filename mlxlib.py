@@ -22,12 +22,110 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 DEFAULT_DIR_CONFIG_PATH = pathlib.Path.home() / ".omlx" / "default_dir.txt"
 DEFAULT_DIR_FALLBACK = pathlib.Path.home() / "LocalAI"
+
+
+def rag_remote_config():
+    """Return optional LAN RAG configuration used by both clients.
+
+    RAG_URL is intentionally separate from OMLX_URL: it points at the document
+    repository, not the model server. RAG_COLLECTION scopes retrieval to one
+    topic while allowing multiple topics to share the same RAG deployment.
+    """
+    url = os.environ.get("RAG_URL", "").strip().rstrip("/")
+    key = os.environ.get("RAG_API_KEY", "").strip()
+    collection = os.environ.get("RAG_COLLECTION", "").strip()
+    return url, key, collection
+
+
+def rag_remote_request(method, path, key, payload=None, body=None, content_type=None, timeout=60):
+    data = body
+    headers = {"Accept": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
+def rag_remote_search(query, url=None, key=None, collection=None, limit=4):
+    configured_url, configured_key, configured_collection = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    collection = collection if collection is not None else configured_collection
+    params = {"query": query, "limit": str(limit)}
+    if collection:
+        params["collection"] = collection
+    endpoint = f"{url}/search?{urllib.parse.urlencode(params)}"
+    return rag_remote_request("GET", endpoint, key)
+
+
+def rag_remote_list(url=None, key=None, collection=None, limit=100):
+    configured_url, configured_key, configured_collection = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    collection = collection if collection is not None else configured_collection
+    params = {"limit": str(limit)}
+    if collection:
+        params["collection"] = collection
+    endpoint = f"{url}/documents?{urllib.parse.urlencode(params)}"
+    return rag_remote_request("GET", endpoint, key)
+
+
+def _multipart_upload(path, title, metadata):
+    boundary = uuid.uuid4().hex
+    filename = pathlib.Path(path).name
+    payload = pathlib.Path(path).read_bytes()
+    parts = []
+    def field(name, value):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+    field("title", title or filename)
+    field("metadata", json.dumps(metadata, ensure_ascii=False))
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
+    parts.append(payload)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def rag_remote_upload(path, url=None, key=None, collection=None, title=None):
+    configured_url, configured_key, configured_collection = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    collection = collection if collection is not None else configured_collection
+    body, content_type = _multipart_upload(path, title, {"collection": collection} if collection else {})
+    return rag_remote_request("POST", f"{url}/documents", key, body=body, content_type=content_type, timeout=900)
+
+
+def rag_remote_update(document_id, content, url=None, key=None, collection=None, title=None, filename="manual-update"):
+    configured_url, configured_key, configured_collection = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    collection = collection if collection is not None else configured_collection
+    return rag_remote_request("PUT", f"{url}/documents/{document_id}", key, payload={
+        "title": title or filename, "content": content,
+        "metadata": {"collection": collection} if collection else {},
+    })
+
+
+def rag_remote_delete(document_id, url=None, key=None):
+    configured_url, configured_key, _ = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    return rag_remote_request("DELETE", f"{url}/documents/{document_id}", key)
 
 
 def load_default_dir():

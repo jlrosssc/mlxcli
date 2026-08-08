@@ -51,6 +51,7 @@ from mlxlib import (
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
     caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
+    rag_remote_config, rag_remote_search,
 )
 
 
@@ -893,6 +894,31 @@ def request_messages_with_context(messages, user_text, rag_folder):
     scoped = request_messages_for_turn(messages, user_text)
     statuses = []
     urls = detect_urls(user_text)
+
+    remote_url, remote_key, remote_collection = rag_remote_config()
+    if remote_url:
+        try:
+            remote = rag_remote_search(user_text, remote_url, remote_key, remote_collection, limit=RAG_MAX_CHUNKS)
+            results = remote.get("results") or []
+            if results:
+                lines = [
+                    f"Remote RAG server: {remote_url}",
+                    f"Remote RAG collection: {remote_collection or '(all collections)'}",
+                    "Relevant excerpts from the remote RAG repository:",
+                ]
+                used = []
+                for result in results:
+                    label = f"{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}"
+                    used.append(label)
+                    lines.append(f"\n[{label}]\n{result.get('content', '')}")
+                insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
+                scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
+                scoped.insert(insert_at + 1, {"role": "system", "content": "\n".join(lines)})
+                statuses.append(f"Remote RAG used {len(results)} excerpt(s) from {', '.join(used)}")
+            else:
+                statuses.append(f"Remote RAG returned no matches ({remote_collection or 'all collections'})")
+        except Exception as exc:
+            statuses.append(f"Remote RAG unavailable: {exc}")
 
     folder = (rag_folder or "").strip()
     if folder:
