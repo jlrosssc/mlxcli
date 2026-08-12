@@ -13,6 +13,7 @@ mlxgui) since those are fundamentally different interaction models.
 """
 import ast
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -84,6 +85,50 @@ def rag_remote_list(url=None, key=None, collection=None, limit=100):
         params["collection"] = collection
     endpoint = f"{url}/documents?{urllib.parse.urlencode(params)}"
     return rag_remote_request("GET", endpoint, key)
+
+
+def rag_remote_get_document(document_id, url=None, key=None):
+    """Fetch a document's full, unchunked stored content (not search snippets) —
+    needed for exact extraction (e.g. a precise Bible verse range) rather than
+    keyword-similarity search."""
+    configured_url, configured_key, _ = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    return rag_remote_request("GET", f"{url}/documents/{document_id}", key)
+
+
+def esv_passage(reference, api_key=None):
+    """On-demand ESV passage lookup via api.esv.org — fetched fresh each call,
+    never cached or stored, per Crossway's API terms (personal/non-commercial
+    use). Returns the passage text, or raises on a missing/invalid key or a
+    reference the API can't parse."""
+    key = api_key or os.environ.get("ESV_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("ESV_API_KEY is not set")
+    params = urllib.parse.urlencode({
+        "q": reference,
+        "include-headings": "true",
+        "include-footnotes": "false",
+        "include-verse-numbers": "true",
+        "include-short-copyright": "true",
+    })
+    request = urllib.request.Request(
+        f"https://api.esv.org/v3/passage/text/?{params}",
+        headers={"Authorization": f"Token {key}"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    passages = data.get("passages") or []
+    if not passages:
+        raise RuntimeError(f"ESV API returned no passage for {reference!r} — check the reference")
+    return data.get("canonical", reference), passages[0]
+
+
+def rag_remote_collections(url=None, key=None):
+    """List every collection on the RAG server, with each one's document count."""
+    configured_url, configured_key, _ = rag_remote_config()
+    url = (url or configured_url).rstrip("/")
+    key = key if key is not None else configured_key
+    return rag_remote_request("GET", f"{url}/collections", key)
 
 
 def _multipart_upload(path, title, metadata):
@@ -579,6 +624,71 @@ def run_verify_command(command, timeout=60):
     return proc.returncode == 0, tail
 
 
+def _maybe_archive_verify_script(command, history_dir):
+    """If `command` is exactly a runner plus one script file ("bash X.sh" or
+    "python3 X.py"), copy that script into history_dir so a later --verify
+    also re-runs it as a regression check. Content-hash deduped — running the
+    same check again doesn't pile up duplicate copies. Silently does nothing
+    for inline/complex commands, since those can't be safely re-invoked out
+    of their original context."""
+    parts = command.split()
+    if len(parts) != 2:
+        return
+    runner, script = parts
+    if runner not in ("bash", "sh", "python3", "python"):
+        return
+    script_path = pathlib.Path(script)
+    if not script_path.is_file():
+        return
+    try:
+        content = script_path.read_bytes()
+    except Exception:
+        return
+    digest = hashlib.sha256(content).hexdigest()[:12]
+    dest = pathlib.Path(history_dir) / f"{script_path.stem}_{digest}{script_path.suffix}"
+    if dest.exists():
+        return
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+        dest.chmod(0o755)
+    except Exception:
+        pass
+
+
+def run_verify_suite(command, history_dir=None, timeout=60):
+    """Run `command` (the current task's own correctness check) plus every
+    .sh/.py script already accumulated in history_dir (regression checks from
+    earlier steps in this same project) — a step that breaks something two
+    steps back gets caught here instead of only surfacing when a human
+    happens to rerun an old check by hand. On a full pass, also archives
+    `command` into history_dir (if it's a simple runner+script form) so it
+    joins the regression suite for whatever comes next.
+
+    Returns (passed, output) — passed only if the main command AND every
+    archived script all exit 0; output concatenates every failure's tail."""
+    passed, output = run_verify_command(command, timeout=timeout)
+    if not history_dir:
+        return passed, output
+
+    failures = [] if passed else [f"[current check] {output}"]
+    history_path = pathlib.Path(history_dir)
+    if history_path.is_dir():
+        for script in sorted(history_path.glob("*")):
+            if script.suffix not in (".sh", ".py"):
+                continue
+            runner = "bash" if script.suffix == ".sh" else sys.executable
+            regression_ok, regression_output = run_verify_command(f"{runner} {script}", timeout=timeout)
+            if not regression_ok:
+                failures.append(f"[regression: {script.name}] {regression_output}")
+
+    if failures:
+        return False, "\n\n".join(failures)
+
+    _maybe_archive_verify_script(command, history_dir)
+    return True, output
+
+
 def resolve_output_path(raw):
     # A relative path (no directory given) defaults to the configured default
     # directory for convenience. An absolute path is honored as-is — the
@@ -824,16 +934,24 @@ def caffeinate_guard():
     """Prevent idle sleep for exactly the duration of an in-flight turn (a local
     generation, including any agentic tool-call retries, can run for minutes),
     so it can't get killed by the Mac going to sleep. Scoped to the active
-    request/turn only, not the whole app session, via a `caffeinate -i` child
+    request/turn only, not the whole app session, via a `caffeinate` child
     process that starts on entry and is normally stopped on exit via the
     try/finally below — but that cleanup is cooperative Python code, which a
     `kill -9` on this process skips entirely, orphaning caffeinate to block
     idle sleep forever. `-w <our own pid>` is the OS-level backstop: caffeinate
     watches that pid directly and exits on its own the moment it's gone, no
-    cooperation required, so even a hard kill can't leak it."""
+    cooperation required, so even a hard kill can't leak it.
+
+    `-d` (prevent display sleep) is included alongside `-i` (prevent system
+    idle sleep) — `-i` alone still lets the screen go dark, and on macOS a
+    dark screen can trigger more aggressive background-process power
+    management (GPU clock/App-Nap-style throttling) even while the system
+    stays technically awake, independent of whatever's actually driving any
+    given slow generation. Costs nothing to also hold off display sleep for
+    a turn that's already holding off system sleep."""
     proc = None
     try:
-        proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+        proc = subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(os.getpid())])
     except Exception:
         proc = None
     try:

@@ -6,16 +6,26 @@ Low-overhead design: streaming output, bounded history, shared dialogue
 defaults, and approval-gated tools with diff preview.
 
 Usage:
-  mlxcli [model] [-p "custom system prompt"]
+  mlxcli [model] [-p "custom system prompt"] [-y]
+                             -y/--yes pre-approves all tool categories (run_command,
+                             write_file, python_interpreter, ssh_read/write/run) up
+                             front, so nothing prompts for the rest of the session —
+                             works in both the interactive REPL and headless --run.
   mlxcli --run "task" [-y]   headless one-shot mode: run a single task, print the
-                             result, and exit (no REPL). -y/--yes auto-approves
-                             all tool categories for the run (for scripting/CI).
+                             result, and exit (no REPL).
   mlxcli --run "task" -y --verify "shell command"
                              after the model claims completion, run this command as
                              a correctness check (cwd: the default directory). Exit
                              code 0 = pass. On failure, its output is fed back to the
                              model as a new turn (up to 3 attempts) instead of trusting
                              the model's own claim of success.
+  mlxcli --run "task" -y --verify "..." --verify-history DIR
+                             also require every .sh/.py script already in DIR to pass
+                             (a regression suite accumulated from earlier steps of the
+                             same project) — a fix that breaks something two steps back
+                             gets caught here. On a full pass, if --verify was a plain
+                             "runner script" form (e.g. "bash check.sh"), that script is
+                             archived into DIR so it joins the suite for the next step.
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
@@ -58,7 +68,7 @@ from mlxlib import (
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
     python_syntax_error, missing_local_imports,
-    find_entry_point_candidates, smoke_test_python_app, run_verify_command,
+    find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop, parse_bare_json_tool_call, parse_xml_tag_tool_call,
     parse_python_call_tool_call, DEFAULT_REPETITION_PENALTY,
@@ -68,7 +78,8 @@ from mlxlib import (
     record_last_artifact, last_artifact_system_note,
     caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
     rag_remote_config, rag_remote_request, rag_remote_search, rag_remote_list,
-    rag_remote_upload, rag_remote_update, rag_remote_delete,
+    rag_remote_upload, rag_remote_update, rag_remote_delete, rag_remote_collections,
+    rag_remote_get_document, esv_passage,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -119,6 +130,12 @@ DEFAULT_SYSTEM = (
     "Never simulate tool output or claim that files were created, executed, inspected, verified, or shared based only on your response. "
     "After writing files, use a tool to check the exact paths and report only the paths, sizes, and results returned by tools. "
     "If a required tool action is unavailable or declined, state that the task was not completed.\n"
+    "Ground-truth check: for any task involving calculation, physical/scientific data, or a numeric result that "
+    "has a real correct answer (not just code that runs without error), derive expected reference values from "
+    "known facts first — a textbook formula, a known physical constant, a hand-computed example — then check your "
+    "output against them with a tool before declaring the task complete. A script that runs cleanly and a script "
+    "that is CORRECT are different claims; only the second is done. Passing py_compile or a bare execution check "
+    "is not sufficient evidence of correctness by itself.\n"
     "When running a local script against an absolute input file, use the input file's directory as the working directory unless the user explicitly specifies another one. "
     "For generated scripts, resolve relative output files beside the input file, not beside the CLI process.\n"
     "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes. Use python_interpreter only to run already-created code when explicitly needed.\n"
@@ -234,8 +251,30 @@ HELP = """Commands:
   /defaultdir PATH
                   change the default directory (persists; created if missing)
   /rag status      show configured remote RAG server and collection
+  /rag collections list every collection on the server, with document counts
+  /rag collection  show which collection chat messages are auto-searched against
+  /rag collection C
+                  switch chat messages to auto-search collection C for this
+                  session (does not touch RAG_COLLECTION); "all" searches everything
+  /rag strict      show whether strict mode is on
+  /rag strict on|off
+                  on: a chat message with zero RAG matches gets no response at
+                  all rather than an ungrounded guess. off (default): the
+                  model is told no source was found and to say so, not fabricate.
   /rag list [C]    list remote documents, optionally scoped to collection C
-  /rag search Q    search the remote RAG repository
+  /rag search Q    search the remote RAG repository; results are numbered —
+                  type a bare number afterward to see that result's full text.
+                  "topic A or topic B or topic C" (without --collection) tries
+                  each topic against every collection and keeps what hits —
+                  e.g. /rag search sin or bearing failure or Mississippi river
+  /rag fetch ID [FILENAME]
+                  save one document's full, unchunked text to a local file
+                  (works for any document in any collection) — use this when a
+                  search snippet isn't enough context; then /read or /find it
+  /rag esv REFERENCE
+                  exact ESV passage text via api.esv.org, fetched live each
+                  call — never stored/uploaded (needs ESV_API_KEY set)
+                  e.g. /rag esv Romans 1:18-32
   /rag upload PATH [C]
                   upload a local document to the remote RAG repository
   /rag update ID PATH
@@ -252,6 +291,161 @@ RAG_REMOTE_SYSTEM = (
     "Use them as source material, cite the document title when useful, and do not invent facts "
     "that are not supported by the excerpts."
 )
+
+# Bible book name/abbreviation aliases, used only to expand a search query that
+# looks like a scripture reference — different commentaries cite books
+# differently (JFB uses "Ro" and "Joh"; others may spell them out), so rather
+# than making the user discover each convention by trial and error, a
+# reference-shaped query gets tried under several known forms and the results
+# merged. This is purely a search-query expansion, not a parser or a new
+# command — /rag search itself stays exactly as generic as it was for every
+# other collection. Data compiled from common English Bible abbreviation
+# conventions, not individually verified against every uploaded commentary.
+BIBLE_BOOK_ALIASES = {
+    "Genesis": ["Gen", "Ge", "Gn"], "Exodus": ["Exod", "Ex", "Exo"],
+    "Leviticus": ["Lev", "Le", "Lv"], "Numbers": ["Num", "Nu", "Nm"],
+    "Deuteronomy": ["Deut", "De", "Dt"], "Joshua": ["Josh", "Jos", "Jsh"],
+    "Judges": ["Judg", "Jdg", "Jg"], "Ruth": ["Rth", "Ru"],
+    "1 Samuel": ["1 Sam", "1 Sa", "1Sm", "I Samuel"],
+    "2 Samuel": ["2 Sam", "2 Sa", "2Sm", "II Samuel"],
+    "1 Kings": ["1 Kgs", "1 Ki", "1K", "I Kings"],
+    "2 Kings": ["2 Kgs", "2 Ki", "2K", "II Kings"],
+    "1 Chronicles": ["1 Chron", "1 Ch", "1Chr", "I Chronicles"],
+    "2 Chronicles": ["2 Chron", "2 Ch", "2Chr", "II Chronicles"],
+    "Ezra": ["Ezr"], "Nehemiah": ["Neh", "Ne"], "Esther": ["Esth", "Es"],
+    "Job": ["Jb"], "Psalms": ["Psalm", "Psa", "Ps", "Pss"],
+    "Proverbs": ["Prov", "Pro", "Prv", "Pr"],
+    "Ecclesiastes": ["Eccles", "Eccl", "Ecc", "Ec"],
+    "Song of Solomon": ["Song of Songs", "Canticles", "Song", "SOS", "So", "Cant"],
+    "Isaiah": ["Isa", "Is"], "Jeremiah": ["Jer", "Je", "Jr"],
+    "Lamentations": ["Lam", "La"], "Ezekiel": ["Ezek", "Eze", "Ezk"],
+    "Daniel": ["Dan", "Da", "Dn"], "Hosea": ["Hos", "Ho"],
+    "Joel": ["Joe", "Jl"], "Amos": ["Am"], "Obadiah": ["Obad", "Ob"],
+    "Jonah": ["Jon", "Jnh"], "Micah": ["Mic", "Mc"], "Nahum": ["Nah", "Na"],
+    "Habakkuk": ["Hab", "Hb"], "Zephaniah": ["Zeph", "Zep", "Zp"],
+    "Haggai": ["Hag", "Hg"], "Zechariah": ["Zech", "Zec", "Zc"],
+    "Malachi": ["Mal", "Ml"],
+    "Matthew": ["Matt", "Mt"], "Mark": ["Mrk", "Mk", "Mr"],
+    "Luke": ["Luk", "Lk"], "John": ["Joh", "Jn", "Jo", "Gospel of John"],
+    "Acts": ["Act", "Ac"], "Romans": ["Rom", "Ro", "Rm"],
+    "1 Corinthians": ["1 Cor", "1 Co", "I Corinthians"],
+    "2 Corinthians": ["2 Cor", "2 Co", "II Corinthians"],
+    "Galatians": ["Gal", "Ga"], "Ephesians": ["Eph", "Ephes"],
+    "Philippians": ["Phil", "Php", "Pp"], "Colossians": ["Col", "Co"],
+    "1 Thessalonians": ["1 Thess", "1 Th", "I Thessalonians"],
+    "2 Thessalonians": ["2 Thess", "2 Th", "II Thessalonians"],
+    "1 Timothy": ["1 Tim", "1 Ti", "I Timothy"],
+    "2 Timothy": ["2 Tim", "2 Ti", "II Timothy"],
+    "Titus": ["Tit", "Ti"], "Philemon": ["Philem", "Phm", "Pm"],
+    "Hebrews": ["Heb"], "James": ["Jas", "Jm"],
+    "1 Peter": ["1 Pet", "1 Pe", "I Peter"],
+    "2 Peter": ["2 Pet", "2 Pe", "II Peter"],
+    "1 John": ["1 Joh", "1 Jn", "I John"],
+    "2 John": ["2 Joh", "2 Jn", "II John"],
+    "3 John": ["3 Joh", "3 Jn", "III John"],
+    "Jude": ["Jud", "Jd"], "Revelation": ["Rev", "Re", "Apocalypse"],
+}
+# Reverse lookup: any known name/alias (lowercased) -> (canonical, [all forms])
+_BIBLE_BOOK_LOOKUP = {}
+for _canonical, _aliases in BIBLE_BOOK_ALIASES.items():
+    _all_forms = [_canonical] + _aliases
+    for _form in _all_forms:
+        _BIBLE_BOOK_LOOKUP[_form.lower()] = (_canonical, _all_forms)
+
+
+def expand_bible_reference_query(query):
+    """If query starts with a recognized Bible book name/alias followed by a
+    reference (e.g. 'John 3:16', 'Gospel of John 3:16', 'Jn 3:16-18'), return
+    one query variant per known form of that book so a search can try them
+    all and merge results. Otherwise return [query] unchanged — this only
+    ever adds variants, never changes behavior for non-reference queries or
+    any non-Bible collection."""
+    words = query.split()
+    for word_count in (3, 2, 1):
+        if word_count > len(words):
+            continue
+        candidate = " ".join(words[:word_count])
+        rest = " ".join(words[word_count:])
+        match = _BIBLE_BOOK_LOOKUP.get(candidate.lower())
+        if match and rest:
+            _canonical, all_forms = match
+            return [f"{form} {rest}" for form in all_forms]
+    return [query]
+
+
+# All known book forms, longest first (so "Song of Solomon" matches before
+# "Song"), for finding a reference embedded anywhere in a normal sentence —
+# not just when it's the whole query, unlike expand_bible_reference_query above.
+_BIBLE_BOOK_FORMS_BY_LENGTH = sorted(_BIBLE_BOOK_LOOKUP.keys(), key=len, reverse=True)
+_EMBEDDED_REFERENCE_RE = re.compile(
+    r"\b(" + "|".join(re.escape(f) for f in _BIBLE_BOOK_FORMS_BY_LENGTH) + r")\s+"
+    r"(\d+(?::\d+(?:-\d+)?)?)\b",
+    re.IGNORECASE)
+
+
+def find_embedded_bible_reference(text):
+    """Find a Bible reference anywhere in a normal sentence (e.g. 'show me
+    commentary on John 3:16 please') and return its expanded query variants,
+    or None if no reference is found. This is what lets a plain chat message
+    that happens to mention a reference get a targeted search instead of the
+    whole sentence — including its filler words — being used as one literal,
+    almost-certainly-losing query."""
+    m = _EMBEDDED_REFERENCE_RE.search(text)
+    if not m:
+        return None
+    return expand_bible_reference_query(f"{m.group(1)} {m.group(2)}")
+
+
+_COLLECTION_PHRASE_START_RE = re.compile(r"^\s*from\s+(?:the\s+)?(?:rag\s+)?(.+)$", re.IGNORECASE)
+# Leading instruction phrasing that never appears in real source text, so it
+# should be stripped before the remainder is used as a search query — e.g.
+# "list all references to due process" -> "due process".
+_INSTRUCTION_FILLER_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:show|list|find|search(?:\s+for)?|give\s+me|tell\s+me\s+about)"
+    r"(?:\s+(?:me|all|any))*(?:\s+references?)?(?:\s+(?:to|about|for|of|on))?\s+", re.IGNORECASE)
+
+
+def detect_natural_language_collection(text, url, key):
+    """Parse a leading 'from COLLECTION, ...' or 'from rag COLLECTION ...'
+    phrase, fuzzy-matched (typo-tolerant) against the real, current
+    collection list fetched live from the server — never a hardcoded name
+    list, so this keeps working for whatever collections exist. Tries
+    candidate lengths from longest to shortest (up to 4 words) so a
+    multi-word, comma-less name like 'founding documenets list all...' still
+    resolves to the 2-word collection name rather than matching just the
+    first word. Returns (matched_collection_name, remaining_query_with_
+    filler_stripped), or None if no recognizable 'from X' phrase is found or
+    nothing fuzzy-matches a real collection well enough."""
+    start = _COLLECTION_PHRASE_START_RE.match(text)
+    if not start:
+        return None
+    remainder = start.group(1).strip()
+    try:
+        real_names = [c.get("collection") for c in rag_remote_collections(url, key).get("collections", [])]
+    except Exception:
+        return None
+    real_names = [n for n in real_names if n]
+    if not real_names:
+        return None
+    lower_map = {n.lower(): n for n in real_names}
+    words = remainder.split()
+    best = None  # (score, matched_name, rest_text)
+    for word_count in range(min(4, len(words)), 0, -1):
+        candidate = " ".join(words[:word_count]).rstrip(",:")
+        rest = " ".join(words[word_count:])
+        if not rest:
+            continue
+        close = difflib.get_close_matches(candidate.lower(), lower_map.keys(), n=1, cutoff=0.6)
+        if close:
+            score = difflib.SequenceMatcher(None, candidate.lower(), close[0]).ratio()
+            if best is None or score > best[0]:
+                best = (score, lower_map[close[0]], rest)
+    if not best:
+        return None
+    _score, matched_name, rest = best
+    stripped = _INSTRUCTION_FILLER_RE.sub("", rest).strip() or rest
+    return matched_name, stripped
+
 
 INPUT_VERBS = (
     "read", "review", "load", "open", "summarize", "summarise", "analyze", "analyse",
@@ -1744,15 +1938,68 @@ def do_errorlog(arg):
         print(line)
 
 
-def remote_rag_context(messages, user_text, limit=4):
-    url, key, collection = rag_remote_config()
+def remote_rag_context(messages, user_text, limit=4, collection_override=None, no_match_warning=True):
+    """Returns (status, results). status is None if RAG isn't configured (not
+    applicable to this turn), False if it was searched but found nothing,
+    True if excerpts were injected. Callers use this to distinguish "not
+    grounded because RAG is off" from "searched and came up empty" — the
+    latter is the case where a model can confidently fabricate a
+    citation-shaped answer with nothing behind it. Unless
+    no_match_warning=False (used when the caller is about to skip the turn
+    entirely, e.g. strict mode), an explicit instruction not to fabricate is
+    inserted into messages on a no-match result. results is the raw list of
+    retrieved excerpts (empty list if none) — callers can store this the
+    same way /rag search results are stored, so a plain chat turn's
+    retrieval is just as inspectable (numbered, full-text-on-demand) as an
+    explicit search."""
+    url, key, configured_collection = rag_remote_config()
+    # None = defer to RAG_COLLECTION env var (unchanged default behavior);
+    # "" = explicitly search all collections; anything else = that collection,
+    # set for the rest of this session via /rag collection NAME.
+    collection = configured_collection if collection_override is None else collection_override
     if not url:
-        return False
-    data = rag_remote_search(user_text, url, key, collection, limit=limit)
-    results = data.get("results") or []
+        return None, []
+    # A leading "from COLLECTION, ..." phrase names its target explicitly and
+    # wins over any session default — fuzzy-matched against the real,
+    # current collection list so a typo ("founding documenets") still
+    # resolves, and the matched phrase is stripped from the search text
+    # along with common instruction filler ("list all references to").
+    search_text = user_text
+    natural_collection = detect_natural_language_collection(user_text, url, key)
+    if natural_collection:
+        collection, search_text = natural_collection
+        print(f"(interpreting as: collection={collection!r} query={search_text!r})")
+    # If the message embeds a recognizable Bible reference (e.g. "show me
+    # commentary on John 3:16"), search for just that reference under all its
+    # known forms instead of the whole sentence — filler words like "show me
+    # commentary on" don't appear in source text and would otherwise dilute
+    # or zero out the match.
+    reference_variants = find_embedded_bible_reference(search_text)
+    seen_keys = set()
+    results = []
+    for query in (reference_variants or [search_text]):
+        data = rag_remote_search(query, url, key, collection, limit=limit)
+        for result in data.get("results") or []:
+            dedupe_key = (result.get("id"), result.get("chunk_index"))
+            if dedupe_key not in seen_keys:
+                seen_keys.add(dedupe_key)
+                results.append(result)
+    results.sort(key=lambda r: r.get("score", 0), reverse=True)
+    results = results[:limit]
     if not results:
         print(f"(remote RAG: no matches in {collection or 'all collections'})")
-        return False
+        if no_match_warning:
+            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+            messages.insert(insert_at, {"role": "system", "content": (
+                f"A RAG search of {collection or 'all configured collections'} for this message "
+                "found no matching source excerpts. If the user's request depends on retrieved "
+                "source material (an exact quotation, a specific document's content, or commentary "
+                "attributed to a specific named source), say plainly that no matching source was "
+                "found rather than answering from memory or presenting an unsourced guess as if it "
+                "were the retrieved content. You may still answer questions that don't depend on "
+                "retrieval normally."
+            )})
+        return False, []
     lines = [
         f"Remote RAG server: {url}",
         f"Remote RAG collection: {collection or '(all collections)'}",
@@ -1766,8 +2013,64 @@ def remote_rag_context(messages, user_text, limit=4):
     insert_at = 1 if messages and messages[0].get("role") == "system" else 0
     messages.insert(insert_at, {"role": "system", "content": RAG_REMOTE_SYSTEM})
     messages.insert(insert_at + 1, {"role": "system", "content": "\n".join(lines)})
-    print(f"(remote RAG: used {len(results)} excerpt(s) from {', '.join(labels)})")
-    return True
+    numbered = "; ".join(f"[{i}] {label}" for i, label in enumerate(labels, start=1))
+    print(f"(remote RAG: used {len(results)} excerpt(s) — {numbered})")
+    print(f"(type a number 1-{len(results)} to see that excerpt's full, untruncated text — "
+          "the model only saw what's shown here, so this is what to check if an answer looks off)")
+    return True, results
+
+
+def do_rag_fetch(arg):
+    """/rag fetch ID [FILENAME] — save one document's full, unchunked content
+    to a local file, regardless of collection or document type. Search only
+    ever returns small matching snippets; this is the generic way to get the
+    complete text so any of mlxcli's normal tools (/find, /read, agentic
+    reading) can work on it directly — useful whenever a search snippet
+    isn't enough context (an exact section of a manual, a full chapter of a
+    book, a specific clause of a founding document, a bible chapter, etc.)."""
+    parts = arg.strip().split(None, 1)
+    if not parts:
+        print("usage: /rag fetch ID [FILENAME]  (ID from /rag list or /rag search results)")
+        return None
+    document_id = parts[0]
+    url, key, _ = rag_remote_config()
+    if not url or not key:
+        print("Remote RAG is not configured. Set RAG_URL and RAG_API_KEY.")
+        return None
+    try:
+        data = rag_remote_get_document(document_id, url, key)
+    except Exception as exc:
+        print(f"[remote RAG error] {exc}")
+        return None
+    content = data.get("content", "")
+    title = data.get("title") or data.get("filename") or document_id
+    if len(parts) > 1:
+        filename = parts[1]
+    else:
+        safe = re.sub(r"[^A-Za-z0-9 _.-]", "", title).strip().replace(" ", "_")[:80] or document_id
+        filename = f"{safe}.txt"
+    dest = load_default_dir() / filename
+    dest.write_text(content)
+    print(f"(saved \"{title}\" — {len(content):,} chars — to {dest})")
+    print("Use /read, /find, or reference this path directly to work with the full text.")
+    return None
+
+
+def do_rag_esv(arg):
+    """/rag esv REFERENCE — exact ESV passage text via api.esv.org, fetched
+    live each call. Never cached or stored (ESV isn't in the local RAG
+    corpus and never will be — this stays a per-request API call, per
+    Crossway's personal/non-commercial API terms)."""
+    reference = arg.strip()
+    if not reference:
+        print("usage: /rag esv REFERENCE  (e.g. /rag esv Romans 1:18-32)")
+        return
+    try:
+        _canonical, text = esv_passage(reference)
+    except Exception as exc:
+        print(f"[ESV API error] {exc}")
+        return
+    print(f"\n{text}")
 
 
 def do_rag(arg):
@@ -1785,6 +2088,11 @@ def do_rag(arg):
     try:
         if command == "status":
             print(rag_remote_request("GET", f"{url}/health", key))
+        elif command == "collections":
+            data = rag_remote_collections(url, key)
+            for row in data.get("collections", []):
+                marker = " (active)" if row.get("collection") == configured_collection else ""
+                print(f"{row.get('collection')}  {row.get('documents')} document(s){marker}")
         elif command == "list":
             data = rag_remote_list(url, key, collection)
             for doc in data.get("documents", []):
@@ -1792,12 +2100,60 @@ def do_rag(arg):
             print(f"({len(data.get('documents', []))} document(s))")
         elif command == "search":
             query_parts = parts[1:]
+            explicit_collection = False
             if len(query_parts) >= 2 and query_parts[0] == "--collection":
                 collection, query_parts = query_parts[1], query_parts[2:]
+                explicit_collection = True
             query = " ".join(query_parts)
-            data = rag_remote_search(query, url, key, collection)
-            for result in data.get("results", []):
-                print(f"\n[{result.get('title')}] chunk {result.get('chunk_index')} score={result.get('score')}\n{result.get('content', '')[:1200]}")
+
+            # Compound query ("topic A or topic B or topic C"): only when no
+            # explicit --collection was given, since that already pins a
+            # single scope the user chose on purpose. Each clause gets
+            # searched against every existing collection and only kept where
+            # it actually returns something — no hardcoded topic-to-collection
+            # mapping, so this works for whatever collections exist, not just
+            # the ones that happen to be populated right now.
+            clauses = re.split(r"\s+\bor\b\s+", query, flags=re.IGNORECASE) if not explicit_collection else [query]
+            results = []
+            if len(clauses) > 1:
+                all_collections = [c.get("collection") for c in rag_remote_collections(url, key).get("collections", [])]
+                seen_keys = set()
+                for clause in clauses:
+                    clause_hits = []
+                    for variant in expand_bible_reference_query(clause):
+                        for coll in all_collections:
+                            data = rag_remote_search(variant, url, key, coll, limit=3)
+                            for result in data.get("results", []):
+                                dedupe_key = (result.get("id"), result.get("chunk_index"))
+                                if dedupe_key not in seen_keys:
+                                    seen_keys.add(dedupe_key)
+                                    result["_topic"] = clause
+                                    result["_collection"] = coll
+                                    clause_hits.append(result)
+                    clause_hits.sort(key=lambda r: r.get("score", 0), reverse=True)
+                    print(f"(topic {clause!r}: {len(clause_hits)} match(es)"
+                          + (f", best in {clause_hits[0]['_collection']}" if clause_hits else "") + ")")
+                    results.extend(clause_hits)
+            else:
+                variants = expand_bible_reference_query(query)
+                seen_keys = set()
+                for variant in variants:
+                    data = rag_remote_search(variant, url, key, collection)
+                    for result in data.get("results", []):
+                        dedupe_key = (result.get("id"), result.get("chunk_index"))
+                        if dedupe_key not in seen_keys:
+                            seen_keys.add(dedupe_key)
+                            results.append(result)
+                results.sort(key=lambda r: r.get("score", 0), reverse=True)
+                if len(variants) > 1:
+                    print(f"(expanded book-name search: tried {', '.join(repr(v) for v in variants)})")
+
+            for index, result in enumerate(results, start=1):
+                topic_tag = f" [topic: {result['_topic']!r} in {result['_collection']}]" if "_topic" in result else ""
+                print(f"\n[{index}] {result.get('title')} chunk {result.get('chunk_index')} score={result.get('score')}{topic_tag}\n{result.get('content', '')[:1200]}")
+            if results:
+                print(f"\n(type a number 1-{len(results)} to see that result's full, untruncated text)")
+            return results
         elif command == "upload" and len(parts) >= 2:
             path = pathlib.Path(parts[1]).expanduser()
             data = rag_remote_upload(path, url, key, collection)
@@ -1809,7 +2165,7 @@ def do_rag(arg):
         elif command == "delete" and len(parts) >= 2:
             print(rag_remote_delete(parts[1], url, key))
         else:
-            print("usage: /rag status | list [collection] | search [collection] QUERY | upload PATH [collection] | update ID PATH | delete ID")
+            print("usage: /rag status | collections | list [collection] | search [collection] QUERY | upload PATH [collection] | update ID PATH | delete ID")
     except (OSError, urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
         print(f"[remote RAG error] {exc}")
 
@@ -3376,6 +3732,7 @@ def parse_args(argv):
     auto_yes = False
     show_thinking = False
     verify_command = None
+    verify_history_dir = None
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
@@ -3393,22 +3750,30 @@ def parse_args(argv):
         elif argv[i] == "--verify" and i + 1 < len(argv):
             verify_command = argv[i + 1]
             i += 2
+        elif argv[i] == "--verify-history" and i + 1 < len(argv):
+            verify_history_dir = argv[i + 1]
+            i += 2
         elif argv[i] in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
         else:
             model = argv[i]
             i += 1
-    return model, system, run_task, auto_yes, show_thinking, verify_command
+    return model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir
 
 
 def main():
     configure_readline()
     backend, url, key = load_cfg()
     global SHOW_THINKING
-    model_arg, system, run_task, auto_yes, show_thinking, verify_command = parse_args(sys.argv[1:])
+    model_arg, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir = parse_args(sys.argv[1:])
     if show_thinking:
         SHOW_THINKING = True
+    if auto_yes:
+        # Pre-approve every tool category up front — works for both headless
+        # --run and the interactive REPL, so -y also means "don't prompt me"
+        # when just launching mlxcli normally.
+        ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
     if not model_arg and not run_task:
         selected_backend = pick_backend(backend)
         if selected_backend != backend:
@@ -3438,8 +3803,6 @@ def main():
     if run_task:
         # Headless one-shot mode: run a single task non-interactively and exit —
         # for scripting, testing, or driving mlxcli without a live terminal.
-        if auto_yes:
-            ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
         totals = {"in": 0, "out": 0}
         backend_suggestion = suggest_better_backend(backend, run_task)
         if backend_suggestion:
@@ -3469,7 +3832,7 @@ def main():
                 return
             if not verify_command:
                 return
-            passed, output = run_verify_command(verify_command)
+            passed, output = run_verify_suite(verify_command, verify_history_dir)
             if passed:
                 print(f"(verification passed, attempt {attempt}/{max_verify_attempts}: {verify_command})")
                 return
@@ -3495,7 +3858,9 @@ def main():
     last_user_request = ""
     convert_mode = "auto"
     agentic_mode = False
-    state = {"last_paths": [], "current_remote": None, "current_remote_dir": None, "last_remote_path": None, "context_loaded": False}
+    rag_collection_override = None  # None = defer to RAG_COLLECTION env var
+    rag_strict_mode = False  # when on: a RAG search with zero matches skips the model turn entirely
+    state = {"last_paths": [], "current_remote": None, "current_remote_dir": None, "last_remote_path": None, "context_loaded": False, "last_rag_results": []}
     while True:
         try:
             user = read_user_command().strip()
@@ -3562,6 +3927,7 @@ def main():
             state["current_remote_dir"] = None
             state["last_remote_path"] = None
             state["context_loaded"] = False
+            state["last_rag_results"] = []
             print("(history cleared)")
             continue
         if user == "/system":
@@ -3658,6 +4024,52 @@ def main():
             continue
         if user == "/health":
             do_health(backend, url, key)
+            continue
+        if user == "/rag collection" or user.startswith("/rag collection "):
+            arg = user[len("/rag collection"):].strip()
+            if not arg:
+                _, _, configured_collection = rag_remote_config()
+                effective = configured_collection if rag_collection_override is None else rag_collection_override
+                print(f"(active RAG collection: {effective or '(all collections)'}"
+                      f"{' — session override' if rag_collection_override is not None else ' — from RAG_COLLECTION'})")
+            elif arg.lower() in ("all", "none", "-"):
+                rag_collection_override = ""
+                print("(active RAG collection: (all collections) — session override)")
+            else:
+                rag_collection_override = arg
+                print(f"(active RAG collection: {arg} — session override; use /rag collections to see valid names)")
+            continue
+        if user == "/rag strict":
+            print(f"(RAG strict mode: {'on' if rag_strict_mode else 'off'} — "
+                  "on means a chat message that finds zero RAG matches gets no response at all, "
+                  "instead of an ungrounded guess)")
+            continue
+        if user.startswith("/rag strict "):
+            mode = user[len("/rag strict "):].strip().lower()
+            if mode not in ("on", "off"):
+                print("usage: /rag strict on|off")
+                continue
+            rag_strict_mode = mode == "on"
+            print(f"(RAG strict mode: {'on' if rag_strict_mode else 'off'})")
+            continue
+        if user == "/rag fetch" or user.startswith("/rag fetch "):
+            do_rag_fetch(user[len("/rag fetch"):])
+            continue
+        if user == "/rag esv" or user.startswith("/rag esv "):
+            do_rag_esv(user[len("/rag esv"):])
+            continue
+        if user == "/rag" or user.startswith("/rag "):
+            rag_search_results = do_rag(user[len("/rag"):])
+            if rag_search_results is not None:
+                state["last_rag_results"] = rag_search_results
+            continue
+        if user.strip().isdigit() and state["last_rag_results"]:
+            index = int(user.strip())
+            if 1 <= index <= len(state["last_rag_results"]):
+                result = state["last_rag_results"][index - 1]
+                print(f"\n[{index}] {result.get('title')} chunk {result.get('chunk_index')}\n{result.get('content', '')}")
+            else:
+                print(f"(no result {index} — last search had {len(state['last_rag_results'])} result(s))")
             continue
         if user == "/modelsettings" or user.startswith("/modelsettings "):
             do_model_settings(backend, user[len("/modelsettings"):])
@@ -3831,7 +4243,14 @@ def main():
                     print(f"(agentic loaded {len(labels)} file(s) from the last search results)")
                     handled_followup = True
         if not handled_followup:
-            remote_rag_context(messages, user)
+            rag_status, rag_results = remote_rag_context(
+                messages, user, collection_override=rag_collection_override,
+                no_match_warning=not rag_strict_mode)
+            if rag_results:
+                state["last_rag_results"] = rag_results
+            if rag_strict_mode and rag_status is False:
+                print("(strict RAG mode: no source material found — not generating a response)")
+                continue
             messages.append({"role": "user", "content": user})
             if agentic_mode:
                 for note in apply_agentic_preflight(user, messages, convert_mode):

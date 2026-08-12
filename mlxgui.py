@@ -105,6 +105,10 @@ DEFAULT_SYSTEM = (
     "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
     f"Save created files in {load_default_dir()} unless the user gives another path.\n"
     "For local file tasks, use the available tools and never claim a file was created, run, inspected, verified, or shared without tool evidence.\n"
+    "Ground-truth check: for any task involving calculation, physical/scientific data, or a numeric result that "
+    "has a real correct answer, derive expected reference values from known facts first, then check your output "
+    "against them with a tool before declaring the task complete. Running cleanly and being correct are different "
+    "claims; only the second is done.\n"
     "When running a local script against an absolute input file, use that input file's directory as the working directory unless another one is explicitly requested. Resolve relative outputs beside the input file.\n"
     "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes.\n"
     "Keep replies brief and avoid repeating large imported text unless asked.\n"
@@ -232,6 +236,43 @@ def backend_paths(backend):
             "url": "http://127.0.0.1:8080",
         }
     return {}
+
+
+def compute_repo_update_status(root, timeout=10):
+    """Best-effort, read-only check for new commits on a git repo's remotes.
+
+    Fetches (doesn't merge/pull) `origin/<current-branch>` and, if present,
+    `upstream/main`, then reports how many commits each is ahead of HEAD.
+    Never raises — returns None on any failure (offline, not a repo, no
+    remote named that way, etc.) so it can't block or break startup.
+    """
+    if not (root / ".git").exists():
+        return None
+
+    def run(*args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    try:
+        branch_proc = run("rev-parse", "--abbrev-ref", "HEAD")
+        branch = branch_proc.stdout.strip()
+        if branch_proc.returncode != 0 or not branch or branch == "HEAD":
+            return None
+        remotes = set(run("remote").stdout.split())
+        result = {"root": str(root), "branch": branch, "remotes": {}}
+        for remote, ref in (("origin", branch), ("upstream", "main")):
+            if remote not in remotes:
+                continue
+            if run("fetch", remote, ref, "--quiet").returncode != 0:
+                continue
+            count = run("rev-list", "--count", f"HEAD..{remote}/{ref}").stdout.strip()
+            if count.isdigit():
+                result["remotes"][f"{remote}/{ref}"] = int(count)
+        return result if result["remotes"] else None
+    except Exception:
+        return None
 
 
 def load_backend_cfg(backend):
@@ -1424,6 +1465,7 @@ class MlxGui(tk.Tk):
         self.update_memory_indicator()
         self.start_resource_refresh()
         self.after(60, self.drain_events)
+        self.after(300, lambda: self.check_repo_updates_async(TURBO_QWEN_ROOT, "Qwen fork", silent=True))
 
     def build_ui(self):
         self.build_menu()
@@ -1624,10 +1666,45 @@ class MlxGui(tk.Tk):
         ttk.Label(hero_text, textvariable=self.hero_subtitle_var, foreground="#888888").pack(anchor="w")
 
         ttk.Button(hero, text="System Stats...", command=self.open_system_stats).pack(side="right", anchor="ne")
+        self.repo_update_var = tk.StringVar(value="")
+        self.repo_update_label = ttk.Label(
+            title_row, textvariable=self.repo_update_var,
+            foreground="#d9822b", cursor="hand2",
+        )
+        self.repo_update_label.bind("<Button-1>", self.show_repo_update_details)
         self.update_hero_subtitle()
 
     def update_hero_subtitle(self):
         self.hero_subtitle_var.set(f"{backend_label(self.backend)}  ·  {self.url}")
+
+    def check_repo_updates_async(self, root, label, silent=True):
+        def worker():
+            info = compute_repo_update_status(root)
+            self.events.put(("repo_updates", label, info, silent))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_repo_update_indicator(self, label, info):
+        lines = [f"{label} ({info['branch']}) has updates available:"]
+        for remote_ref, count in info["remotes"].items():
+            lines.append(f"  {remote_ref}: {count} new commit{'s' if count != 1 else ''}")
+        lines.append(
+            "\nThis only checks and fetches — nothing is pulled or rebuilt "
+            "automatically. Merge on a separate branch, build, and test on "
+            "an alternate port before touching the running server."
+        )
+        self.repo_update_var.set(f"⬆ Updates available: {label}")
+        self.repo_update_label.pack(side="left", padx=(10, 0))
+        self.repo_update_details = "\n".join(lines)
+
+    def show_repo_update_details(self, _event=None):
+        details = getattr(self, "repo_update_details", None)
+        if details:
+            messagebox.showinfo("Repo updates", details, parent=self)
+
+    def check_repo_updates_menu(self):
+        self.status_var.set("Checking turbo-fieldfare-qwen for updates...")
+        self.check_repo_updates_async(TURBO_QWEN_ROOT, "Qwen fork", silent=False)
 
     def update_hero_status(self, reachable):
         color = "#2ecc71" if reachable else "#9a9a9a"
@@ -1871,6 +1948,8 @@ class MlxGui(tk.Tk):
         tools_menu = tk.Menu(menu, tearoff=False)
         tools_menu.add_command(label="Refine Prompt...", command=self.refine_prompt)
         tools_menu.add_command(label="Add File Reference...", command=self.insert_file_references)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Check for Repo Updates (Qwen fork)", command=self.check_repo_updates_menu)
         menu.add_cascade(label="Tools", menu=tools_menu)
         view = tk.Menu(menu, tearoff=False)
         view.add_command(label="Resources...", command=self.open_resources)
@@ -3331,6 +3410,14 @@ class MlxGui(tk.Tk):
                     self.status_var.set(event[1])
                 elif kind == "server_status":
                     self.update_hero_status(event[1])
+                elif kind == "repo_updates":
+                    _kind, label, info, silent = event
+                    if info:
+                        self.show_repo_update_indicator(label, info)
+                        if not silent:
+                            self.show_repo_update_details()
+                    elif not silent:
+                        self.status_var.set(f"{label}: no updates found")
                 elif kind == "models":
                     models = event[1]
                     labels = [model_label(model) for model in models]
