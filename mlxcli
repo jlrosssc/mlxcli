@@ -3203,6 +3203,13 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     contract = contract or {}
     last_tool_results = []
     written_py_paths = []
+    written_paths = []
+    self_reviewed = False
+    # Captured before any retry/correction messages get injected below, so the
+    # review prompt always references the user's actual ask, not one of this
+    # loop's own injected follow-ups (which are also role="user").
+    original_user_text = next(
+        (m.get("content") for m in reversed(messages) if m.get("role") == "user"), "")
     seen_tool_calls = {}
     effective_agentic_mode = agentic_mode
     retried_with_tools = False
@@ -3285,6 +3292,24 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                 print("(verified tool actions completed)")
                 if content:
                     print(content)
+            if written_paths and not self_reviewed:
+                self_reviewed = True
+                messages.append({"role": "assistant", "content": content})
+                paths_list = ", ".join(written_paths)
+                messages.append({"role": "user", "content": (
+                    f"Before finishing: re-read {paths_list} in full using read_file, exactly as written, "
+                    "not from memory. Then check two things against the original request "
+                    f"({original_user_text[:200]!r}): "
+                    "(1) every name you reference — entity ID, variable, import, helper, function — is defined "
+                    "with the exact same spelling and domain everywhere it's used; a value read from one name "
+                    "and written to a different name is a bug even if both look similar. "
+                    "(2) walk through at least 2-3 concrete edge-case inputs relevant to the request and confirm "
+                    "the logic produces the correct result for each one, showing the walkthrough. "
+                    "If you find a problem, fix it now with write_file and explain what changed. "
+                    "If you find nothing wrong, say so briefly — do not rewrite files that are already correct."
+                )})
+                print("(reviewing written file(s) before finishing...)")
+                continue
             offer_smoke_test(written_py_paths)
             messages.append({"role": "assistant", "content": content})
             totals["in"] += turn_in
@@ -3320,6 +3345,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                         (m.get("content") for m in reversed(messages) if m.get("role") == "user"), ""
                     )
                     record_last_artifact(written_match.group(1), current_user_text)
+                    written_paths.append(written_match.group(1))
                     if written_match.group(1).endswith(".py"):
                         written_py_paths.append(written_match.group(1))
             if fn in {"run_command", "python_interpreter"} and not tool_result_failed(result):
