@@ -46,6 +46,7 @@ import select
 import shlex
 import shutil
 import subprocess
+import threading
 import sys
 import termios
 import time
@@ -61,6 +62,7 @@ try:
 except ImportError:
     formatted_markdown_to_docx = None
 from mlxlib import (
+    compute_repo_update_status,
     load_default_dir, save_default_dir, DEFAULT_DIR_CONFIG_PATH,
     MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
@@ -736,13 +738,19 @@ def ensure_server(backend, url, key):
         log_handle = open(paths["log"], "a")
         log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
         log_handle.flush()
-        subprocess.Popen(
-            [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", paths["port"],
+        launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", paths["port"],
              # 65536 (the documented max tier) was tested directly and hangs on this
              # machine's 18GB RAM: the process goes into uninterruptible sleep with the
              # system nearly out of free pages, thrashing on expert-weight disk I/O
              # instead of generating. 32768 is the highest tier confirmed to work.
-             "--max-context", "32768"],
+             "--max-context", "32768"]
+        if backend == "turbofieldfare-qwen":
+            # Benchmarked +1-11% decode speed (community benchmark protocol, all 3
+            # cases, confirmed at --max-context 32768 with no instability) from
+            # keeping more MoE experts resident instead of re-fetching from disk.
+            launch_args += ["--expert-cache-slots", "32", "--rdadvise", "default"]
+        subprocess.Popen(
+            launch_args,
             cwd=paths["root"],
             stdout=log_handle,
             stderr=log_handle,
@@ -1938,6 +1946,19 @@ def do_errorlog(arg):
         print(line)
 
 
+def _append_system_content(messages, text):
+    """Fold `text` into the existing leading system message rather than
+    inserting a new system-role entry. Both backends' chat templates reject
+    any system message that isn't at index 0 (`system message must be
+    first`), so inserting a second or third one — as this used to do —
+    produces a valid-looking messages list that fails server-side the moment
+    the turn is sent. One combined system message at index 0 is always safe."""
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + text
+    else:
+        messages.insert(0, {"role": "system", "content": text})
+
+
 def remote_rag_context(messages, user_text, limit=4, collection_override=None, no_match_warning=True):
     """Returns (status, results). status is None if RAG isn't configured (not
     applicable to this turn), False if it was searched but found nothing,
@@ -1989,8 +2010,7 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
     if not results:
         print(f"(remote RAG: no matches in {collection or 'all collections'})")
         if no_match_warning:
-            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
-            messages.insert(insert_at, {"role": "system", "content": (
+            _append_system_content(messages, (
                 f"A RAG search of {collection or 'all configured collections'} for this message "
                 "found no matching source excerpts. If the user's request depends on retrieved "
                 "source material (an exact quotation, a specific document's content, or commentary "
@@ -1998,7 +2018,7 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
                 "found rather than answering from memory or presenting an unsourced guess as if it "
                 "were the retrieved content. You may still answer questions that don't depend on "
                 "retrieval normally."
-            )})
+            ))
         return False, []
     lines = [
         f"Remote RAG server: {url}",
@@ -2010,9 +2030,7 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
         label = f"{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}"
         labels.append(label)
         lines.append(f"\n[{label}]\n{result.get('content', '')}")
-    insert_at = 1 if messages and messages[0].get("role") == "system" else 0
-    messages.insert(insert_at, {"role": "system", "content": RAG_REMOTE_SYSTEM})
-    messages.insert(insert_at + 1, {"role": "system", "content": "\n".join(lines)})
+    _append_system_content(messages, RAG_REMOTE_SYSTEM + "\n" + "\n".join(lines))
     numbered = "; ".join(f"[{i}] {label}" for i, label in enumerate(labels, start=1))
     print(f"(remote RAG: used {len(results)} excerpt(s) — {numbered})")
     print(f"(type a number 1-{len(results)} to see that excerpt's full, untruncated text — "
@@ -3762,6 +3780,27 @@ def parse_args(argv):
     return model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir
 
 
+def print_repo_update_notice_if_any(root, label):
+    """Background, non-blocking check for pending updates on a git repo's
+    remotes (e.g. TURBO_QWEN_ROOT), printed once ready. Mirrors mlxgui's
+    silent startup check — read-only, and silent when there's nothing to
+    report, so it never adds noise to a normal launch."""
+    def worker():
+        info = compute_repo_update_status(root)
+        if not info:
+            return
+        lines = [f"\n(⬆ {label} ({info['branch']}) has updates available:"]
+        for remote_ref, count in info["remotes"].items():
+            lines.append(f"  {remote_ref}: {count} new commit{'s' if count != 1 else ''}")
+        lines.append(
+            "This only checks and fetches — nothing is pulled or rebuilt "
+            "automatically. Merge on a separate branch, build, and test on "
+            "an alternate port before touching the running server.)"
+        )
+        print("\n".join(lines))
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def main():
     configure_readline()
     backend, url, key = load_cfg()
@@ -3853,6 +3892,7 @@ def main():
     print(f"mlxcli — backend: {backend} ({backend_description(backend)}) — model: {model} — /help for commands")
     if notes_text:
         print(f"(loaded project notes from {notes_path})")
+    print_repo_update_notice_if_any(TURBO_QWEN_ROOT, "turbo-fieldfare-qwen")
     totals = {"in": 0, "out": 0}
     last_turn = {"in": 0, "out": 0}
     last_user_request = ""

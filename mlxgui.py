@@ -32,6 +32,7 @@ try:
 except ImportError:
     psutil = None
 from mlxlib import (
+    compute_repo_update_status,
     load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
     is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
@@ -238,42 +239,6 @@ def backend_paths(backend):
     return {}
 
 
-def compute_repo_update_status(root, timeout=10):
-    """Best-effort, read-only check for new commits on a git repo's remotes.
-
-    Fetches (doesn't merge/pull) `origin/<current-branch>` and, if present,
-    `upstream/main`, then reports how many commits each is ahead of HEAD.
-    Never raises — returns None on any failure (offline, not a repo, no
-    remote named that way, etc.) so it can't block or break startup.
-    """
-    if not (root / ".git").exists():
-        return None
-
-    def run(*args):
-        return subprocess.run(
-            ["git", "-C", str(root), *args],
-            capture_output=True, text=True, timeout=timeout,
-        )
-
-    try:
-        branch_proc = run("rev-parse", "--abbrev-ref", "HEAD")
-        branch = branch_proc.stdout.strip()
-        if branch_proc.returncode != 0 or not branch or branch == "HEAD":
-            return None
-        remotes = set(run("remote").stdout.split())
-        result = {"root": str(root), "branch": branch, "remotes": {}}
-        for remote, ref in (("origin", branch), ("upstream", "main")):
-            if remote not in remotes:
-                continue
-            if run("fetch", remote, ref, "--quiet").returncode != 0:
-                continue
-            count = run("rev-list", "--count", f"HEAD..{remote}/{ref}").stdout.strip()
-            if count.isdigit():
-                result["remotes"][f"{remote}/{ref}"] = int(count)
-        return result if result["remotes"] else None
-    except Exception:
-        return None
-
 
 def load_backend_cfg(backend):
     if backend == "omlx":
@@ -407,12 +372,18 @@ def ensure_server(backend, url, key, status):
         log_handle = open(paths["log"], "a")
         log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
         log_handle.flush()
-        subprocess.Popen(
-            [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
+        launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
              # 65536 hangs on this machine (confirmed: server goes into uninterruptible
              # sleep, system nearly out of free pages, thrashing on expert-weight disk
              # I/O). 32768 is the highest tier confirmed to actually work.
-             "--max-context", "32768"],
+             "--max-context", "32768"]
+        if backend == "turbofieldfare-qwen":
+            # Benchmarked +1-11% decode speed (community benchmark protocol, all 3
+            # cases, confirmed at --max-context 32768 with no instability) from
+            # keeping more MoE experts resident instead of re-fetching from disk.
+            launch_args += ["--expert-cache-slots", "32", "--rdadvise", "default"]
+        subprocess.Popen(
+            launch_args,
             cwd=paths["root"], stdout=log_handle, stderr=log_handle,
         )
     else:
@@ -2842,6 +2813,7 @@ class MlxGui(tk.Tk):
         self.backend_var.set(backend_label(self.backend))
         self.url, self.key = load_backend_cfg(self.backend)
         save_backend(self.backend)
+        self.update_hero_subtitle()
         stop_other_backend(self.backend, self.status)
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
 

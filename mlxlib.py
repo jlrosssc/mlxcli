@@ -1002,3 +1002,45 @@ def find_project_notes(start_dir=None):
             except Exception:
                 continue
     return None, None
+
+
+def compute_repo_update_status(root, timeout=10):
+    """Best-effort, read-only check for new commits on a git repo's remotes.
+
+    Fetches (doesn't merge/pull) `origin/<current-branch>` and, if present,
+    `upstream/main`, then reports how many commits each is ahead of HEAD.
+    Never raises — returns None on any failure (offline, not a repo, no
+    remote named that way, etc.) so it can't block or break startup.
+
+    Shared by mlxcli and mlxgui — this only checks and fetches; nothing is
+    pulled, merged, or rebuilt automatically. Any actual update should be
+    merged on a separate branch, built, and tested on an alternate port
+    before touching a running server.
+    """
+    if not (root / ".git").exists():
+        return None
+
+    def run(*args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    try:
+        branch_proc = run("rev-parse", "--abbrev-ref", "HEAD")
+        branch = branch_proc.stdout.strip()
+        if branch_proc.returncode != 0 or not branch or branch == "HEAD":
+            return None
+        remotes = set(run("remote").stdout.split())
+        result = {"root": str(root), "branch": branch, "remotes": {}}
+        for remote, ref in (("origin", branch), ("upstream", "main")):
+            if remote not in remotes:
+                continue
+            if run("fetch", remote, ref, "--quiet").returncode != 0:
+                continue
+            count = run("rev-list", "--count", f"HEAD..{remote}/{ref}").stdout.strip()
+            if count.isdigit():
+                result["remotes"][f"{remote}/{ref}"] = int(count)
+        return result if result["remotes"] else None
+    except Exception:
+        return None
