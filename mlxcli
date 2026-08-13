@@ -2007,6 +2007,19 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
                 results.append(result)
     results.sort(key=lambda r: r.get("score", 0), reverse=True)
     results = results[:limit]
+    # The RAG server's score isn't a normalized similarity — it's small and
+    # corpus/query-length dependent (an exact, distinctive quote can score
+    # ~0.017, but a short genuinely on-topic query can score ~0.005, so no
+    # fixed cutoff cleanly separates signal from noise for every query).
+    # RAG_MIN_SCORE only exists to catch the clear case: a query with no
+    # topical connection to any collection still gets low but nonzero
+    # keyword-overlap scores (~0.001-0.007 observed) on whatever happens to
+    # share a few common words, and those get presented as "relevant source
+    # excerpts" with nothing to indicate they're noise. Filtering below this
+    # floor trades a few borderline real matches for not treating noise as
+    # a citation-worthy source.
+    min_score = float(os.environ.get("RAG_MIN_SCORE", "0.01"))
+    results = [r for r in results if r.get("score", 0) >= min_score]
     if not results:
         print(f"(remote RAG: no matches in {collection or 'all collections'})")
         if no_match_warning:
