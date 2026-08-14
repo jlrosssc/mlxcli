@@ -201,7 +201,12 @@ MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 MAX_RESPONSE_TOKENS = 2500
 MAX_CONTEXT_CHARS = 60000
-MAX_TOOL_STEPS = 16
+# 16 was too tight for a real multi-file task with iterative test-driven
+# fixes: writing 4 files (rules/render/main/tests) plus several read-fix-
+# rerun cycles hit the cap mid-review on a legitimately succeeding task,
+# not a runaway loop. Doubled to give real multi-file work room to finish
+# in one turn while still bounding an actual infinite loop.
+MAX_TOOL_STEPS = 32
 
 # TurboFieldfareServer defaults repetition_penalty to 1 (i.e. off) when a
 # request doesn't specify one — confirmed in its own source
