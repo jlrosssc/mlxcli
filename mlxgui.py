@@ -34,7 +34,8 @@ except ImportError:
 from mlxlib import (
     compute_repo_update_status,
     load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
-    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
+    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, SERVER_MAX_CONTEXT_TOKENS,
+    CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
     is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
     requires_agentic_execution as gui_requires_agentic_execution,
     execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
@@ -373,10 +374,7 @@ def ensure_server(backend, url, key, status):
         log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
         log_handle.flush()
         launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
-             # 65536 hangs on this machine (confirmed: server goes into uninterruptible
-             # sleep, system nearly out of free pages, thrashing on expert-weight disk
-             # I/O). 32768 is the highest tier confirmed to actually work.
-             "--max-context", "32768"]
+             "--max-context", str(SERVER_MAX_CONTEXT_TOKENS)]
         if backend == "turbofieldfare-qwen":
             # Benchmarked +1-11% decode speed (community benchmark protocol, all 3
             # cases, confirmed at --max-context 32768 with no instability) from

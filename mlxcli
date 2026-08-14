@@ -32,6 +32,7 @@ Commands:
   /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
 """
 import atexit
+import copy
 import difflib
 import getpass
 import json
@@ -65,7 +66,8 @@ from mlxlib import (
     compute_repo_update_status,
     load_default_dir, save_default_dir, DEFAULT_DIR_CONFIG_PATH,
     MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
-    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
+    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, SERVER_MAX_CONTEXT_TOKENS,
+    CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
@@ -739,11 +741,7 @@ def ensure_server(backend, url, key):
         log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
         log_handle.flush()
         launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", paths["port"],
-             # 65536 (the documented max tier) was tested directly and hangs on this
-             # machine's 18GB RAM: the process goes into uninterruptible sleep with the
-             # system nearly out of free pages, thrashing on expert-weight disk I/O
-             # instead of generating. 32768 is the highest tier confirmed to work.
-             "--max-context", "32768"]
+             "--max-context", str(SERVER_MAX_CONTEXT_TOKENS)]
         if backend == "turbofieldfare-qwen":
             # Benchmarked +1-11% decode speed (community benchmark protocol, all 3
             # cases, confirmed at --max-context 32768 with no instability) from
@@ -3212,6 +3210,10 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     # loop's own injected follow-ups (which are also role="user").
     original_user_text = next(
         (m.get("content") for m in reversed(messages) if m.get("role") == "user"), "")
+    # Everything from here on (this turn's own tool_calls/tool-result
+    # messages) is fair game for in-turn compaction; nothing before it is
+    # ever touched — that's trim()'s job, between turns.
+    turn_start_index = len(messages)
     seen_tool_calls = {}
     effective_agentic_mode = agentic_mode
     retried_with_tools = False
@@ -3250,6 +3252,11 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
         in_tokens, out_tokens = usage_counts(usage)
         turn_in += in_tokens
         turn_out += out_tokens
+        if in_tokens >= SERVER_MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD_RATIO:
+            messages, chars_saved = compact_turn_messages(messages, turn_start_index)
+            if chars_saved > 0:
+                print(f"(context at {in_tokens:,}/{SERVER_MAX_CONTEXT_TOKENS:,} tokens — "
+                      f"compacted {chars_saved:,} chars of older tool results to make room)")
         if not tool_calls:
             if not content and in_tokens == 0 and out_tokens == 0:
                 if not retried_empty:
@@ -3411,6 +3418,83 @@ def trim(messages):
         kept.append(message)
         total += size
     return system + list(reversed(kept))
+
+
+# Compaction starts once a single request's real prompt-token count (as
+# reported by the server, not estimated) crosses this fraction of the
+# server's actual context window — leaves headroom for the response plus
+# whatever gets appended before the next check.
+COMPACT_THRESHOLD_RATIO = 0.75
+# Tool interactions (an assistant tool_calls message + its tool-result
+# response(s)) more recent than this many rounds are never compacted —
+# the model is actively reasoning about what just happened.
+KEEP_RECENT_TOOL_ROUNDS = 4
+# Skip compacting anything this small; not worth replacing with a marker.
+COMPACT_MIN_CHARS = 300
+
+
+def compact_turn_messages(messages, turn_start_index, keep_recent_rounds=KEEP_RECENT_TOOL_ROUNDS):
+    """FIFO-compress older tool interactions within the CURRENT turn only.
+
+    Never touches messages before turn_start_index (prior-turn history is
+    trim()'s job, between turns). Within this turn, replaces the bulky
+    content of tool calls/results older than the most recent
+    keep_recent_rounds with a short marker, preserving the record that the
+    action happened (so the model doesn't re-do it — the separate
+    seen_tool_calls dedup cache also guards against that independently)
+    without carrying its full payload. Compresses, does not delete: message
+    order and count are unchanged. Returns (messages, chars_saved).
+    """
+    unit_starts = [
+        i for i in range(turn_start_index, len(messages))
+        if messages[i].get("role") == "assistant" and messages[i].get("tool_calls")
+    ]
+    if len(unit_starts) <= keep_recent_rounds:
+        return messages, 0
+
+    to_compact_starts = unit_starts[:-keep_recent_rounds]
+    chars_saved = 0
+    new_messages = list(messages)
+
+    for start in to_compact_starts:
+        assistant_msg = new_messages[start]
+        tool_call_ids = {tc.get("id") for tc in (assistant_msg.get("tool_calls") or [])}
+
+        compacted_calls = []
+        assistant_changed = False
+        for tc in assistant_msg.get("tool_calls") or []:
+            args_str = tc.get("function", {}).get("arguments") or ""
+            if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
+                tc = copy.deepcopy(tc)
+                fn_name = tc.get("function", {}).get("name", "?")
+                tc["function"]["arguments"] = json.dumps({
+                    "__compacted__": True,
+                    "fn": fn_name,
+                    "note": f"{len(args_str):,} chars omitted — already applied earlier this turn",
+                })
+                chars_saved += len(args_str) - len(tc["function"]["arguments"])
+                assistant_changed = True
+            compacted_calls.append(tc)
+        if assistant_changed:
+            assistant_msg = dict(assistant_msg)
+            assistant_msg["tool_calls"] = compacted_calls
+            new_messages[start] = assistant_msg
+
+        for i in range(start + 1, len(new_messages)):
+            m = new_messages[i]
+            if m.get("role") != "tool":
+                break  # end of this unit's tool results
+            if m.get("tool_call_id") not in tool_call_ids:
+                continue
+            content = m.get("content") or ""
+            if len(content) > COMPACT_MIN_CHARS and not content.startswith("[compacted:"):
+                marker = f"[compacted: {len(content):,} chars omitted — already applied earlier this turn]"
+                new_m = dict(m)
+                new_m["content"] = marker
+                new_messages[i] = new_m
+                chars_saved += len(content) - len(marker)
+
+    return new_messages, chars_saved
 
 
 def commands_only_from_help():

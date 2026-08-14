@@ -201,6 +201,12 @@ MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 MAX_RESPONSE_TOKENS = 2500
 MAX_CONTEXT_CHARS = 60000
+# Single source of truth for the server's --max-context launch value, so the
+# launch args and any client-side context-budget logic can't drift apart.
+# 65536 (the next documented tier) hangs this machine (18GB RAM): the process
+# goes into uninterruptible sleep, thrashing on expert-weight disk I/O
+# instead of generating. 32768 is the highest tier confirmed to work here.
+SERVER_MAX_CONTEXT_TOKENS = 32768
 # 16 was too tight for a real multi-file task with iterative test-driven
 # fixes: writing 4 files (rules/render/main/tests) plus several read-fix-
 # rerun cycles hit the cap mid-review on a legitimately succeeding task,
