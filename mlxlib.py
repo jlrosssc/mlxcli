@@ -210,9 +210,13 @@ SERVER_MAX_CONTEXT_TOKENS = 32768
 # 16 was too tight for a real multi-file task with iterative test-driven
 # fixes: writing 4 files (rules/render/main/tests) plus several read-fix-
 # rerun cycles hit the cap mid-review on a legitimately succeeding task,
-# not a runaway loop. Doubled to give real multi-file work room to finish
-# in one turn while still bounding an actual infinite loop.
-MAX_TOOL_STEPS = 32
+# not a runaway loop. Doubled to 32, then a larger project (maze/collision/
+# AI logic across multiple files, with heavier test-iteration) hit that cap
+# too — even with in-turn context compaction keeping it safely under the
+# token ceiling the whole time, confirming it was genuinely doing more
+# legitimate work, not looping. Doubled again for the same reason as before:
+# bound an actual infinite loop, not real multi-file iteration.
+MAX_TOOL_STEPS = 64
 
 # TurboFieldfareServer defaults repetition_penalty to 1 (i.e. off) when a
 # request doesn't specify one — confirmed in its own source
