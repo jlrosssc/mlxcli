@@ -1,0 +1,14 @@
+FROM python:3.13-slim
+
+# pygame needs these system libs to import/run correctly, even headless
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsdl2-2.0-0 \
+    libsdl2-image-2.0-0 \
+    libsdl2-mixer-2.0-0 \
+    libsdl2-ttf-2.0-0 \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pygame>=2.5.0 pytest>=7.4.0
+
+WORKDIR /workspace
