@@ -967,6 +967,24 @@ def sandbox_container_path(target):
     except ValueError:
         return str(target)
 
+
+def sandbox_rewrite_command(cmd):
+    """Rewrite host absolute-path references to the working directory inside
+    a shell command string so they resolve inside the container. The model's
+    own system prompt tells it to use the real host path (e.g.
+    /Users/dad/LocalAI) for anything in the working directory — that path
+    doesn't exist inside the container, only its bind-mount target
+    (/workspace) does, so a command using it verbatim would otherwise fail
+    with a spurious 'No such file or directory'. Only rewrites the working
+    directory prefix; a command referencing some other host path outside it
+    is left as-is (see sandbox_container_path's docstring for why)."""
+    root = str(load_default_dir().resolve())
+    # Match the root path only at a token boundary (end of string, or
+    # followed by /, whitespace, or a quote) so a sibling directory that
+    # merely shares the prefix (e.g. /Users/dad/LocalAI2) isn't mangled.
+    pattern = re.escape(root) + r'(?=$|[/\s\'"])'
+    return re.sub(pattern, "/workspace", cmd)
+
 # When on, prints the model's own prose at each retry step of an agentic turn
 # (normally swallowed behind a terse status line), and its prose alongside a
 # tool call in the same turn. This backend doesn't expose a separate
@@ -1032,7 +1050,8 @@ def exec_tool(name, args):
             if SANDBOX_MODE:
                 ensure_sandbox_container()
             if SANDBOX_MODE and _sandbox_started:
-                p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "sh", "-c", cmd],
+                sandboxed_cmd = sandbox_rewrite_command(cmd)
+                p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "sh", "-c", sandboxed_cmd],
                                    capture_output=True, text=True, timeout=180)
                 location = "\nworking_directory=/workspace (sandboxed)"
             else:
@@ -1055,7 +1074,8 @@ def exec_tool(name, args):
             if SANDBOX_MODE:
                 ensure_sandbox_container()
             if SANDBOX_MODE and _sandbox_started:
-                p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "python3", "-c", code],
+                sandboxed_code = sandbox_rewrite_command(code)
+                p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "python3", "-c", sandboxed_code],
                                    capture_output=True, text=True, timeout=180)
             else:
                 p = subprocess.run([sys.executable, "-c", code], capture_output=True,
