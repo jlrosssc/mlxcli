@@ -986,6 +986,21 @@ def approve(desc, category=None):
         if category:
             ALWAYS_APPROVED.add(category)
             print(f"  (will auto-approve {category} actions for the rest of this session)")
+        # "Always allow" means the same thing -y does from here on: nothing
+        # reviews this category's tool calls before they run, so it gets the
+        # same sandbox protection -y gets — for the whole rest of the session,
+        # not just this category, since the sandbox container is one shared
+        # instance rather than scoped per tool category.
+        global SANDBOX_MODE
+        if not SANDBOX_MODE:
+            if shutil.which("container"):
+                SANDBOX_MODE = True
+                print("  (switching the rest of this session to sandboxed execution — "
+                      "auto-approved actions no longer get human review, so they "
+                      "shouldn't touch the real filesystem unreviewed either)")
+            else:
+                print("  (note: Apple's `container` tool wasn't found, so auto-approved "
+                      "actions will still run unsandboxed directly on this machine)")
         return True
     return ch == "y"
 
