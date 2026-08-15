@@ -6,20 +6,29 @@ Low-overhead design: streaming output, bounded history, shared dialogue
 defaults, and approval-gated tools with diff preview.
 
 Usage:
-  mlxcli [model] [-p "custom system prompt"] [-y]
-                             -y/--yes pre-approves all tool categories (run_command,
-                             write_file, python_interpreter, ssh_read/write/run) up
-                             front, so nothing prompts for the rest of the session —
-                             works in both the interactive REPL and headless --run.
-  mlxcli --run "task" [-y]   headless one-shot mode: run a single task, print the
+  mlxcli [model] [-p "custom system prompt"]
+                             Tool calls are pre-approved by default (run_command,
+                             write_file, python_interpreter, ssh_read/write/run) —
+                             nothing prompts for the rest of the session, and every
+                             tool call runs sandboxed inside an Apple `container`
+                             instance (see ensure_sandbox_container) instead of
+                             directly on the host. Works in both the interactive
+                             REPL and headless --run. -y/--yes is still accepted
+                             for old scripts/muscle memory but is now a no-op.
+  mlxcli [model] --ask       opt back into the old behavior: prompt for approval
+                             (with diff preview) before every tool call, and run
+                             tool calls directly on the host, unsandboxed — no
+                             human-review gate means no need for a sandbox, and
+                             vice versa; the two are tied together deliberately.
+  mlxcli --run "task"        headless one-shot mode: run a single task, print the
                              result, and exit (no REPL).
-  mlxcli --run "task" -y --verify "shell command"
+  mlxcli --run "task" --verify "shell command"
                              after the model claims completion, run this command as
                              a correctness check (cwd: the default directory). Exit
                              code 0 = pass. On failure, its output is fed back to the
                              model as a new turn (up to 3 attempts) instead of trusting
                              the model's own claim of success.
-  mlxcli --run "task" -y --verify "..." --verify-history DIR
+  mlxcli --run "task" --verify "..." --verify-history DIR
                              also require every .sh/.py script already in DIR to pass
                              (a regression suite accumulated from earlier steps of the
                              same project) — a fix that breaks something two steps back
@@ -3996,7 +4005,10 @@ def parse_args(argv):
     model = None
     system = load_system_prompt()
     run_task = None
-    auto_yes = False
+    # Auto-approve (and therefore sandbox — see main()) is now the default;
+    # --ask opts back into the old prompted/unsandboxed behavior. -y/--yes is
+    # kept accepted as a no-op so old scripts and muscle memory don't break.
+    auto_yes = True
     show_thinking = False
     verify_command = None
     verify_history_dir = None
@@ -4010,6 +4022,9 @@ def parse_args(argv):
             i += 2
         elif argv[i] in ("-y", "--yes"):
             auto_yes = True
+            i += 1
+        elif argv[i] == "--ask":
+            auto_yes = False
             i += 1
         elif argv[i] == "--thinking":
             show_thinking = True
@@ -4063,19 +4078,21 @@ def main():
     if show_thinking:
         SHOW_THINKING = True
     if auto_yes:
-        # Pre-approve every tool category up front — works for both headless
-        # --run and the interactive REPL, so -y also means "don't prompt me"
-        # when just launching mlxcli normally.
+        # Pre-approve every tool category up front — the default now, works for
+        # both headless --run and the interactive REPL. Pass --ask to opt back
+        # into per-call prompts (see the --ask branch below for the sandbox
+        # implication of that).
         ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
-        # -y also means no human is watching each tool call before it runs, so
+        # No human is watching each tool call before it runs in this mode, so
         # route the agentic tool-execution layer through the Apple `container`
         # sandbox instead of the host directly (see ensure_sandbox_container).
         global SANDBOX_MODE
         if shutil.which("container"):
             SANDBOX_MODE = True
         else:
-            print("  (note: -y bypasses approval prompts, but Apple's `container` tool wasn't found — "
-                  "tool calls will run unsandboxed directly on this machine)")
+            print("  (note: tool calls are auto-approved by default, but Apple's `container` tool wasn't "
+                  "found — tool calls will run unsandboxed directly on this machine; pass --ask to review "
+                  "each call instead)")
     if not model_arg and not run_task:
         selected_backend = pick_backend(backend)
         if selected_backend != backend:
