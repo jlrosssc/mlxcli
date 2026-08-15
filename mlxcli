@@ -47,7 +47,6 @@ import select
 import shlex
 import shutil
 import subprocess
-import threading
 import sys
 import termios
 import time
@@ -3927,24 +3926,29 @@ def parse_args(argv):
 
 
 def print_repo_update_notice_if_any(root, label):
-    """Background, non-blocking check for pending updates on a git repo's
-    remotes (e.g. TURBO_QWEN_ROOT), printed once ready. Mirrors mlxgui's
-    silent startup check — read-only, and silent when there's nothing to
-    report, so it never adds noise to a normal launch."""
-    def worker():
-        info = compute_repo_update_status(root)
-        if not info:
-            return
-        lines = [f"\n(⬆ {label} ({info['branch']}) has updates available:"]
-        for remote_ref, count in info["remotes"].items():
-            lines.append(f"  {remote_ref}: {count} new commit{'s' if count != 1 else ''}")
-        lines.append(
-            "This only checks and fetches — nothing is pulled or rebuilt "
-            "automatically. Merge on a separate branch, build, and test on "
-            "an alternate port before touching the running server.)"
-        )
-        print("\n".join(lines))
-    threading.Thread(target=worker, daemon=True).start()
+    """Synchronous check for pending updates on a git repo's remotes (e.g.
+    TURBO_QWEN_ROOT), printed before the interactive prompt starts. Was
+    previously a background thread, but its print() could land after the
+    readline prompt was already active and waiting for input — the notice
+    text would interleave with the prompt mid-display, leaving the terminal
+    looking stuck until the user pressed Enter to force a redraw. Running
+    this before anything interactive is shown (bounded by
+    compute_repo_update_status's own 10s timeout, and it never raises)
+    trades a small one-time startup delay for never hitting that race.
+    Silent when there's nothing to report, so it never adds noise to a
+    normal launch."""
+    info = compute_repo_update_status(root)
+    if not info:
+        return
+    lines = [f"\n(⬆ {label} ({info['branch']}) has updates available:"]
+    for remote_ref, count in info["remotes"].items():
+        lines.append(f"  {remote_ref}: {count} new commit{'s' if count != 1 else ''}")
+    lines.append(
+        "This only checks and fetches — nothing is pulled or rebuilt "
+        "automatically. Merge on a separate branch, build, and test on "
+        "an alternate port before touching the running server.)"
+    )
+    print("\n".join(lines))
 
 
 def main():
