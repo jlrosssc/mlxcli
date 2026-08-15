@@ -890,6 +890,74 @@ def read_single_key(prompt, valid_chars, default=""):
 # mirroring Claude Code's "don't ask again for this kind of action" behavior.
 ALWAYS_APPROVED = set()
 
+# Opt-in sandboxing: when -y/--yes bypasses the interactive approval prompts,
+# route run_command/python_interpreter/write_file through an Apple `container`
+# instance instead of the host directly, so a runaway or malicious tool call
+# can't touch anything outside the working directory. Normal reviewed
+# sessions (no -y) are never sandboxed — the diff preview + human approval
+# already gates those, same as always.
+SANDBOX_MODE = False
+SANDBOX_IMAGE = "mlxcli-sandbox:latest"
+SANDBOX_CONTAINER_NAME = f"mlxcli-sandbox-{os.getpid()}"
+_sandbox_started = False
+
+
+def ensure_sandbox_container():
+    """Start the sandbox container on first use (idempotent). The working
+    directory is bind-mounted at /workspace so writes there are visible on
+    the host in real time; writes elsewhere land only in the container's
+    own ephemeral filesystem and vanish with it. Disables SANDBOX_MODE for
+    the rest of the session (falling back to direct host execution, same as
+    a plain -y run today) if the container tool isn't actually available."""
+    global _sandbox_started, SANDBOX_MODE
+    if _sandbox_started or not SANDBOX_MODE:
+        return
+    workdir = load_default_dir().resolve()
+    subprocess.run(["container", "delete", "-f", SANDBOX_CONTAINER_NAME],
+                    capture_output=True)  # clear a stale container from a crashed prior run
+    try:
+        p = subprocess.run(
+            ["container", "run", "-d", "--name", SANDBOX_CONTAINER_NAME,
+             "-v", f"{workdir}:/workspace", "-w", "/workspace",
+             SANDBOX_IMAGE, "sleep", "infinity"],
+            capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"  (sandbox container failed to start ({e}) — falling back to unsandboxed execution)")
+        SANDBOX_MODE = False
+        return
+    if p.returncode != 0:
+        print(f"  (sandbox container failed to start: {p.stderr.strip()} — falling back to unsandboxed execution)")
+        SANDBOX_MODE = False
+        return
+    _sandbox_started = True
+    print(f"  (sandbox container started: {SANDBOX_CONTAINER_NAME}, workspace={workdir})")
+
+
+def teardown_sandbox_container():
+    global _sandbox_started
+    if not _sandbox_started:
+        return
+    subprocess.run(["container", "stop", SANDBOX_CONTAINER_NAME], capture_output=True, timeout=30)
+    subprocess.run(["container", "delete", "-f", SANDBOX_CONTAINER_NAME], capture_output=True, timeout=30)
+    _sandbox_started = False
+
+
+atexit.register(teardown_sandbox_container)
+
+
+def sandbox_container_path(target):
+    """Map a resolved host path to its path inside the sandbox container.
+    Paths inside the bind-mounted working directory map to /workspace/...
+    so the write is visible on the host; anything else stays as a literal
+    path inside the container's own ephemeral filesystem — i.e. it never
+    reaches the host at all."""
+    root = load_default_dir().resolve()
+    try:
+        rel = target.relative_to(root)
+        return str(pathlib.PurePosixPath("/workspace") / rel)
+    except ValueError:
+        return str(target)
+
 # When on, prints the model's own prose at each retry step of an agentic turn
 # (normally swallowed behind a terse status line), and its prose alongside a
 # tool call in the same turn. This backend doesn't expose a separate
@@ -937,11 +1005,18 @@ def exec_tool(name, args):
         if not approve(f"run: {cmd}", category="run_command"):
             return "User declined."
         try:
-            cwd = infer_command_cwd(cmd)
-            p = subprocess.run(cmd, shell=True, capture_output=True,
-                               text=True, timeout=180, cwd=cwd)
+            if SANDBOX_MODE:
+                ensure_sandbox_container()
+            if SANDBOX_MODE and _sandbox_started:
+                p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "sh", "-c", cmd],
+                                   capture_output=True, text=True, timeout=180)
+                location = "\nworking_directory=/workspace (sandboxed)"
+            else:
+                cwd = infer_command_cwd(cmd)
+                p = subprocess.run(cmd, shell=True, capture_output=True,
+                                   text=True, timeout=180, cwd=cwd)
+                location = f"\nworking_directory={cwd}" if cwd else ""
             out = (p.stdout + p.stderr).strip()
-            location = f"\nworking_directory={cwd}" if cwd else ""
             return f"exit_code={p.returncode}{location}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
         except subprocess.TimeoutExpired:
             return "Command timed out."
@@ -953,8 +1028,14 @@ def exec_tool(name, args):
         if not approve(f"run Python code ({len(code)} chars)", category="python_interpreter"):
             return "User declined."
         try:
-            p = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                               text=True, timeout=180)
+            if SANDBOX_MODE:
+                ensure_sandbox_container()
+            if SANDBOX_MODE and _sandbox_started:
+                p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "python3", "-c", code],
+                                   capture_output=True, text=True, timeout=180)
+            else:
+                p = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                                   text=True, timeout=180)
             out = (p.stdout + p.stderr).strip()
             return f"exit_code={p.returncode}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
         except subprocess.TimeoutExpired:
@@ -1006,6 +1087,29 @@ def exec_tool(name, args):
             print("  (no textual change)")
         if not approve(f"write {len(content)} chars to {target}", category="write_file"):
             return "User declined."
+        in_workspace = True
+        try:
+            target.relative_to(load_default_dir().resolve())
+        except ValueError:
+            in_workspace = False
+        if SANDBOX_MODE and not in_workspace:
+            ensure_sandbox_container()
+            if _sandbox_started:
+                container_path = sandbox_container_path(target)
+                p = subprocess.run(
+                    ["container", "exec", "-i", SANDBOX_CONTAINER_NAME, "python3", "-c",
+                     "import pathlib,sys\n"
+                     "p = pathlib.Path(sys.argv[1])\n"
+                     "p.parent.mkdir(parents=True, exist_ok=True)\n"
+                     "p.write_text(sys.stdin.read())\n"
+                     "print(p.stat().st_size)",
+                     container_path],
+                    input=content, capture_output=True, text=True, timeout=60)
+                if p.returncode == 0:
+                    return (f"Written: {container_path} ({p.stdout.strip()} bytes) inside the sandbox only "
+                            f"— this path is outside the working directory, so nothing was written to the "
+                            f"real host filesystem.")
+                return f"Error writing inside sandbox: {p.stderr.strip()}"
         backup_path = backup_before_overwrite(target) if diff else None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -3963,6 +4067,15 @@ def main():
         # --run and the interactive REPL, so -y also means "don't prompt me"
         # when just launching mlxcli normally.
         ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
+        # -y also means no human is watching each tool call before it runs, so
+        # route the agentic tool-execution layer through the Apple `container`
+        # sandbox instead of the host directly (see ensure_sandbox_container).
+        global SANDBOX_MODE
+        if shutil.which("container"):
+            SANDBOX_MODE = True
+        else:
+            print("  (note: -y bypasses approval prompts, but Apple's `container` tool wasn't found — "
+                  "tool calls will run unsandboxed directly on this machine)")
     if not model_arg and not run_task:
         selected_backend = pick_backend(backend)
         if selected_backend != backend:
