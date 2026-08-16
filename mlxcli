@@ -911,6 +911,25 @@ SANDBOX_CONTAINER_NAME = f"mlxcli-sandbox-{os.getpid()}"
 _sandbox_started = False
 
 
+def prune_stopped_sandbox_containers():
+    """Delete any stopped mlxcli-sandbox-* containers left behind by prior
+    sessions that didn't exit cleanly (killed process, closed terminal,
+    crash) and so never reached teardown_sandbox_container(). Only touches
+    stopped containers -- a sandbox still running under another live mlxcli
+    session's PID is left alone."""
+    try:
+        p = subprocess.run(["container", "list", "-a", "--format", "json"],
+                            capture_output=True, text=True, timeout=15)
+        containers = json.loads(p.stdout) if p.returncode == 0 else []
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return
+    for c in containers:
+        cid = c.get("id", "")
+        state = c.get("status", {}).get("state", "")
+        if cid.startswith("mlxcli-sandbox-") and state != "running":
+            subprocess.run(["container", "delete", "-f", cid], capture_output=True)
+
+
 def ensure_sandbox_container():
     """Start the sandbox container on first use (idempotent). The working
     directory is bind-mounted at /workspace so writes there are visible on
@@ -922,6 +941,7 @@ def ensure_sandbox_container():
     if _sandbox_started or not SANDBOX_MODE:
         return
     workdir = load_default_dir().resolve()
+    prune_stopped_sandbox_containers()  # clean up leftovers from prior crashed/killed sessions
     subprocess.run(["container", "delete", "-f", SANDBOX_CONTAINER_NAME],
                     capture_output=True)  # clear a stale container from a crashed prior run
     try:
