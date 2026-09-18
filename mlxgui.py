@@ -55,6 +55,7 @@ from mlxlib import (
     record_last_artifact, last_artifact_system_note,
     caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
     rag_remote_config, rag_remote_search, web_search,
+    load_host_aliases, keychain_get, request as ha_http_request, api as ha_http_api,
 )
 
 
@@ -2577,6 +2578,42 @@ class MlxGui(tk.Tk):
                 return result
             except Exception as exc:
                 return f"Error: {exc}"
+        if name == "ha_api":
+            target = str(args.get("host") or args.get("target") or "").strip().lower()
+            method = str(args.get("method") or "GET").upper()
+            api_path = args.get("path", "")
+            data = args.get("data")
+            entry = load_host_aliases().get(target)
+            ha_cfg = None
+            if entry:
+                if entry.get("type") == "ha_api":
+                    ha_cfg = entry
+                elif entry.get("ha_api"):
+                    ha_cfg = entry["ha_api"]
+            if not ha_cfg:
+                return f"Error: '{target}' is not a known ha_api-capable alias."
+            token = keychain_get(target, ha_cfg.get("keychain_service", ""))
+            if token is None:
+                return f"Error: no stored HA token for alias '{target}'."
+            if not self.request_tool_approval(f"Home Assistant API call:\n{target} {method} {api_path}"):
+                return "User declined."
+            try:
+                base_url = ha_cfg["base_url"]
+                if method == "GET":
+                    result = ha_http_api(base_url, token, api_path)
+                else:
+                    req = ha_http_request(base_url, token, api_path, payload=data if data is not None else {})
+                    req.get_method = lambda: method
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        result = json.load(r)
+                text = json.dumps(result, indent=2)
+                note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
+                return f"[source: {target}]\n" + text[:MAX_FILE_CHARS] + note
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:800]
+                return f"HTTP {exc.code} from {target}: {detail}"
+            except Exception as exc:
+                return f"Error calling ha_api on {target}: {exc}"
         if name == "web_search":
             query = args.get("query", "")
             max_results = args.get("max_results", 5)

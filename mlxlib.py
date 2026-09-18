@@ -34,6 +34,61 @@ from logging.handlers import RotatingFileHandler
 DEFAULT_DIR_CONFIG_PATH = pathlib.Path.home() / ".omlx" / "default_dir.txt"
 DEFAULT_DIR_FALLBACK = pathlib.Path.home() / "LocalAI"
 
+HOST_ALIASES_PATH = pathlib.Path.home() / ".omlx" / "host_aliases.json"
+_HOST_ALIASES_CACHE = None
+
+
+def load_host_aliases():
+    """Non-secret connection metadata for named hosts (dad/hross/unity/...),
+    keyed by lowercase alias. Actual credentials live in the macOS Keychain,
+    never in this file — see keychain_get() below. Cached after first read
+    since it's read on every tool call that might use an alias. Shared by
+    mlxcli and mlxgui so both resolve the same aliases the same way."""
+    global _HOST_ALIASES_CACHE
+    if _HOST_ALIASES_CACHE is not None:
+        return _HOST_ALIASES_CACHE
+    try:
+        _HOST_ALIASES_CACHE = json.loads(HOST_ALIASES_PATH.read_text())
+    except Exception:
+        _HOST_ALIASES_CACHE = {}
+    return _HOST_ALIASES_CACHE
+
+
+def keychain_get(account, service):
+    """Fetch a secret from the macOS Keychain. Returns None (never raises)
+    if the entry doesn't exist or `security` isn't available — callers fall
+    back to their normal interactive prompt in that case, so a missing
+    Keychain entry degrades gracefully instead of hard-failing."""
+    try:
+        p = subprocess.run(
+            ["security", "find-generic-password", "-a", account, "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            return None
+        return p.stdout.rstrip("\n")
+    except Exception:
+        return None
+
+
+def request(url, key, path, payload=None):
+    # Real browser UA: some targets (e.g. Cloudflare-fronted Home Assistant
+    # instances hit via ha_api) block urllib's default "Python-urllib/x.y"
+    # UA outright (HTTP 403, Cloudflare error 1010) even with a valid token.
+    headers = {"Content-Type": "application/json",
+               "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return urllib.request.Request(
+        url + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers=headers)
+
+
+def api(url, key, path, payload=None):
+    with urllib.request.urlopen(request(url, key, path, payload), timeout=900) as r:
+        return json.load(r)
+
 
 def rag_remote_config():
     """Return optional LAN RAG configuration used by both clients.

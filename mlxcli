@@ -103,6 +103,7 @@ from mlxlib import (
     rag_remote_config, rag_remote_request, rag_remote_search, rag_remote_list,
     rag_remote_upload, rag_remote_update, rag_remote_delete, rag_remote_collections,
     rag_remote_get_document, esv_passage, web_search,
+    load_host_aliases, keychain_get, request, api, HOST_ALIASES_PATH,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -124,26 +125,6 @@ MAX_BATCH_RESUME_CHARS = 22000
 SSH_PASSWORD_CACHE = {}
 CONVERT_MODES = {"auto", "all", "off"}
 READLINE_HISTORY_PATH = pathlib.Path.home() / ".omlx" / "mlxcli_history"
-
-HOST_ALIASES_PATH = pathlib.Path.home() / ".omlx" / "host_aliases.json"
-_HOST_ALIASES_CACHE = None
-
-
-def load_host_aliases():
-    """Non-secret connection metadata for named hosts (dad/hross/unity/...),
-    keyed by lowercase alias. Actual credentials live in the macOS Keychain,
-    never in this file — see keychain_get() further down. Cached after first
-    read since it's read on every tool call that might use an alias, and
-    once here too, to list known aliases in the system prompt below."""
-    global _HOST_ALIASES_CACHE
-    if _HOST_ALIASES_CACHE is not None:
-        return _HOST_ALIASES_CACHE
-    try:
-        _HOST_ALIASES_CACHE = json.loads(HOST_ALIASES_PATH.read_text())
-    except Exception:
-        _HOST_ALIASES_CACHE = {}
-    return _HOST_ALIASES_CACHE
-
 
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac.\n"
@@ -740,26 +721,6 @@ def request_messages_for_mode(messages, agentic_mode, backend):
 def save_system_prompt(text):
     SYSTEM_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
     SYSTEM_PROMPT_PATH.write_text(text.strip() + "\n")
-
-
-def request(url, key, path, payload=None):
-    # Real browser UA: some targets (e.g. Cloudflare-fronted Home Assistant
-    # instances hit via ha_api) block urllib's default "Python-urllib/x.y"
-    # UA outright (HTTP 403, Cloudflare error 1010) even with a valid token.
-    headers = {"Content-Type": "application/json",
-               "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    return urllib.request.Request(
-        url + path,
-        data=json.dumps(payload).encode() if payload is not None else None,
-        headers=headers)
-
-
-def api(url, key, path, payload=None):
-    with urllib.request.urlopen(request(url, key, path, payload), timeout=900) as r:
-        return json.load(r)
 
 
 def server_up(url, key):
@@ -2440,22 +2401,6 @@ def read_masked_password(prompt):
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         print()
     return "".join(chars)
-
-
-def keychain_get(account, service):
-    """Fetch a secret from the macOS Keychain. Returns None (never raises)
-    if the entry doesn't exist or `security` isn't available — callers fall
-    back to their normal interactive prompt in that case, so a missing
-    Keychain entry degrades gracefully instead of hard-failing."""
-    try:
-        p = subprocess.run(
-            ["security", "find-generic-password", "-a", account, "-s", service, "-w"],
-            capture_output=True, text=True, timeout=10)
-        if p.returncode != 0:
-            return None
-        return p.stdout.rstrip("\n")
-    except Exception:
-        return None
 
 
 SSH_KEY_AUTH = {}  # real_host -> {"identity_file": str, "port": str}, for
