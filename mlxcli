@@ -306,16 +306,6 @@ HELP = """Commands:
                   write or overwrite a remote file over SSH (content prompted after command)
   /sshrun USER@HOST COMMAND
                   run a remote shell command over SSH
-  /ha TARGET config
-                  show Home Assistant version/location for TARGET (home, unity)
-  /ha TARGET states [domain.]
-                  list entity states for TARGET, optionally filtered by domain prefix
-  /ha TARGET automations
-                  list automations and their last-triggered time for TARGET
-  /ha TARGET entity ENTITY_ID
-                  show full state/attributes for one entity on TARGET
-  /ha TARGET services
-                  list available service calls for TARGET
   /agentic        show whether model tool use is enabled
   /agentic on     enable model-driven tool calls (run/read/write with approvals)
   /agentic off    disable model-driven tool calls
@@ -2588,127 +2578,6 @@ def run_ssh_command_with_input(host, command, input_text):
                      f"a shorter/simpler command may succeed.")
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output.strip()
-
-
-HA_TARGETS_FILE = pathlib.Path.home() / ".omlx" / "ha_targets.json"
-HA_TARGETS_CACHE = None
-
-
-def load_ha_targets():
-    global HA_TARGETS_CACHE
-    if HA_TARGETS_CACHE is not None:
-        return HA_TARGETS_CACHE
-    if not HA_TARGETS_FILE.exists():
-        HA_TARGETS_CACHE = {}
-        return HA_TARGETS_CACHE
-    try:
-        with open(HA_TARGETS_FILE) as f:
-            HA_TARGETS_CACHE = json.load(f)
-    except Exception as e:
-        print(f"(couldn't read {HA_TARGETS_FILE}: {e})")
-        HA_TARGETS_CACHE = {}
-    return HA_TARGETS_CACHE
-
-
-def ha_api_request(target, path, method="GET", body=None, timeout=15):
-    """Authenticated call to a Home Assistant target's REST API. Returns (ok, data_or_error)."""
-    targets = load_ha_targets()
-    cfg = targets.get(target)
-    if not cfg:
-        known = ", ".join(sorted(targets)) or "(none configured)"
-        return False, f"no Home Assistant target named '{target}' — known targets: {known}"
-    url = cfg["url"].rstrip("/") + "/api/" + path.lstrip("/")
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {cfg['token']}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", "mlxcli/1.0 (+https://github.com/jlrosssc/mlxcli)")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode()
-            try:
-                return True, json.loads(raw)
-            except json.JSONDecodeError:
-                return True, raw
-    except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"
-    except urllib.error.URLError as e:
-        return False, f"connection failed: {e.reason}"
-    except Exception as e:
-        return False, f"error: {e}"
-
-
-def do_ha(arg):
-    parts = arg.strip().split(None, 2)
-    if len(parts) < 2:
-        targets = ", ".join(sorted(load_ha_targets())) or "(none configured)"
-        print("usage: /ha TARGET SUBCOMMAND [args]")
-        print(f"  known targets: {targets}")
-        print("  subcommands: config, states [domain], automations, entity ENTITY_ID, services")
-        return
-    target, subcommand = parts[0], parts[1]
-    rest = parts[2] if len(parts) > 2 else ""
-
-    if subcommand == "config":
-        ok, data = ha_api_request(target, "config")
-        if not ok:
-            print(f"({data})")
-            return
-        print(f"{target}: HA {data.get('version')} | location: {data.get('location_name')} "
-              f"| time_zone: {data.get('time_zone')} | components: {len(data.get('components', []))}")
-        return
-
-    if subcommand == "states":
-        ok, data = ha_api_request(target, "states")
-        if not ok:
-            print(f"({data})")
-            return
-        domain_filter = rest.strip()
-        rows = [s for s in data if not domain_filter or s["entity_id"].startswith(domain_filter)]
-        print(f"{target}: {len(rows)} entities" + (f" matching '{domain_filter}'" if domain_filter else ""))
-        for s in rows[:200]:
-            name = s.get("attributes", {}).get("friendly_name", "")
-            print(f"  {s['entity_id']:<40} {s['state']:<12} {name}")
-        if len(rows) > 200:
-            print(f"  ...and {len(rows) - 200} more (narrow with: /ha {target} states <domain.>)")
-        return
-
-    if subcommand == "automations":
-        ok, data = ha_api_request(target, "states")
-        if not ok:
-            print(f"({data})")
-            return
-        autos = [s for s in data if s["entity_id"].startswith("automation.")]
-        print(f"{target}: {len(autos)} automations")
-        for s in autos:
-            name = s.get("attributes", {}).get("friendly_name", s["entity_id"])
-            last_triggered = s.get("attributes", {}).get("last_triggered", "never")
-            print(f"  [{s['state']:<3}] {name}  (last triggered: {last_triggered})")
-        return
-
-    if subcommand == "entity":
-        entity_id = rest.strip()
-        if not entity_id:
-            print("usage: /ha TARGET entity ENTITY_ID")
-            return
-        ok, data = ha_api_request(target, f"states/{entity_id}")
-        if not ok:
-            print(f"({data})")
-            return
-        print(json.dumps(data, indent=2))
-        return
-
-    if subcommand == "services":
-        ok, data = ha_api_request(target, "services")
-        if not ok:
-            print(f"({data})")
-            return
-        for domain_entry in data:
-            svc_names = ", ".join(sorted(domain_entry.get("services", {})))
-            print(f"  {domain_entry['domain']}: {svc_names}")
-        return
-
-    print(f"(unknown /ha subcommand: {subcommand})")
 
 
 def do_errorlog(arg):
@@ -5347,9 +5216,6 @@ def main():
             continue
         if user.startswith("/sshrun"):
             do_sshrun(user[7:])
-            continue
-        if user.startswith("/ha "):
-            do_ha(user[4:])
             continue
         request_agentic_mode = agentic_mode or should_auto_enable_agentic(user, messages)
         if request_agentic_mode and not agentic_mode:
