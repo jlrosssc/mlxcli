@@ -1,7 +1,7 @@
 """Shared logic for mlxcli and mlxgui.
 
-Both tools talk to the same local model servers (omlx, turbofieldfare,
-turbofieldfare-qwen) and need the same answers to "is this an agentic
+Both tools talk to the same local model servers (omlx, turbofieldfare-qwen)
+and need the same answers to "is this an agentic
 request", "what does this tool call actually do", and "which files count as
 reviewable code". Keeping that logic in one place means a fix made here
 applies to both interfaces at once, instead of the two independently
@@ -13,6 +13,7 @@ mlxgui) since those are fundamentally different interaction models.
 """
 import ast
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -123,6 +124,54 @@ def esv_passage(reference, api_key=None):
     return data.get("canonical", reference), passages[0]
 
 
+_WEB_SEARCH_RESULT_RE = re.compile(
+    r'<a[^>]+class="result__a"[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
+    r'<a[^>]+class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+    re.DOTALL)
+
+
+def _strip_html_tags(fragment):
+    return re.sub(r"<[^>]+>", "", fragment).replace("&#x27;", "'").replace("&amp;", "&").strip()
+
+
+def web_search(query, max_results=5):
+    """General internet search via DuckDuckGo's no-JS HTML endpoint -- chosen
+    specifically because it needs no API key/signup, matching this codebase's
+    existing "no credentials required" pattern for everything else. Returns a
+    list of {title, url, snippet} dicts, or raises on a network failure (the
+    caller is responsible for approval-gating this before it's ever invoked,
+    since unlike every other tool here it reaches beyond the user's own
+    machines and services)."""
+    max_results = max(1, min(int(max_results or 5), 10))
+    params = urllib.parse.urlencode({"q": query})
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(f"https://html.duckduckgo.com/html/?{params}", headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    results = []
+    for match in _WEB_SEARCH_RESULT_RE.finditer(body):
+        url = match.group("url")
+        if url.startswith("//duckduckgo.com/l/?"):
+            # DDG's HTML endpoint wraps result links in its own redirector
+            # (//duckduckgo.com/l/?uddg=<encoded-real-url>&...) -- unwrap it
+            # so the model gets the real destination, not a tracking link.
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            url = qs.get("uddg", [url])[0]
+        results.append({
+            "title": _strip_html_tags(match.group("title")),
+            "url": url,
+            "snippet": _strip_html_tags(match.group("snippet")),
+        })
+        if len(results) >= max_results:
+            break
+    return results
+
+
 def rag_remote_collections(url=None, key=None):
     """List every collection on the RAG server, with each one's document count."""
     configured_url, configured_key, _ = rag_remote_config()
@@ -199,7 +248,7 @@ def save_default_dir(path):
 
 MAX_FILE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
-MAX_RESPONSE_TOKENS = 2500
+MAX_RESPONSE_TOKENS = 8000
 MAX_CONTEXT_CHARS = 60000
 # Single source of truth for the server's --max-context launch value, so the
 # launch args and any client-side context-budget logic can't drift apart.
@@ -407,38 +456,71 @@ TOOLS = [
             "content": {"type": "string"}}, "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "ssh_run",
-        "description": (
-            "Run a single command on a remote host over SSH and return its "
-            "output. Use this for any task that requires connecting to another "
-            "machine on the network (routers, servers, IoT devices, etc.) "
-            "rather than claiming no network access — the sandbox has full LAN "
-            "and internet connectivity."
-        ),
+        "description": "Run a shell command on a remote host over SSH, using the password already "
+                        "established for that host this session (prompts once and caches it if this "
+                        "is the first command to that host). Prefer this over run_command with a "
+                        "manually-constructed `ssh user@host ...` string — that path tries local SSH "
+                        "key auth, which may not be authorized on the remote host even when password "
+                        "auth works fine, and it can't reuse the password already cached here. `host` "
+                        "also accepts a saved alias name (e.g. \"dad\", \"hross\") instead of "
+                        "user@hostname — aliased hosts resolve their address and password from local "
+                        "storage automatically, no credentials needed in the call. If the command needs "
+                        "sudo on an aliased host, put the literal placeholder {{SUDO_PASSWORD}} where the "
+                        "password would go (e.g. \"echo '{{SUDO_PASSWORD}}' | sudo -S -p '' <cmd>\") — it "
+                        "is substituted from storage at execution time; never ask the user for this "
+                        "password or invent one.",
         "parameters": {"type": "object", "properties": {
-            "host": {"type": "string", "description": "Hostname or IP of the remote machine."},
-            "username": {"type": "string", "description": "SSH login username."},
-            "password": {"type": "string", "description": "SSH login password, if password auth is being used."},
-            "command": {"type": "string", "description": "The shell command to run on the remote host."}},
-            "required": ["host", "username", "command"]}}},
+            "host": {"type": "string", "description": "user@hostname, user@ip, or a saved alias name"},
+            "command": {"type": "string", "description": "the shell command to run on that host"}},
+            "required": ["host", "command"]}}},
     {"type": "function", "function": {
-        "name": "check_call_signatures",
-        "description": (
-            "Statically scan every .py file under a directory for two bug classes "
-            "at once: (1) function/method calls whose argument count or keyword "
-            "names don't match any known definition of that function in the "
-            "project, and (2) self.<attr>.<method>() calls where <attr> is a "
-            "known local class instance whose class has no method by that name "
-            "at all (e.g. calling self.renderer.draw_score() when Renderer was "
-            "never given a draw_score method). Run this ONCE after a refactor "
-            "touching multiple files, instead of fixing one TypeError/"
-            "AttributeError at a time by running the program repeatedly. "
-            "Read-only; makes no changes. Best-effort — unresolvable call "
-            "targets are silently skipped rather than guessed at, so a clean "
-            "report is a real signal."
-        ),
+        "name": "ssh_read",
+        "description": "Read a text file from a remote host over SSH, using the password already "
+                        "established for that host this session. Prefer this over run_command/"
+                        "ssh_run with a manually-constructed cat command. `host` also accepts a saved "
+                        "alias name (e.g. \"dad\", \"hross\") — resolved automatically, no credentials needed.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Project root directory to scan."}},
-            "required": ["path"]}}},
+            "host": {"type": "string", "description": "user@hostname, user@ip, or a saved alias name"},
+            "path": {"type": "string", "description": "absolute path on the remote host"}},
+            "required": ["host", "path"]}}},
+    {"type": "function", "function": {
+        "name": "ssh_write",
+        "description": "Write a new file or overwrite an existing file on a remote host over SSH, "
+                        "using the password already established for that host this session. Shows "
+                        "the user a preview and asks for approval before writing, same as write_file. "
+                        "`host` also accepts a saved alias name (e.g. \"dad\", \"hross\") — resolved "
+                        "automatically, no credentials needed.",
+        "parameters": {"type": "object", "properties": {
+            "host": {"type": "string", "description": "user@hostname, user@ip, or a saved alias name"},
+            "path": {"type": "string", "description": "absolute path on the remote host"},
+            "content": {"type": "string"}}, "required": ["host", "path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "ha_api",
+        "description": "Call a Home Assistant instance's REST API on a saved alias (e.g. \"unity\", or "
+                        "\"dad\" — which is also reachable this way in addition to ssh_run/ssh_read/"
+                        "ssh_write). The auth token is resolved from local storage automatically — never "
+                        "ask the user for it. Common paths: GET /api/states or /api/states/<entity_id> to "
+                        "read state; POST /api/services/<domain>/<service> with `data` as the JSON body "
+                        "to call a service (e.g. domain=light, service=turn_on).",
+        "parameters": {"type": "object", "properties": {
+            "host": {"type": "string", "description": "saved alias name, e.g. \"unity\" or \"dad\" — same "
+                                                        "field name as ssh_run/ssh_read/ssh_write"},
+            "method": {"type": "string", "description": "GET or POST (default GET)"},
+            "path": {"type": "string", "description": "API path, e.g. /api/states/sensor.example"},
+            "data": {"type": "object", "description": "JSON body for POST calls (e.g. service data)"}},
+            "required": ["host", "path"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the public internet and return a list of result titles, URLs, and snippets. "
+                        "This leaves the local machine and always requires the user's explicit approval before "
+                        "it runs. Only call this when the user has actually asked for something that needs "
+                        "current, external, or general-internet information (e.g. today's news, a product's "
+                        "current price, a fact you don't have and can't get from a local tool) -- never call it "
+                        "by default, speculatively, or just to double-check something you can already answer.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "the search query"},
+            "max_results": {"type": "integer", "description": "how many results to return (default 5, max 10)"}},
+            "required": ["query"]}}},
 ]
 
 
@@ -472,6 +554,7 @@ def requires_agentic_execution(text):
         "confirm that", "list its byte size", "share the final files",
         "open", "show", "view", "look at", "check", "list", "read",
         "update", "modify", "edit", "add", "change", "build", "set up",
+        "find", "locate", "search",
     )
     target_terms = (
         "file", "files", "directory", "folder", "path", "script",
@@ -502,10 +585,10 @@ def should_auto_enable_agentic(text, messages=None):
         bool(re.search(r"(?:^|\s)(?:~|/|\./|\.\./)[^\s]+", lowered))
         or any(term_present(term, lowered) for term in (
             "downloads", "download folder", "local file", "local folder", "filesystem",
-            "file system", "directory", "folder", "repository", "repo", "working tree",
+            "file system", "file", "files", "directory", "folder", "repository", "repo", "working tree",
             "/users/",
             "spreadsheet", "workbook", "excel",
-            "script", "project", "app", "application", "program", "python", "database",
+            "script", "project", "app", "application", "program", "database",
             "website", "webpage", "web app", "api", "server", "notebook",
             "presentation", "slides", "document", "game",
             *REVIEWABLE_TEXT, *CONVERTIBLE,
@@ -599,423 +682,6 @@ def missing_local_imports(py_path):
         if not sibling_file.exists() and not sibling_pkg.exists():
             missing.append(name)
     return missing
-
-
-class _SignatureInfo:
-    __slots__ = ("required", "optional", "has_vararg", "has_kwarg",
-                 "kwonly_required", "kwonly_optional", "is_method", "file", "line")
-
-    def __init__(self, required, optional, has_vararg, has_kwarg,
-                 kwonly_required, kwonly_optional, is_method, file, line):
-        self.required = required
-        self.optional = optional
-        self.has_vararg = has_vararg
-        self.has_kwarg = has_kwarg
-        self.kwonly_required = kwonly_required
-        self.kwonly_optional = kwonly_optional
-        self.is_method = is_method
-        self.file = file
-        self.line = line
-
-    def accepts(self, n_positional, keyword_names):
-        """Best-effort compatibility check, not a full binder. Positional
-        args fill positional-or-keyword slots left-to-right; any slot they
-        don't reach can still be satisfied by a matching keyword — a call
-        like `create_enemy(eid=..., etype=..., slot=...)` is a perfectly
-        valid match for `def create_enemy(eid, etype, slot)` even with zero
-        positional args passed. `is_method` signatures are tried both with
-        and without a leading self/cls slot, since a static walk can't tell
-        `self.method(a, b)` from `Cls.method(obj, a, b)` apart."""
-        combined = self.required + self.optional
-        variants = [combined]
-        if self.is_method and combined:
-            variants.append(combined[1:])
-        keyword_set = set(keyword_names)
-        for slots in variants:
-            if n_positional > len(slots) and not self.has_vararg:
-                continue
-            remaining = slots[n_positional:]
-            required_remaining = [p for p in remaining
-                                   if p in self.required and p not in keyword_set]
-            covered_by_keyword = keyword_set & set(slots[:n_positional])
-            if covered_by_keyword:
-                # A positional slot re-supplied by keyword is a real
-                # "multiple values" TypeError — don't call this a match.
-                continue
-            if required_remaining:
-                continue
-            if not self.has_kwarg:
-                known = set(slots) | set(self.kwonly_required) | set(self.kwonly_optional)
-                if any(k not in known for k in keyword_names):
-                    continue
-            missing_kwonly = set(self.kwonly_required) - keyword_set
-            if missing_kwonly and not self.has_kwarg:
-                continue
-            return True
-        return False
-
-
-def _collect_signatures(tree, file_label):
-    """All function/method definitions in one parsed module, keyed by
-    simple name. Multiple definitions of the same name (methods on
-    different classes, functions in different modules) all get collected
-    under that name — a call is only flagged if it matches none of them."""
-    sigs = {}
-
-    class _Visitor(ast.NodeVisitor):
-        def __init__(self):
-            self.class_depth = 0
-            self.func_depth = 0
-
-        def visit_ClassDef(self, node):
-            self.class_depth += 1
-            self.generic_visit(node)
-            self.class_depth -= 1
-
-        def _visit_func(self, node):
-            # A closure nested inside another function (e.g. a `def run(*args):`
-            # helper defined inline for one caller's convenience) is private to
-            # that scope. Treating it as a project-wide candidate signature for
-            # any call named `run` elsewhere — including unrelated stdlib calls
-            # like `subprocess.run(...)` — produces exactly the kind of false
-            # positive this checker exists to avoid. Only module-level functions
-            # and direct class methods are collected as real candidates; nested
-            # closures are walked (in case *they* contain interesting calls to
-            # check) but not registered as signatures.
-            if self.func_depth == 0:
-                a = node.args
-                n_defaults = len(a.defaults)
-                pos_params = [p.arg for p in a.posonlyargs] + [p.arg for p in a.args]
-                required = pos_params[:len(pos_params) - n_defaults] if n_defaults else pos_params
-                optional = pos_params[len(pos_params) - n_defaults:] if n_defaults else []
-                kwonly_required = [p.arg for p, d in zip(a.kwonlyargs, a.kw_defaults) if d is None]
-                kwonly_optional = [p.arg for p, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
-                info = _SignatureInfo(
-                    required=required, optional=optional,
-                    has_vararg=a.vararg is not None, has_kwarg=a.kwarg is not None,
-                    kwonly_required=kwonly_required, kwonly_optional=kwonly_optional,
-                    is_method=self.class_depth > 0,
-                    file=file_label, line=node.lineno,
-                )
-                sigs.setdefault(node.name, []).append(info)
-            self.func_depth += 1
-            self.generic_visit(node)
-            self.func_depth -= 1
-
-        visit_FunctionDef = _visit_func
-        visit_AsyncFunctionDef = _visit_func
-
-    _Visitor().visit(tree)
-    return sigs
-
-
-def _collect_calls(tree):
-    """(name, lineno, n_positional, keyword_names, is_attribute_call) for
-    every Call node whose target resolves to a simple name — `foo(...)` or
-    `x.foo(...)`. Calls using `*args`/`**kwargs` unpacking at the call site
-    are skipped as unverifiable rather than risking a false positive."""
-    calls = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name):
-            name = node.func.id
-            is_attribute_call = False
-        elif isinstance(node.func, ast.Attribute):
-            name = node.func.attr
-            is_attribute_call = True
-        else:
-            continue
-        if any(isinstance(arg, ast.Starred) for arg in node.args):
-            continue
-        if any(kw.arg is None for kw in node.keywords):
-            continue
-        n_positional = len(node.args)
-        keyword_names = [kw.arg for kw in node.keywords]
-        calls.append((name, node.lineno, n_positional, keyword_names, is_attribute_call))
-    return calls
-
-
-def _collect_class_info(tree):
-    """For every class in one parsed module: its own method names, its base
-    class names (as written — no MRO resolution), and any `self.<attr> =
-    <ClassName>(...)` assignments found in its methods. The attr-type map is
-    deliberately narrow (a direct `Name(...)` call on the RHS, not a
-    conditional, a factory function, or anything requiring real type
-    inference) — a miss here just means that attribute isn't checked, which
-    is the safe failure mode."""
-    methods = {}
-    bases = {}
-    attr_types = {}
-
-    class _Visitor(ast.NodeVisitor):
-        def __init__(self):
-            self.class_stack = []
-
-        def visit_ClassDef(self, node):
-            name = node.name
-            methods.setdefault(name, set())
-            bases.setdefault(name, [])
-            attr_types.setdefault(name, {})
-            for base in node.bases:
-                if isinstance(base, ast.Name):
-                    bases[name].append(base.id)
-                else:
-                    bases[name].append("<unresolved>")
-            self.class_stack.append(name)
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    methods[name].add(item.name)
-            self.generic_visit(node)
-            self.class_stack.pop()
-
-        def visit_Assign(self, node):
-            if self.class_stack:
-                cls = self.class_stack[-1]
-                for target in node.targets:
-                    if (isinstance(target, ast.Attribute)
-                            and isinstance(target.value, ast.Name)
-                            and target.value.id == "self"
-                            and isinstance(node.value, ast.Call)
-                            and isinstance(node.value.func, ast.Name)):
-                        attr_types[cls][target.attr] = node.value.func.id
-            self.generic_visit(node)
-
-        def visit_AnnAssign(self, node):
-            if (self.class_stack and isinstance(node.target, ast.Attribute)
-                    and isinstance(node.target.value, ast.Name)
-                    and node.target.value.id == "self"
-                    and node.value is not None
-                    and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)):
-                attr_types[self.class_stack[-1]][node.target.attr] = node.value.func.id
-            self.generic_visit(node)
-
-    _Visitor().visit(tree)
-    return methods, bases, attr_types
-
-
-def _collect_undefined_method_calls(tree, class_methods, class_bases, attr_types, file_label):
-    """`self.<attr>.<method>(...)` calls where `<attr>` was assigned a known
-    locally-defined class instance whose class (with no unresolved/unknown
-    base classes, to avoid false-flagging an inherited method we can't see)
-    genuinely has no method by that name — e.g. `self.renderer.draw_score()`
-    when `Renderer` was never given a `draw_score` method."""
-    findings = []
-
-    class _Visitor(ast.NodeVisitor):
-        def __init__(self):
-            self.class_stack = []
-
-        def visit_ClassDef(self, node):
-            self.class_stack.append(node.name)
-            self.generic_visit(node)
-            self.class_stack.pop()
-
-        def visit_Call(self, node):
-            if (self.class_stack and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Attribute)
-                    and isinstance(node.func.value.value, ast.Name)
-                    and node.func.value.value.id == "self"):
-                owner_class = self.class_stack[-1]
-                attr = node.func.value.attr
-                method = node.func.attr
-                target_class = attr_types.get(owner_class, {}).get(attr)
-                if (target_class and target_class in class_methods
-                        and not class_bases.get(target_class)
-                        and method not in class_methods[target_class]):
-                    findings.append({
-                        "file": file_label,
-                        "line": node.lineno,
-                        "call": f"self.{attr}.{method}",
-                        "target_class": target_class,
-                        "reason": f"{target_class} has no method named {method!r}",
-                    })
-            self.generic_visit(node)
-
-    _Visitor().visit(tree)
-    return findings
-
-
-_SED_RANGE_RE = re.compile(
-    r"sed\s+-n\s+['\"](\d+)\s*,\s*(\d+)\s*p['\"]\s+(\S+)")
-
-
-def parse_sed_range_view(cmd):
-    """If `cmd` is (or contains) a `sed -n 'A,Bp' PATH` line-range view, return
-    (path, start, end); otherwise None. Only matches the specific single-range
-    quoted form actually seen in practice — anything fancier (multiple -e
-    ranges, unquoted addresses, `sed -n A,Bp` without quotes) is left
-    untracked rather than mis-parsed."""
-    m = _SED_RANGE_RE.search(cmd or "")
-    if not m:
-        return None
-    start, end = int(m.group(1)), int(m.group(2))
-    if start > end:
-        return None
-    return m.group(3), start, end
-
-
-def count_file_lines(path):
-    """Total line count of a text file, or None if it can't be read. Used to
-    tell a `sed -n 'A,Bp'` range view how much of the file it's actually
-    looking at (e.g. "lines 200-225 of 375 total") — the range alone doesn't
-    say whether that's most of a short file or a sliver of a long one."""
-    try:
-        with open(path, "rb") as handle:
-            return sum(1 for _ in handle)
-    except OSError:
-        return None
-
-
-def note_file_inspection(cache, path_key, mtime, line_range=None):
-    """Record that a file (identified by `path_key`, at `mtime`) had
-    `line_range` (a (start, end) tuple, or None for 'the whole file')
-    inspected, and return a short note if this exact information was
-    already shown earlier in the same session for an unchanged file — or
-    None if this is genuinely new. `cache` is a plain dict the caller owns
-    and passes back in every time (mlxlib keeps no session state of its
-    own — see the module docstring); one shared dict across a session's
-    read_file/run_command calls is what makes the "already seen" check work.
-    This never blocks or withholds the underlying output — callers should
-    append the note (if any) alongside the real result, not use it to skip
-    running the command."""
-    entry = cache.get(path_key)
-    if entry is None or entry["mtime"] != mtime:
-        cache[path_key] = {
-            "mtime": mtime,
-            "ranges": [line_range] if line_range else [],
-            "whole": line_range is None,
-        }
-        return None
-    if entry["whole"]:
-        return "(note: the full contents of this file, unchanged since, were already shown earlier this session)"
-    if line_range is None:
-        entry["whole"] = True
-        return None
-    start, end = line_range
-    for s, e in entry["ranges"]:
-        if s <= start and end <= e:
-            return (f"(note: lines {start}-{end} were already shown in an earlier view of "
-                     f"lines {s}-{e} of this same, unchanged file this session)")
-    entry["ranges"].append((start, end))
-    return None
-
-
-def check_call_signatures(root_dir, skip_dirs=("__pycache__", ".git", "venv",
-                                                 ".venv", "node_modules", "build", "dist")):
-    """Walk every .py file under root_dir, collect every function/method
-    definition and every call site, and report calls whose argument count
-    or keyword names don't match any known definition of that name.
-
-    Also catches a second, more severe bug class: `self.<attr>.<method>()`
-    calls where `<attr>` was assigned an instance of a locally-defined class
-    (via a plain `self.<attr> = ClassName(...)` in the same class) and that
-    class — with no unresolved base classes, to avoid false-flagging an
-    inherited method — genuinely has no method by that name at all. This is
-    what catches code calling `self.renderer.draw_score()` when `Renderer`
-    was never given a `draw_score` method, as opposed to a mere argument
-    mismatch on a method that does exist.
-
-    This is the single-pass version of what a crash-then-patch cycle does
-    one TypeError/AttributeError at a time — it exists to catch a whole
-    class of "call site drifted from the actual code during a refactor"
-    bugs (wrong positional count, a renamed/removed parameter, a method
-    that was never written) in one run instead of one `python main.py`
-    crash per mismatch. It is deliberately conservative: unresolvable call
-    targets (attribute chains on unknown objects, builtins, anything using
-    *args/**kwargs unpacking at the call site, inherited methods on classes
-    with unresolved bases) are skipped rather than guessed at, so a clean
-    report is a real signal, not an artifact of the checker giving up.
-    Best-effort like missing_local_imports — not a substitute for actually
-    running the code.
-
-    Returns a list of dicts, each tagged with "kind":
-      "signature_mismatch": file, line, call, passed_positional,
-        passed_keywords, known_signatures (file:line strings)
-      "undefined_method": file, line, call, target_class, reason
-    Empty list if nothing looks wrong (or nothing was resolvable)."""
-    root = pathlib.Path(root_dir)
-    py_files = [p for p in root.rglob("*.py")
-                if not any(part in skip_dirs for part in p.parts)]
-
-    all_sigs = {}
-    all_methods = {}
-    all_bases = {}
-    all_attr_types = {}
-    parsed = {}
-    for path in py_files:
-        try:
-            tree = ast.parse(path.read_text(errors="replace"))
-        except Exception:
-            continue
-        parsed[path] = tree
-        label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
-        for name, sigs in _collect_signatures(tree, label).items():
-            all_sigs.setdefault(name, []).extend(sigs)
-        methods, bases, attr_types = _collect_class_info(tree)
-        for cls, names in methods.items():
-            all_methods.setdefault(cls, set()).update(names)
-        for cls, base_list in bases.items():
-            all_bases.setdefault(cls, []).extend(base_list)
-        for cls, attrs in attr_types.items():
-            all_attr_types.setdefault(cls, {}).update(attrs)
-
-    findings = []
-    for path, tree in parsed.items():
-        label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
-        for f in _collect_undefined_method_calls(tree, all_methods, all_bases, all_attr_types, label):
-            f["kind"] = "undefined_method"
-            findings.append(f)
-        for name, lineno, n_positional, keyword_names, is_attribute_call in _collect_calls(tree):
-            candidates = all_sigs.get(name)
-            if not candidates:
-                continue  # not a locally-defined function we can verify
-            if is_attribute_call and not any(c.is_method for c in candidates):
-                # `x.name(...)` with zero known method-style definitions of
-                # `name` almost always means `x` is some external object
-                # (subprocess.run, pytest.main, ...) coincidentally sharing a
-                # name with an unrelated local top-level function — not a
-                # call to that local function at all. Skip rather than
-                # false-positive on a name collision the walk can't resolve.
-                continue
-            if any(c.accepts(n_positional, keyword_names) for c in candidates):
-                continue
-            findings.append({
-                "kind": "signature_mismatch",
-                "file": label,
-                "line": lineno,
-                "call": name,
-                "passed_positional": n_positional,
-                "passed_keywords": keyword_names,
-                "known_signatures": [f"{c.file}:{c.line}" for c in candidates],
-            })
-    return findings
-
-
-def format_signature_check_report(findings, target):
-    """Render check_call_signatures' findings as the plain-text report shown
-    to the model — shared by mlxcli and mlxgui so the wording only needs to
-    be maintained once."""
-    if not findings:
-        return (f"No call/signature mismatches found under {target}. "
-                 "(Read-only static check — unresolvable call targets are "
-                 "skipped, so this doesn't guarantee the code runs, only that "
-                 "no locally-defined function is being called with the wrong "
-                 "argument count or an unknown keyword, and no self.<attr>."
-                 "<method>() call targets a method that was never defined.)")
-    lines = [f"Found {len(findings)} issue(s) under {target}:"]
-    for f in findings[:30]:
-        if f.get("kind") == "undefined_method":
-            lines.append(f"  {f['file']}:{f['line']} calls {f['call']}(...) — {f['reason']}")
-        else:
-            kw = f", keywords={f['passed_keywords']}" if f["passed_keywords"] else ""
-            lines.append(
-                f"  {f['file']}:{f['line']} calls {f['call']}({f['passed_positional']} "
-                f"positional{kw}) — known definition(s): {', '.join(f['known_signatures'])}")
-    if len(findings) > 30:
-        lines.append(f"  ... ({len(findings) - 30} more)")
-    return "\n".join(lines)
 
 
 def find_entry_point_candidates(py_paths):
@@ -1218,7 +884,8 @@ def detect_repetition_loop(text):
     return False
 
 
-KNOWN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter")
+KNOWN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
+                     "ssh_run", "ssh_read", "ssh_write", "ha_api", "web_search")
 
 
 def _unique_call_id(prefix):
@@ -1285,6 +952,58 @@ def parse_xml_tag_tool_call(content):
             if args:
                 calls.append({"id": _unique_call_id("xml_call"), "type": "function",
                               "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
+
+
+_TOOL_NAME_ALIASES = {"shell": "run_command", "bash": "run_command", "cmd": "run_command",
+                       "shell_command": "run_command", "exec": "run_command"}
+
+
+def parse_attr_tag_tool_call(content):
+    """Some backends emit a tool call as `<tool_call><function=NAME>
+    <parameter=ARGNAME>value</parameter>...</function></tool_call>` -- the
+    argument name and (for the function tag) the tool name live in the tag's
+    attribute-like suffix after `=`, not as a nested child tag the way
+    parse_xml_tag_tool_call expects. Observed directly from an Ornith
+    backend: `<function=tool_command><parameter=command>...</parameter>
+    <parameter=name>shell</parameter></function>` -- Ornith's own function
+    name (`tool_command`) isn't in KNOWN_TOOL_NAMES at all; the *real*
+    intended tool is named via a `name` parameter inside the call ("shell"),
+    a wrapper convention distinct from every other backend this project has
+    seen. Recognized here via a small alias table rather than silently
+    dropping every one of Ornith's tool-call attempts as unparseable prose."""
+    if not content:
+        return []
+    calls = []
+    for block in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL | re.IGNORECASE):
+        for fm in re.finditer(r"<function=([A-Za-z0-9_]+)>(.*?)</function>", block.group(1),
+                               re.DOTALL | re.IGNORECASE):
+            raw_name, inner = fm.group(1), fm.group(2)
+            args = {}
+            for pm in re.finditer(r"<parameter=([A-Za-z0-9_]+)>\s*(.*?)\s*</parameter>", inner,
+                                   re.DOTALL | re.IGNORECASE):
+                args[pm.group(1)] = pm.group(2).strip()
+            name = raw_name if raw_name in KNOWN_TOOL_NAMES else None
+            if name is None and "name" in args:
+                name = _TOOL_NAME_ALIASES.get(args.pop("name").strip().lower())
+            if name is None:
+                # The model invented the wrapper name directly as the function
+                # tag itself (e.g. <function=bash>) instead of Ornith's usual
+                # <function=tool_command><parameter=name>shell</parameter>...
+                # wrapper -- same alias table, just consulted against the tag
+                # rather than an inner "name" parameter.
+                name = _TOOL_NAME_ALIASES.get(raw_name.strip().lower())
+            if name == "run_command" and ("host" in args or "target" in args):
+                # A remote host/target parameter alongside a shell/bash/cmd-style
+                # name means ssh_run was actually intended -- aliasing to plain
+                # run_command here would silently run the command on this Mac
+                # instead of the named remote host, which is a worse failure
+                # than refusing to parse at all.
+                name = "ssh_run"
+            if name is None:
+                continue  # can't confidently resolve which real tool this was
+            calls.append({"id": _unique_call_id("attr_call"), "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args)}})
     return calls
 
 
@@ -1435,6 +1154,53 @@ def caffeinate_guard():
                 proc.kill()
 
 
+SERVER_BUSY_LOCK_PATH = pathlib.Path.home() / ".omlx" / "mlx_server_busy.lock"
+
+
+@contextlib.contextmanager
+def server_busy_guard():
+    """Hold an OS-level exclusive advisory lock for exactly the duration of
+    an in-flight chat_turn — the real model-server request/response, plus
+    any agentic tool-call retries within that same turn — not the whole
+    mlxcli process. An interactive REPL sitting idle at its prompt holds
+    this for none of that time, only the turns where it's actually waiting
+    on the model server. Anything that only checks "is an mlxcli process
+    still running" (e.g. pgrep) can't distinguish that from a session that
+    will sit open all day; checking this lock instead gets the real signal.
+
+    Exclusive means a second concurrent chat_turn (interactive session and
+    a headless job both firing at once) blocks here instead of both hitting
+    the single-threaded model server at the same time — cleaner than
+    letting them contend at the network layer. flock is released by the
+    kernel the instant this process exits or dies for any reason (including
+    kill -9), so it can never leak stale like a PID-file convention could."""
+    SERVER_BUSY_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(SERVER_BUSY_LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def server_busy():
+    """Non-blocking check: is some chat_turn currently holding the lock?
+    Used by external tooling (e.g. a job queue) that wants to know whether
+    the model server is actually in use right now, not just whether an
+    mlxcli process happens to still be open."""
+    SERVER_BUSY_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(SERVER_BUSY_LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        lock_file.close()
+
+
 # Conventional filenames checked (in order) for project-local instructions —
 # lets a user persist project-specific guidance ("write directly to this path,
 # don't stage in Downloads first") once, instead of repeating it every prompt.
@@ -1445,17 +1211,11 @@ def suggest_better_backend(backend, text):
     """Return a short suggestion if the current backend is known — from this
     project's own direct testing, not speculation — to be unreliable for the
     kind of request about to be sent, or None if nothing applies. Deliberately
-    narrow and evidence-based: a topic-based "this model is better for X"
-    router isn't something we have real grounds to build, but "Gemma's
-    tool-call decoder reliably fails on this server for agentic requests" is a
-    confirmed, reproduced finding, not a guess. This never switches anything
-    automatically — local model switches cost real time (stopping one server,
-    loading another), so the choice stays with the user; this only surfaces
-    the suggestion at the moment it'd actually matter."""
-    if backend == "turbofieldfare" and requires_agentic_execution(text):
-        return ("Gemma has shown unreliable tool-calling on this local server for agentic "
-                "requests (confirmed: tool-call parsing failures during testing). "
-                "Consider /backend turbofieldfare-qwen for this one.")
+    narrow and evidence-based, not a topic-based "this model is better for X"
+    router. No cases currently apply: the previous one (Gemma's unreliable
+    tool-calling on this server) no longer applies now that the Gemma backend
+    has been removed. Kept as a hook for future evidence-based findings rather
+    than deleted outright."""
     return None
 
 

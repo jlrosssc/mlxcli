@@ -32,7 +32,7 @@ try:
 except ImportError:
     psutil = None
 from mlxlib import (
-    compute_repo_update_status,
+    compute_repo_update_status, compute_model_update_status,
     load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, SERVER_MAX_CONTEXT_TOKENS,
     CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
@@ -41,20 +41,20 @@ from mlxlib import (
     execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
     resolve_output_path, normalize_tool_name as gui_normalize_tool_name,
     infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
-    python_syntax_error, missing_local_imports, check_call_signatures, format_signature_check_report,
-    parse_sed_range_view, note_file_inspection, count_file_lines,
+    python_syntax_error, missing_local_imports,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop as gui_detect_repetition_loop,
     parse_bare_json_tool_call as gui_parse_bare_json_tool_call,
     parse_xml_tag_tool_call as gui_parse_xml_tag_tool_call,
     parse_python_call_tool_call as gui_parse_python_call_tool_call,
+    parse_attr_tag_tool_call as gui_parse_attr_tag_tool_call,
     DEFAULT_REPETITION_PENALTY, _unique_call_id as gui_unique_call_id,
     suggest_better_backend as gui_suggest_better_backend,
     load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
     caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
-    rag_remote_config, rag_remote_search,
+    rag_remote_config, rag_remote_search, web_search,
 )
 
 
@@ -65,14 +65,14 @@ SESSIONS_DIR = pathlib.Path.home() / ".omlx" / "sessions"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
 MODELS_ROOT = pathlib.Path.home() / "Models"
-TURBO_ROOT = MODELS_ROOT / "turbo-fieldfare"
-TURBO_SERVER_BIN = TURBO_ROOT / ".build" / "release" / "TurboFieldfareServer"
-TURBO_MODEL_DIR = TURBO_ROOT / "scratch" / "gemma4.gturbo"
-TURBO_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-server.log"
-TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-qwen"
-TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TurboFieldfareServer"
+TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-nvmai"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "NVMAIServer"
 TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
 TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
+# Ornith 1.5 shares the same NVMAI repo/binary as Qwen -- same install, just a
+# different repacked model file and port, so it can run side by side.
+TURBO_ORNITH_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "ornith15.gturbo"
+TURBO_ORNITH_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-ornith-server.log"
 TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
 MLXGUI_ICON_PATH = pathlib.Path(__file__).resolve().parent / "mlxgui_icon.png"
 RESOURCE_REFRESH_MS = 5000
@@ -87,7 +87,7 @@ RAG_CACHE_INDEX = "index.json"
 URL_MAX_FETCHES = 2
 URL_MAX_CHARS = 12000
 CONVERT_MODES = ("auto", "all", "off")
-SUPPORTED_BACKENDS = ("omlx", "turbofieldfare", "turbofieldfare-qwen")
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare-qwen", "turbofieldfare-ornith")
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac.\n"
     "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
@@ -108,6 +108,8 @@ DEFAULT_SYSTEM = (
     "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
     f"Save created files in {load_default_dir()} unless the user gives another path.\n"
     "For local file tasks, use the available tools and never claim a file was created, run, inspected, verified, or shared without tool evidence.\n"
+    "web_search reaches the open internet, unlike every other tool here, and always requires the user to approve it live, every call. "
+    "Only use it when the request actually needs current, external, or general-internet information that no local tool or your own knowledge can answer -- never call it by default, proactively, or to double-check a routine question.\n"
     "Ground-truth check: for any task involving calculation, physical/scientific data, or a numeric result that "
     "has a real correct answer, derive expected reference values from known facts first, then check your output "
     "against them with a tool before declaring the task complete. Running cleanly and being correct are different "
@@ -153,7 +155,10 @@ PRESET_SYSTEMS = {
 }
 CODE_REQUEST_SYSTEM = (
     "This turn is a code/script request. Do not include hidden reasoning, planning, or analysis. "
-    "Start with the final code block. After the code, include only requested output or one short usage note. "
+    "Start with the final code block, shown directly in this response — this applies even if you also "
+    "write the code to a file and/or run it as part of an agentic tool sequence; showing the code in the "
+    "response and using tools to save/execute it are both required, not alternatives to each other. "
+    "After the code, include only requested output or one short usage note. "
     "If the user asks to list generated values, list them after the code without explaining your process."
 )
 RAG_USE_SYSTEM = (
@@ -202,22 +207,22 @@ def save_backend(backend):
 
 
 def is_turbo_backend(backend):
-    return backend in ("turbofieldfare", "turbofieldfare-qwen")
+    return backend in ("turbofieldfare-qwen", "turbofieldfare-ornith")
 
 
 def backend_label(backend):
     return {
         "omlx": "oMLX",
-        "turbofieldfare": "TurboFieldfare (Gemma 4)",
         "turbofieldfare-qwen": "TurboFieldfare Qwen (Qwen 3.6)",
+        "turbofieldfare-ornith": "TurboFieldfare Ornith (Ornith 1.5)",
     }.get(backend, backend)
 
 
 def backend_description(backend):
     return {
         "omlx": "General / Flexible",
-        "turbofieldfare": "Gemma 4 / General",
         "turbofieldfare-qwen": "Qwen 3.6 / Coding",
+        "turbofieldfare-ornith": "Ornith 1.5 / Coding",
     }.get(backend, "")
 
 
@@ -230,13 +235,13 @@ def backend_paths(backend):
             "log": TURBO_QWEN_SERVER_LOG,
             "url": "http://127.0.0.1:8081",
         }
-    if backend == "turbofieldfare":
+    if backend == "turbofieldfare-ornith":
         return {
-            "root": TURBO_ROOT,
-            "server_bin": TURBO_SERVER_BIN,
-            "model_dir": TURBO_MODEL_DIR,
-            "log": TURBO_SERVER_LOG,
-            "url": "http://127.0.0.1:8080",
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_ORNITH_MODEL_DIR,
+            "log": TURBO_ORNITH_SERVER_LOG,
+            "url": "http://127.0.0.1:8083",
         }
     return {}
 
@@ -247,10 +252,11 @@ def load_backend_cfg(backend):
         url, key = load_cfg()
         return url, key
     paths = backend_paths(backend)
-    return os.environ.get(
-        "TURBOFIELDFARE_QWEN_URL" if backend == "turbofieldfare-qwen" else "TURBOFIELDFARE_URL",
-        paths["url"],
-    ), os.environ.get("TURBOFIELDFARE_API_KEY", "")
+    env_var = {
+        "turbofieldfare-qwen": "TURBOFIELDFARE_QWEN_URL",
+        "turbofieldfare-ornith": "TURBOFIELDFARE_ORNITH_URL",
+    }.get(backend, "TURBOFIELDFARE_URL")
+    return os.environ.get(env_var, paths["url"]), os.environ.get("TURBOFIELDFARE_API_KEY", "")
 
 
 def load_system_prompt():
@@ -335,17 +341,19 @@ def stop_turbo(backend):
 
 
 def stop_other_backend(target_backend, status):
+    # Qwen and Ornith run on different ports and could technically coexist,
+    # but both are ~35B models -- keeping only one loaded at a time avoids
+    # doubling resident RAM for no benefit, so switching to either one stops
+    # the other, same as it stops oMLX.
     if target_backend == "omlx":
-        stopped = stop_turbo("turbofieldfare") or stop_turbo("turbofieldfare-qwen")
-        status("Stopped TurboFieldfare" if stopped else "TurboFieldfare was not running")
-    elif target_backend == "turbofieldfare":
-        stopped_omlx = stop_omlx()
         stopped_qwen = stop_turbo("turbofieldfare-qwen")
-        status("Stopped oMLX and Turbo Qwen" if stopped_omlx or stopped_qwen else "Other backends were not running")
+        stopped_ornith = stop_turbo("turbofieldfare-ornith")
+        status("Stopped TurboFieldfare" if stopped_qwen or stopped_ornith else "TurboFieldfare was not running")
     else:
         stopped_omlx = stop_omlx()
-        stopped_gemma = stop_turbo("turbofieldfare")
-        status("Stopped oMLX and Turbo Gemma" if stopped_omlx or stopped_gemma else "Other backends were not running")
+        status("Stopped oMLX" if stopped_omlx else "oMLX was not running")
+        other = "turbofieldfare-ornith" if target_backend == "turbofieldfare-qwen" else "turbofieldfare-qwen"
+        stop_turbo(other)
 
 
 def ensure_turbo_status_app():
@@ -376,11 +384,13 @@ def ensure_server(backend, url, key, status):
         log_handle.flush()
         launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
              "--max-context", str(SERVER_MAX_CONTEXT_TOKENS)]
-        if backend == "turbofieldfare-qwen":
-            # Benchmarked +1-11% decode speed (community benchmark protocol, all 3
-            # cases, confirmed at --max-context 32768 with no instability) from
-            # keeping more MoE experts resident instead of re-fetching from disk.
-            launch_args += ["--expert-cache-slots", "32", "--rdadvise", "default"]
+        if backend in ("turbofieldfare-qwen", "turbofieldfare-ornith"):
+            # Switched to the NVMAI fork (2026-08-23): ~3x measured decode speedup
+            # over the old TurboFieldfareServer build. --rdadvise doesn't exist in
+            # NVMAIServer's argument parser (unlike the old server) so it's dropped
+            # here; --expert-cache-slots is still supported and kept. Ornith shares
+            # the same MoE/expert-cache architecture as Qwen here.
+            launch_args += ["--expert-cache-slots", "32"]
         subprocess.Popen(
             launch_args,
             cwd=paths["root"], stdout=log_handle, stderr=log_handle,
@@ -680,8 +690,10 @@ def request_messages_for_turn(messages, user_text):
     if not is_code_request(user_text):
         return messages
     scoped = list(messages)
-    insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
-    scoped.insert(insert_at, {"role": "system", "content": CODE_REQUEST_SYSTEM})
+    if scoped and scoped[0].get("role") == "system":
+        scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + CODE_REQUEST_SYSTEM}
+    else:
+        scoped.insert(0, {"role": "system", "content": CODE_REQUEST_SYSTEM})
     return scoped
 
 
@@ -922,9 +934,11 @@ def request_messages_with_context(messages, user_text, rag_folder):
                     label = f"{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}"
                     used.append(label)
                     lines.append(f"\n[{label}]\n{result.get('content', '')}")
-                insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
-                scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
-                scoped.insert(insert_at + 1, {"role": "system", "content": "\n".join(lines)})
+                extra = RAG_USE_SYSTEM + "\n\n" + "\n".join(lines)
+                if scoped and scoped[0].get("role") == "system":
+                    scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + extra}
+                else:
+                    scoped.insert(0, {"role": "system", "content": extra})
                 statuses.append(f"Remote RAG used {len(results)} excerpt(s) from {', '.join(used)}")
             else:
                 statuses.append(f"Remote RAG returned no matches ({remote_collection or 'all collections'})")
@@ -951,9 +965,6 @@ def request_messages_with_context(messages, user_text, rag_folder):
             for _score, label, chunk_text in matches:
                 used_labels.append(label)
                 content_lines.append(f"\n[{label}]\n{chunk_text}")
-            insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
-            scoped.insert(insert_at, {"role": "system", "content": RAG_USE_SYSTEM})
-            insert_at += 1
             content_lines.append(
                 "\nTreat the represented files above as the available documents for this turn. "
                 "Use the provided excerpts to compare the source files that are represented here. "
@@ -962,7 +973,11 @@ def request_messages_with_context(messages, user_text, rag_folder):
                 "If some files are represented only partially, still analyze and rank the represented set rather than asking "
                 "the user to paste the resumes again."
             )
-            scoped.insert(insert_at, {"role": "system", "content": "\n".join(content_lines)})
+            extra = RAG_USE_SYSTEM + "\n\n" + "\n".join(content_lines)
+            if scoped and scoped[0].get("role") == "system":
+                scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + extra}
+            else:
+                scoped.insert(0, {"role": "system", "content": extra})
             failed_note = ""
             if context["failed"]:
                 failed_names = ", ".join(item.split(":", 1)[0] for item in context["failed"][:6])
@@ -990,9 +1005,11 @@ def request_messages_with_context(messages, user_text, rag_folder):
                 content_lines.append(
                     f"\n[URL]\nTitle: {item['title']}\nURL: {item['url']}\nContent-Type: {item['content_type']}\nExcerpt:\n{item['text']}"
                 )
-            insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
-            scoped.insert(insert_at, {"role": "system", "content": URL_USE_SYSTEM})
-            scoped.insert(insert_at + 1, {"role": "system", "content": "\n".join(content_lines)})
+            extra = URL_USE_SYSTEM + "\n\n" + "\n".join(content_lines)
+            if scoped and scoped[0].get("role") == "system":
+                scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + extra}
+            else:
+                scoped.insert(0, {"role": "system", "content": extra})
             statuses.append(
                 f"Fetched {len(fetched)} URL(s): {', '.join(item['title'] for item in fetched)}"
             )
@@ -1399,15 +1416,12 @@ class MlxGui(tk.Tk):
         self.system_prompt = load_system_prompt()
         self.gui_defaults = load_gui_defaults()
         self.messages = [{"role": "system", "content": self.system_prompt}]
-        # Session-scoped record of which file/line-ranges have already been
-        # shown via read_file or a sed range view — see mlxlib.note_file_inspection.
-        self._inspection_cache = {}
         notes_path, notes_text = find_project_notes()
         if notes_text:
-            self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
         artifact_note = last_artifact_system_note()
         if artifact_note:
-            self.messages.append({"role": "system", "content": artifact_note})
+            self.messages[0]["content"] += f"\n\n{artifact_note}"
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.events = queue.Queue()
@@ -1426,6 +1440,7 @@ class MlxGui(tk.Tk):
         self.last_user_text = ""
         self.current_stream_start = None
         self.current_stream_end = None
+        self.turn_start_time = None
         self.working_started_at = None
         self.working_after = None
         self.resource_after = None
@@ -1439,6 +1454,10 @@ class MlxGui(tk.Tk):
         self.start_resource_refresh()
         self.after(60, self.drain_events)
         self.after(300, lambda: self.check_repo_updates_async(TURBO_QWEN_ROOT, "Qwen fork", silent=True))
+        self.after(300, lambda: self.check_model_updates_async(
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            pathlib.Path.home() / ".omlx" / "model_update_cache.json",
+            "Qwen 3.6 35B-A3B", silent=True))
 
     def build_ui(self):
         self.build_menu()
@@ -1645,6 +1664,12 @@ class MlxGui(tk.Tk):
             foreground="#d9822b", cursor="hand2",
         )
         self.repo_update_label.bind("<Button-1>", self.show_repo_update_details)
+        self.model_update_var = tk.StringVar(value="")
+        self.model_update_label = ttk.Label(
+            title_row, textvariable=self.model_update_var,
+            foreground="#d9822b", cursor="hand2",
+        )
+        self.model_update_label.bind("<Button-1>", self.show_model_update_details)
         self.update_hero_subtitle()
 
     def update_hero_subtitle(self):
@@ -1656,6 +1681,31 @@ class MlxGui(tk.Tk):
             self.events.put(("repo_updates", label, info, silent))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def check_model_updates_async(self, repo_id, cache_path, label, silent=True):
+        def worker():
+            info = compute_model_update_status(repo_id, cache_path)
+            self.events.put(("model_updates", label, info, silent))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_model_update_indicator(self, label, info):
+        lines = [
+            f"Upstream model {label} ({info['repo_id']}) has changed:",
+            f"  new revision {info['new_sha'][:10]} (was {info['previous_sha'][:10]})",
+            f"  last modified {info['last_modified']}",
+            "\nThis only checks Hugging Face repo metadata — nothing is "
+            "downloaded, converted, or applied automatically. Re-run the "
+            "conversion pipeline manually if you want to pick up the change.",
+        ]
+        self.model_update_var.set(f"⬆ Model update: {label}")
+        self.model_update_label.pack(side="left", padx=(10, 0))
+        self.model_update_details = "\n".join(lines)
+
+    def show_model_update_details(self, _event=None):
+        details = getattr(self, "model_update_details", None)
+        if details:
+            messagebox.showinfo("Model update available", details, parent=self)
 
     def show_repo_update_indicator(self, label, info):
         lines = [f"{label} ({info['branch']}) has updates available:"]
@@ -2454,22 +2504,7 @@ class MlxGui(tk.Tk):
                 proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=180, cwd=cwd)
                 output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
                 location = f"\nworking_directory={cwd}" if cwd else ""
-                result = f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
-                sed_view = parse_sed_range_view(command)
-                if sed_view:
-                    sed_path, start, end = sed_view
-                    try:
-                        resolved = (pathlib.Path(cwd) / sed_path if cwd else pathlib.Path(sed_path)).expanduser()
-                        mtime = resolved.stat().st_mtime
-                        total_lines = count_file_lines(resolved)
-                        if total_lines is not None:
-                            result += f"\n(showing lines {start}-{end} of {total_lines} total lines in this file)"
-                        note = note_file_inspection(self._inspection_cache, str(resolved.resolve()), mtime, (start, end))
-                        if note:
-                            result += f"\n{note}"
-                    except OSError:
-                        pass
-                return result
+                return f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
             except subprocess.TimeoutExpired:
                 return "Command timed out."
         if name == "python_interpreter":
@@ -2491,15 +2526,7 @@ class MlxGui(tk.Tk):
                         f"Use run_command with 'ls' or 'find' to see its contents.")
             try:
                 text = path.read_text(errors="replace")
-                result = text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
-                try:
-                    mtime = path.stat().st_mtime
-                    already = note_file_inspection(self._inspection_cache, str(path.resolve()), mtime, None)
-                    if already:
-                        result += f"\n{already}"
-                except OSError:
-                    pass
-                return result
+                return text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
             except Exception as exc:
                 return f"Error: {exc}"
         if name == "write_file":
@@ -2550,19 +2577,28 @@ class MlxGui(tk.Tk):
                 return result
             except Exception as exc:
                 return f"Error: {exc}"
-        if name == "check_call_signatures":
-            path = args.get("path", "")
+        if name == "web_search":
+            query = args.get("query", "")
+            max_results = args.get("max_results", 5)
+            if not str(query).strip():
+                return "Error: web_search needs a non-empty 'query'."
+            # Every tool call in this GUI already goes through
+            # request_tool_approval with no "always allow" shortcut, so this
+            # already never runs without the user seeing and confirming it
+            # first -- unlike every other tool here, this one leaves the
+            # user's own machines/services and reaches the open internet.
+            if not self.request_tool_approval(f"Web search:\n{query}\n(up to {max_results} results)"):
+                return "User declined."
             try:
-                target = pathlib.Path(path).expanduser()
+                results = web_search(query, max_results=max_results)
             except Exception as exc:
-                return f"Error: {exc}"
-            if not target.exists():
-                return f"Error: {target} does not exist."
-            try:
-                findings = check_call_signatures(target)
-            except Exception as exc:
-                return f"Error scanning {target}: {exc}"
-            return format_signature_check_report(findings, target)
+                return f"Error running web_search: {exc}"
+            if not results:
+                return f"[web_search: {query!r}] No results."
+            lines = [f"[web_search: {query!r}] {len(results)} result(s):"]
+            for i, r in enumerate(results, 1):
+                lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
+            return "\n".join(lines)[:MAX_FILE_CHARS]
         return f"Unknown tool: {name}"
 
     def finish_canceled_response(self, partial_text):
@@ -3070,10 +3106,10 @@ class MlxGui(tk.Tk):
         self.messages = [{"role": "system", "content": self.system_prompt}]
         notes_path, notes_text = find_project_notes()
         if notes_text:
-            self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
         artifact_note = last_artifact_system_note()
         if artifact_note:
-            self.messages.append({"role": "system", "content": artifact_note})
+            self.messages[0]["content"] += f"\n\n{artifact_note}"
         self.totals = {"in": 0, "out": 0}
         self.last_turn_tokens = {"in": 0, "out": 0}
         self.last_user_text = ""
@@ -3137,6 +3173,7 @@ class MlxGui(tk.Tk):
         self.append_tagged("Assistant\n", "assistant_label")
         self.current_stream_start = self.chat.index("end-1c")
         self.current_stream_end = self.current_stream_start
+        self.turn_start_time = time.time()
         self.busy = True
         self.send_button.configure(state="disabled")
         self.start_working("Waiting for model response")
@@ -3172,12 +3209,16 @@ class MlxGui(tk.Tk):
         retried_with_tools = False
         repetition_streak = 0
         if agentic:
-            working_messages.insert(1, {"role": "system", "content": (
+            agentic_note = (
                 "Agentic local-resource task: use tools for all file reads, writes, commands, and verification. "
                 "Do not simulate tool calls or claim completion without successful tool results and exact path evidence. "
                 "Do not repeat identical tool calls after a successful result; reuse the returned evidence, and preserve stronger existing file validation. write_file always shows the user a preview and asks for approval before an existing file is changed, so call it directly rather than staging a copy elsewhere first. "
                 "write_file creates parent directories, so do not issue a separate mkdir unless it is actually required."
-            )})
+            )
+            if working_messages and working_messages[0].get("role") == "system":
+                working_messages[0] = {"role": "system", "content": working_messages[0]["content"] + "\n\n" + agentic_note}
+            else:
+                working_messages.insert(0, {"role": "system", "content": agentic_note})
         effective_agentic = agentic
         model_settings = load_model_settings(self.backend)
         for _step in range(MAX_TOOL_STEPS):
@@ -3190,8 +3231,17 @@ class MlxGui(tk.Tk):
                 "top_k": model_settings["top_k"],
                 "repetition_penalty": model_settings["repetition_penalty"],
             }
-            if effective_agentic:
-                payload["tools"] = TOOLS
+            # Tools are always offered, regardless of effective_agentic --
+            # effective_agentic still controls the extra "Agentic local-resource
+            # task" system note below, but gating the tools array itself on a
+            # keyword heuristic made every tool, including web_search,
+            # unreachable for any request that heuristic didn't recognize (a
+            # plain factual question has no reason to mention "file" or
+            # "script", so it never would have qualified) -- the model's own
+            # judgment plus each tool's description and the system prompt's
+            # usage rules are what should gate whether a given tool actually
+            # gets called, not whether it's offered.
+            payload["tools"] = TOOLS
             parts, calls, usage = [], {}, {}
             stream_error = None
             repetition_detected = False
@@ -3282,22 +3332,32 @@ class MlxGui(tk.Tk):
                            "function": {"name": slot["name"], "arguments": slot["arguments"]}}
                           for index, slot in sorted(calls.items())]
             content = "".join(parts)
-            if not tool_calls and effective_agentic:
+            # These fallback parsers used to be gated on effective_agentic too,
+            # back when tools were only sometimes offered -- now that tools are
+            # always in the payload (see above), a model can attempt a
+            # non-standard-format tool call on any turn, so these need to run
+            # unconditionally too, matching mlxcli's already-unconditional
+            # equivalent (mlxcli never gated these on agentic_mode).
+            if not tool_calls:
                 tool_calls = parse_gui_text_tool_calls(content)
                 if tool_calls:
                     self.events.put(("status", "Compatibility text tool call parsed"))
-            if not tool_calls and effective_agentic:
+            if not tool_calls:
                 tool_calls = gui_parse_bare_json_tool_call(content)
                 if tool_calls:
                     self.events.put(("status", "Compatibility bare-JSON tool call parsed"))
-            if not tool_calls and effective_agentic:
+            if not tool_calls:
                 tool_calls = gui_parse_xml_tag_tool_call(content)
                 if tool_calls:
                     self.events.put(("status", "Compatibility XML-tag tool call parsed"))
-            if not tool_calls and effective_agentic:
+            if not tool_calls:
                 tool_calls = gui_parse_python_call_tool_call(content)
                 if tool_calls:
                     self.events.put(("status", "Compatibility Python-call-style tool call parsed"))
+            if not tool_calls:
+                tool_calls = gui_parse_attr_tag_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility attribute-tag-style tool call parsed"))
             if not tool_calls:
                 if execution_required and _step == 0:
                     # The model answered with prose and never attempted a tool
@@ -3428,6 +3488,14 @@ class MlxGui(tk.Tk):
                             self.show_repo_update_details()
                     elif not silent:
                         self.status_var.set(f"{label}: no updates found")
+                elif kind == "model_updates":
+                    _kind, label, info, silent = event
+                    if info:
+                        self.show_model_update_indicator(label, info)
+                        if not silent:
+                            self.show_model_update_details()
+                    elif not silent:
+                        self.status_var.set(f"{label}: no model updates found")
                 elif kind == "models":
                     models = event[1]
                     labels = [model_label(model) for model in models]
@@ -3449,6 +3517,9 @@ class MlxGui(tk.Tk):
                             except Exception as exc:
                                 self.append(f"\n[could not save Word document: {exc}]\n")
                     in_tokens, out_tokens = usage_counts(usage)
+                    elapsed = (time.time() - self.turn_start_time) if self.turn_start_time else None
+                    rate = f" / {out_tokens / elapsed:.1f} tok/s" if elapsed and elapsed > 0 and out_tokens > 0 else ""
+                    self.turn_start_time = None
                     self.last_turn_tokens = {"in": in_tokens, "out": out_tokens}
                     self.totals["in"] += in_tokens
                     self.totals["out"] += out_tokens
@@ -3457,7 +3528,7 @@ class MlxGui(tk.Tk):
                     )
                     self.update_resource_indicator()
                     self.update_memory_indicator()
-                    self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}")
+                    self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}{rate}")
                     self.busy = False
                     self.stop_working()
                     self.send_button.configure(state="normal")
