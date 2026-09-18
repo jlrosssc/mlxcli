@@ -41,7 +41,8 @@ from mlxlib import (
     execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
     resolve_output_path, normalize_tool_name as gui_normalize_tool_name,
     infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
-    python_syntax_error, missing_local_imports,
+    python_syntax_error, missing_local_imports, check_call_signatures, format_signature_check_report,
+    parse_sed_range_view, note_file_inspection, count_file_lines,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop as gui_detect_repetition_loop,
     parse_bare_json_tool_call as gui_parse_bare_json_tool_call,
@@ -1398,6 +1399,9 @@ class MlxGui(tk.Tk):
         self.system_prompt = load_system_prompt()
         self.gui_defaults = load_gui_defaults()
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        # Session-scoped record of which file/line-ranges have already been
+        # shown via read_file or a sed range view — see mlxlib.note_file_inspection.
+        self._inspection_cache = {}
         notes_path, notes_text = find_project_notes()
         if notes_text:
             self.messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
@@ -2450,7 +2454,22 @@ class MlxGui(tk.Tk):
                 proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=180, cwd=cwd)
                 output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
                 location = f"\nworking_directory={cwd}" if cwd else ""
-                return f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
+                result = f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
+                sed_view = parse_sed_range_view(command)
+                if sed_view:
+                    sed_path, start, end = sed_view
+                    try:
+                        resolved = (pathlib.Path(cwd) / sed_path if cwd else pathlib.Path(sed_path)).expanduser()
+                        mtime = resolved.stat().st_mtime
+                        total_lines = count_file_lines(resolved)
+                        if total_lines is not None:
+                            result += f"\n(showing lines {start}-{end} of {total_lines} total lines in this file)"
+                        note = note_file_inspection(self._inspection_cache, str(resolved.resolve()), mtime, (start, end))
+                        if note:
+                            result += f"\n{note}"
+                    except OSError:
+                        pass
+                return result
             except subprocess.TimeoutExpired:
                 return "Command timed out."
         if name == "python_interpreter":
@@ -2472,7 +2491,15 @@ class MlxGui(tk.Tk):
                         f"Use run_command with 'ls' or 'find' to see its contents.")
             try:
                 text = path.read_text(errors="replace")
-                return text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
+                result = text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
+                try:
+                    mtime = path.stat().st_mtime
+                    already = note_file_inspection(self._inspection_cache, str(path.resolve()), mtime, None)
+                    if already:
+                        result += f"\n{already}"
+                except OSError:
+                    pass
+                return result
             except Exception as exc:
                 return f"Error: {exc}"
         if name == "write_file":
@@ -2523,6 +2550,19 @@ class MlxGui(tk.Tk):
                 return result
             except Exception as exc:
                 return f"Error: {exc}"
+        if name == "check_call_signatures":
+            path = args.get("path", "")
+            try:
+                target = pathlib.Path(path).expanduser()
+            except Exception as exc:
+                return f"Error: {exc}"
+            if not target.exists():
+                return f"Error: {target} does not exist."
+            try:
+                findings = check_call_signatures(target)
+            except Exception as exc:
+                return f"Error scanning {target}: {exc}"
+            return format_signature_check_report(findings, target)
         return f"Unknown tool: {name}"
 
     def finish_canceled_response(self, partial_text):

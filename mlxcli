@@ -35,10 +35,21 @@ Usage:
                              gets caught here. On a full pass, if --verify was a plain
                              "runner script" form (e.g. "bash check.sh"), that script is
                              archived into DIR so it joins the suite for the next step.
+  mlxcli --transcript URL   fetch a YouTube video's transcript and summarize it into key
+                             bullet points, then exit (no REPL). Thin wrapper around
+                             yt_summarize.py in the default directory — delegates to it
+                             rather than duplicating its logic here.
+  mlxcli --run "task" --no-agentic
+                             force a plain-completion turn regardless of the usual
+                             action/target keyword heuristic — for callers piping large
+                             arbitrary text (a transcript, a pasted document) into --run
+                             for summarization, where that heuristic false-positives on
+                             ordinary words in the pasted text and wrongly grants tool
+                             access the task never needed.
 
 Commands:
-  /paste <file>  /review <file-or-folder> [glob]  /read <file>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
-  /convert  /model  /models  /resources  /mem  /tokens  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
+  /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
+  /convert  /model  /models  /resources  /mem  /tokens  /hosts  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
 """
 import atexit
 import copy
@@ -71,7 +82,7 @@ try:
 except ImportError:
     formatted_markdown_to_docx = None
 from mlxlib import (
-    compute_repo_update_status,
+    compute_repo_update_status, compute_model_update_status,
     load_default_dir, save_default_dir, DEFAULT_DIR_CONFIG_PATH,
     MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, SERVER_MAX_CONTEXT_TOKENS,
@@ -83,15 +94,15 @@ from mlxlib import (
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
     detect_repetition_loop, parse_bare_json_tool_call, parse_xml_tag_tool_call,
-    parse_python_call_tool_call, DEFAULT_REPETITION_PENALTY,
+    parse_python_call_tool_call, parse_attr_tag_tool_call, DEFAULT_REPETITION_PENALTY,
     _unique_call_id, suggest_better_backend,
     load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
-    caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
+    caffeinate_guard, server_busy_guard, log_error, tail_error_log, ERROR_LOG_PATH,
     rag_remote_config, rag_remote_request, rag_remote_search, rag_remote_list,
     rag_remote_upload, rag_remote_update, rag_remote_delete, rag_remote_collections,
-    rag_remote_get_document, esv_passage,
+    rag_remote_get_document, esv_passage, web_search,
 )
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
@@ -99,20 +110,40 @@ SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
 BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MODELS_ROOT = pathlib.Path.home() / "Models"
-TURBO_ROOT = MODELS_ROOT / "turbo-fieldfare"
-TURBO_SERVER_BIN = TURBO_ROOT / ".build" / "release" / "TurboFieldfareServer"
-TURBO_MODEL_DIR = TURBO_ROOT / "scratch" / "gemma4.gturbo"
-TURBO_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-server.log"
-TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-qwen"
-TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TurboFieldfareServer"
+TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-nvmai"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "NVMAIServer"
 TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
 TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
+# Ornith 1.5 shares the same NVMAI repo/binary as Qwen -- same install, just a
+# different repacked model file and port, so it can run side by side.
+TURBO_ORNITH_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "ornith15.gturbo"
+TURBO_ORNITH_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-ornith-server.log"
 TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
 MAX_LOADED_CONTEXT_CHARS = 28000
 MAX_BATCH_RESUME_CHARS = 22000
 SSH_PASSWORD_CACHE = {}
 CONVERT_MODES = {"auto", "all", "off"}
 READLINE_HISTORY_PATH = pathlib.Path.home() / ".omlx" / "mlxcli_history"
+
+HOST_ALIASES_PATH = pathlib.Path.home() / ".omlx" / "host_aliases.json"
+_HOST_ALIASES_CACHE = None
+
+
+def load_host_aliases():
+    """Non-secret connection metadata for named hosts (dad/hross/unity/...),
+    keyed by lowercase alias. Actual credentials live in the macOS Keychain,
+    never in this file — see keychain_get() further down. Cached after first
+    read since it's read on every tool call that might use an alias, and
+    once here too, to list known aliases in the system prompt below."""
+    global _HOST_ALIASES_CACHE
+    if _HOST_ALIASES_CACHE is not None:
+        return _HOST_ALIASES_CACHE
+    try:
+        _HOST_ALIASES_CACHE = json.loads(HOST_ALIASES_PATH.read_text())
+    except Exception:
+        _HOST_ALIASES_CACHE = {}
+    return _HOST_ALIASES_CACHE
+
 
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac.\n"
@@ -140,6 +171,56 @@ DEFAULT_SYSTEM = (
     f"Save created files in {load_default_dir()} unless the user gives another path.\n"
     "Execution contract: if the user asks you to create, write, run, test, export, verify, or share local files, you MUST use the available tools. "
     "Never simulate tool output or claim that files were created, executed, inspected, verified, or shared based only on your response. "
+    "Never end a turn on only a statement of intent (\"I'll check...\", \"Let me query...\", \"I will look into...\") with no "
+    "actual tool call attached to that same response — a sentence announcing what you're about to do is not progress by itself "
+    "and leaves the task exactly as undone as never answering. If a request needs a tool call, the tool call itself must be "
+    "part of this response, not a promise to make one next. For a request naming several targets (e.g. multiple hosts), call "
+    "the tool for the first target now rather than describing the plan for all of them; later turns will cover the rest.\n"
+    "If the user asks you to log into, connect to, or run something on another device on their network (a router, server, camera, or similar), "
+    "use ssh_run (or ssh_read/ssh_write) now — do not decline by claiming no network access or no credentials-handling capability. "
+    "These tools exist specifically for this, run inside a sandbox with full LAN and internet connectivity, and the user's own message "
+    "typically already contains the host and login details you need to call them.\n"
+    + (f"Saved host aliases — do not ask the user for an address, username, or password for these; "
+       f"the address and credentials are already resolved automatically from local storage. Each is a "
+       f"REMOTE machine, reached only via the mechanism listed for it below — never reinterpret an alias "
+       f"name as a local path, a local username, or run it through run_command/python_interpreter "
+       f"against this Mac or its sandbox instead; a command run locally when an alias was named answers "
+       f"a different question than the one asked, even if it returns real-looking output:\n"
+       + "\n".join(
+           f"  - \"{alias_name}\": " + (
+               f"ha_api only — this alias has no SSH access at all; ssh_run/ssh_read/ssh_write will hang "
+               f"on a password prompt with no valid password, do not attempt them"
+               if entry.get("type") == "ha_api" else
+               f"ssh_run/ssh_read/ssh_write" + (", or ha_api for its Home Assistant instance"
+                                                 if entry.get("ha_api") else "")
+               if entry.get("type") == "ssh" else "unknown"
+           )
+           for alias_name, entry in sorted(load_host_aliases().items())
+       ) + "\n"
+       if load_host_aliases() else "") +
+    "The output of every ssh_run/ssh_read/ssh_write/ha_api call is automatically marked, inside the tool result you "
+    "receive back, with which host actually produced it -- this marking is inserted for you after a real call "
+    "completes; do not write anything resembling it yourself, and do not print a command inside a code block as a "
+    "substitute for calling the actual tool. When a request covers multiple hosts, call the tool separately for "
+    "each host, then in your final answer keep every fact attributed to the specific tool result it came from -- "
+    "never state a vendor, model, serial number, or other value for one host using data that actually came back "
+    "for a different host, even if the values would look plausible swapped or you are trying to fill a gap. If a "
+    "host's tool result didn't contain the specific thing asked about, say that plainly for that host (e.g. \"not "
+    "returned by dad's command\") instead of guessing or reusing another host's value.\n"
+    "Never state a specific fact -- a version number, build hash, file content, model/spec, command output, or search "
+    "result -- unless you can point to the literal text a tool actually returned it in. If a tool call returned "
+    "nothing, an error, or output that didn't contain the specific thing asked about, say that plainly (e.g. \"that "
+    "file was empty\", \"the command produced no matching output\", \"the search didn't return anything usable\") "
+    "instead of filling the gap with a plausible-sounding value drawn from general knowledge or pattern-matching what "
+    "similar output usually looks like. This applies to every tool (ssh_run/ssh_read/ssh_write/ha_api/web_search/"
+    "run_command/python_interpreter) and every kind of request, not only host-specific facts. Only give an estimate, "
+    "guess, or general-knowledge answer in place of a real result when the user's own request explicitly asks you to "
+    "speculate, guess, or estimate -- and say plainly that it is one when you do.\n"
+    "web_search reaches the open internet, unlike every other tool here, and always requires the user to approve "
+    "it live, every call. Only use it when the user's own request actually needs current, external, or "
+    "general-internet information that no local tool or your own knowledge can answer -- never call it by "
+    "default, proactively, or to double-check a routine question. Do not use it as a substitute for actually "
+    "calling ssh_run/ha_api/etc. when the request is about the user's own hosts.\n"
     "After writing files, use a tool to check the exact paths and report only the paths, sizes, and results returned by tools. "
     "If a required tool action is unavailable or declined, state that the task was not completed.\n"
     "Ground-truth check: for any task involving calculation, physical/scientific data, or a numeric result that "
@@ -236,7 +317,7 @@ HELP = """Commands:
   /notes          show the loaded project notes file, if any (.mlxcli-notes.md,
                   AGENTS.md, or CLAUDE.md in the directory mlxcli was launched from)
   /backend        show active backend
-  /backend NAME   switch backend: omlx, turbofieldfare, or turbofieldfare-qwen
+  /backend NAME   switch backend: omlx, turbofieldfare-qwen, or turbofieldfare-ornith
   /convert MODE   set paste conversion: auto, all, or off
   /system         show the active dialogue defaults
   /system save TEXT
@@ -257,6 +338,7 @@ HELP = """Commands:
   /verbs          show natural-language input/output verbs the router recognizes
   ? [request]     refine a request with a short, stateless prompt decoder
   /tokens         show running token totals for this mlxcli session
+  /hosts          list saved host aliases (names only — never shows credentials)
   /save [file]    save transcript as markdown (default: <default dir>/mlxcli-<timestamp>.md)
   /export [file]  save latest model reply as .docx, .md, or .txt (default: <default dir>/mlxcli-reply-<timestamp>.docx)
   /defaultdir     show the default directory used for saving and searching
@@ -413,8 +495,15 @@ _COLLECTION_PHRASE_START_RE = re.compile(r"^\s*from\s+(?:the\s+)?(?:rag\s+)?(.+)
 # should be stripped before the remainder is used as a search query — e.g.
 # "list all references to due process" -> "due process".
 _INSTRUCTION_FILLER_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:show|list|find|search(?:\s+for)?|give\s+me|tell\s+me\s+about)"
+    r"^\s*(?:please\s+)?(?:show|list|find|search(?:\s+for)?|give\s+me|tell\s+me\s+about|do)"
     r"(?:\s+(?:me|all|any))*(?:\s+references?)?(?:\s+(?:to|about|for|of|on))?\s+", re.IGNORECASE)
+# RAG only runs on a message when the user explicitly asks for it this way
+# ("from rag COLLECTION do QUERY") -- RAG used to fire implicitly on every
+# plain chat message regardless of content, which meant an unrelated request
+# (e.g. "convert this to a spreadsheet") still paid for a RAG lookup and, if
+# the RAG server happened to be unreachable, could fail/slow down a turn
+# that never needed retrieval in the first place.
+_EXPLICIT_RAG_TRIGGER_RE = re.compile(r"^\s*from\s+rag\b", re.IGNORECASE)
 
 
 def detect_natural_language_collection(text, url, key):
@@ -468,11 +557,11 @@ OUTPUT_VERBS = (
     "create", "generate", "make", "write", "build", "draft", "rank", "score", "format",
     "export", "save", "show",
 )
-SUPPORTED_BACKENDS = ("omlx", "turbofieldfare", "turbofieldfare-qwen")
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare-qwen", "turbofieldfare-ornith")
 
 
 def is_turbo_backend(backend):
-    return backend in ("turbofieldfare", "turbofieldfare-qwen")
+    return backend in ("turbofieldfare-qwen", "turbofieldfare-ornith")
 
 
 def configure_readline():
@@ -504,8 +593,8 @@ def configure_readline():
 def backend_label(backend):
     labels = {
         "omlx": "oMLX",
-        "turbofieldfare": "TurboFieldfare",
         "turbofieldfare-qwen": "TurboFieldfare Qwen",
+        "turbofieldfare-ornith": "TurboFieldfare Ornith",
     }
     return labels.get(backend, backend)
 
@@ -513,8 +602,8 @@ def backend_label(backend):
 def backend_description(backend):
     descriptions = {
         "omlx": "[General / Flexible]",
-        "turbofieldfare": "[Gemma 4 / General]",
         "turbofieldfare-qwen": "[Qwen 3.6 / Coding]",
+        "turbofieldfare-ornith": "[Ornith 1.5 / Coding]",
     }
     return descriptions.get(backend, "")
 
@@ -528,13 +617,13 @@ def backend_paths(backend):
             "log": TURBO_QWEN_SERVER_LOG,
             "port": "8081",
         }
-    if backend == "turbofieldfare":
+    if backend == "turbofieldfare-ornith":
         return {
-            "root": TURBO_ROOT,
-            "server_bin": TURBO_SERVER_BIN,
-            "model_dir": TURBO_MODEL_DIR,
-            "log": TURBO_SERVER_LOG,
-            "port": "8080",
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_ORNITH_MODEL_DIR,
+            "log": TURBO_ORNITH_SERVER_LOG,
+            "port": "8083",
         }
     return {}
 
@@ -561,12 +650,12 @@ def save_backend(backend):
 
 def load_cfg():
     backend = load_backend()
-    if backend == "turbofieldfare":
-        url = os.environ.get("TURBOFIELDFFARE_URL", os.environ.get("TURBOFIELDFARE_URL", os.environ.get("TURBOFIELDFIELDFARE_URL", "http://127.0.0.1:8080")))
-        key = os.environ.get("TURBOFIELDFARE_API_KEY", "")
-        return backend, url, key
     if backend == "turbofieldfare-qwen":
         url = os.environ.get("TURBOFIELDFARE_QWEN_URL", "http://127.0.0.1:8081")
+        key = os.environ.get("TURBOFIELDFARE_API_KEY", "")
+        return backend, url, key
+    if backend == "turbofieldfare-ornith":
+        url = os.environ.get("TURBOFIELDFARE_ORNITH_URL", "http://127.0.0.1:8083")
         key = os.environ.get("TURBOFIELDFARE_API_KEY", "")
         return backend, url, key
     url = os.environ.get("OMLX_URL", "http://localhost:8000")
@@ -654,7 +743,12 @@ def save_system_prompt(text):
 
 
 def request(url, key, path, payload=None):
-    headers = {"Content-Type": "application/json"}
+    # Real browser UA: some targets (e.g. Cloudflare-fronted Home Assistant
+    # instances hit via ha_api) block urllib's default "Python-urllib/x.y"
+    # UA outright (HTTP 403, Cloudflare error 1010) even with a valid token.
+    headers = {"Content-Type": "application/json",
+               "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     return urllib.request.Request(
@@ -699,10 +793,10 @@ def stop_omlx():
 
 def stop_turbofieldfare(backend=None):
     pattern = "TurboFieldfareServer"
-    if backend == "turbofieldfare":
-        pattern = str(TURBO_MODEL_DIR)
-    elif backend == "turbofieldfare-qwen":
+    if backend == "turbofieldfare-qwen":
         pattern = str(TURBO_QWEN_MODEL_DIR)
+    elif backend == "turbofieldfare-ornith":
+        pattern = str(TURBO_ORNITH_MODEL_DIR)
     first = subprocess.run(["pkill", "-f", pattern], capture_output=True, text=True, timeout=15)
     time.sleep(1)
     probe = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=15)
@@ -713,23 +807,23 @@ def stop_turbofieldfare(backend=None):
 
 
 def stop_other_backend(target_backend):
+    # Qwen and Ornith run on different ports and could technically coexist,
+    # but both are ~35B models -- keeping only one loaded at a time avoids
+    # doubling resident RAM for no benefit, so switching to either one stops
+    # the other, same as it stops oMLX.
     if target_backend == "omlx":
-        stopped_gemma = stop_turbofieldfare("turbofieldfare")
         stopped_qwen = stop_turbofieldfare("turbofieldfare-qwen")
-        if stopped_gemma or stopped_qwen:
+        stopped_ornith = stop_turbofieldfare("turbofieldfare-ornith")
+        if stopped_qwen or stopped_ornith:
             print("(stopped TurboFieldfare server)")
         else:
             print("(TurboFieldfare server was not running)")
-    elif target_backend == "turbofieldfare":
-        stopped = stop_omlx()
-        print("(stopped oMLX)" if stopped else "(oMLX was not running)")
-        stopped_qwen = stop_turbofieldfare("turbofieldfare-qwen")
-        print("(stopped TurboFieldfare Qwen server)" if stopped_qwen else "(TurboFieldfare Qwen server was not running)")
     else:
-        stopped = stop_omlx()
-        print("(stopped oMLX)" if stopped else "(oMLX was not running)")
-        stopped_gemma = stop_turbofieldfare("turbofieldfare")
-        print("(stopped TurboFieldfare server)" if stopped_gemma else "(TurboFieldfare server was not running)")
+        stopped_omlx = stop_omlx()
+        print("(stopped oMLX)" if stopped_omlx else "(oMLX was not running)")
+        other = "turbofieldfare-ornith" if target_backend == "turbofieldfare-qwen" else "turbofieldfare-qwen"
+        stopped_other = stop_turbofieldfare(other)
+        print(f"(stopped {backend_label(other)} server)" if stopped_other else f"({backend_label(other)} server was not running)")
 
 
 def ensure_server(backend, url, key):
@@ -750,17 +844,58 @@ def ensure_server(backend, url, key):
         log_handle.flush()
         launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", paths["port"],
              "--max-context", str(SERVER_MAX_CONTEXT_TOKENS)]
-        if backend == "turbofieldfare-qwen":
-            # Benchmarked +1-11% decode speed (community benchmark protocol, all 3
-            # cases, confirmed at --max-context 32768 with no instability) from
-            # keeping more MoE experts resident instead of re-fetching from disk.
-            launch_args += ["--expert-cache-slots", "32", "--rdadvise", "default"]
+        launch_env = os.environ.copy()
+        if backend in ("turbofieldfare-qwen", "turbofieldfare-ornith"):
+            # Switched to the NVMAI fork (2026-08-23): ~3x measured decode speedup
+            # over the old TurboFieldfareServer build on the same transcript-
+            # summarization workload (2.9-3.0 tok/s -> ~8-9 tok/s). --rdadvise
+            # doesn't exist in NVMAIServer's argument parser (unlike the old
+            # server) so it's dropped here.
+            #
+            # --ram-budget replaces the old --expert-cache-slots 32 (2026-08-25):
+            # 32 slots was carried over from the old server's tuning, not
+            # re-measured against NVMAIServer's own defaults. Using the
+            # binary's documented default (8G / 64 slots) instead -- chosen
+            # deliberately over the more conservative 6G step after flagging
+            # the RAM-pressure history below. If this causes the same
+            # uninterruptible-sleep/thrashing hang the 65536-token
+            # --max-context attempt did on this 18GB-RAM machine (see
+            # SERVER_MAX_CONTEXT_TOKENS in mlxlib.py), drop back to 6G or the
+            # old --expert-cache-slots 32.
+            #
+            # --prompt-cache-memory-mib/-disk (2026-08-25): the server's
+            # 256MB default RAM snapshot budget was too small for this
+            # workload's actual snapshot sizes (~280-340MB), so the
+            # multi-prefix follow-up cache was silently failing on nearly
+            # every request (see snapshot_failed errors in the ornith log).
+            # Raised to 1024MB and given a disk tier so cache entries also
+            # survive a server restart/idle-unload -- disk space is not a
+            # concern here (276GB free).
+            prompt_cache_dir = pathlib.Path.home() / ".omlx" / "nvmai-prompt-cache" / backend
+            prompt_cache_dir.mkdir(parents=True, exist_ok=True)
+            launch_args += [
+                "--ram-budget", "8G",
+                "--prompt-cache-memory-mib", "1024",
+                "--prompt-cache-disk", str(prompt_cache_dir),
+            ]
+            # ANE prefill (2026-08-25): opt-in, env-var-gated. README claims
+            # ~2.3x faster time-to-first-token on long prompts with decode
+            # speed unchanged -- this workload has repeated 18-28K token
+            # prompts in the logs, so it's a plausible real win. Requires a
+            # one-time-exported Core ML sidecar per model (tools/export_ane_
+            # prefill.py) -- the server refuses to start at all if the env
+            # var is set but the sidecar is missing (learned the hard way:
+            # this took the server down entirely on 2026-08-26), so only set
+            # it once that export has actually been run for this model.
+            if (paths["model_dir"] / "ane_prefill" / "ane_prefill.json").exists():
+                launch_env["NVMAI_PREFILL_ANE"] = "on"
         subprocess.Popen(
             launch_args,
             cwd=paths["root"],
             stdout=log_handle,
             stderr=log_handle,
             start_new_session=True,
+            env=launch_env,
         )
     else:
         print("oMLX not running — launching it...")
@@ -872,6 +1007,13 @@ def read_single_key(prompt, valid_chars, default=""):
         except KeyboardInterrupt:
             print()
             raise
+        except EOFError:
+            # No TTY and nothing was piped in either (e.g. a headless --run
+            # with no auto-approval for this category) — there is genuinely
+            # no way to get an answer, so take the safe default rather than
+            # crashing the whole run with an unhandled EOFError.
+            print(f"(no input available; defaulting to {default or 'n'!r})")
+            return default or "n"
         result = line[:1] if line else default
         return result
     fd = sys.stdin.fileno()
@@ -908,6 +1050,15 @@ ALWAYS_APPROVED = set()
 SANDBOX_MODE = False
 SANDBOX_IMAGE = "mlxcli-sandbox:latest"
 SANDBOX_CONTAINER_NAME = f"mlxcli-sandbox-{os.getpid()}"
+
+# When set (via /remote USER@HOST), every run_command/read_file/write_file
+# tool call transparently executes against this host over SSH instead of
+# locally -- same tool names, same model behavior, different target. Lets
+# the chat interface stay the "remote" experience (like Claude Code/Codex
+# CLI's remote sandbox) without the model needing to remember to call
+# ssh_run/ssh_read/ssh_write instead of the local tools, or the user ever
+# dropping into a raw shell on the other machine. /local clears it.
+REMOTE_MODE_HOST = None
 _sandbox_started = False
 
 
@@ -1046,12 +1197,52 @@ def approve(desc, category=None):
 # infer_command_cwd is imported from mlxlib (shared with mlxgui).
 
 
+def _arg_str(value):
+    """Coerce a tool-call argument to str. Local backends sometimes emit a
+    numeric-looking alias (e.g. host alias "6000") as a bare JSON number
+    instead of a quoted string, which would otherwise crash downstream
+    .strip()/.lower() calls with 'int' object has no attribute 'strip'."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
 def exec_tool(name, args):
     # Some local backends qualify function names as shell:run_command or shell.run_command.
     # Normalize those names before dispatching so valid tool calls are not silently lost.
     raw_name = str(name or "")
     normalized_name = raw_name.strip().lower().replace("/", ":").replace(".", ":")
     name = normalized_name.rsplit(":", 1)[-1]
+
+    if REMOTE_MODE_HOST and name in ("run_command", "read_file", "write_file"):
+        host = REMOTE_MODE_HOST
+        if name == "run_command":
+            cmd = args.get("command", "")
+            print(f"  tool: run_command [remote:{host}] ({cmd})")
+            if not approve(f"ssh run {host}: {cmd}", category="ssh_run"):
+                return "User declined."
+            code, output = run_ssh_command(host, cmd)
+            return f"exit_code={code}\n{output[:MAX_FILE_CHARS] if output else '(no output)'}"
+        if name == "read_file":
+            path = args.get("path", "")
+            print(f"  tool: read_file [remote:{host}] ({path})")
+            if not approve(f"ssh read {host}:{path}", category="ssh_read"):
+                return "User declined."
+            code, output = run_ssh_command(host, f"cat {shlex.quote(path)}")
+            if code != 0:
+                return f"Error reading remote file {host}:{path}: {output}"
+            note = "" if len(output) <= MAX_FILE_CHARS else "\n[truncated]"
+            return output[:MAX_FILE_CHARS] + note
+        if name == "write_file":
+            path = args.get("path", "")
+            content = args.get("content", "")
+            print(f"  tool: write_file [remote:{host}] ({path}, {len(content)} chars)")
+            if not write_remote_file(host, path, content):
+                return "User declined or the remote write failed."
+            return f"Wrote {len(content)} chars to {host}:{path}"
+
     if name == "run_command":
         cmd = args.get("command", "")
         print(f"  tool: run_command ({cmd})")
@@ -1104,6 +1295,135 @@ def exec_tool(name, args):
             return f"exit_code={p.returncode}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
         except subprocess.TimeoutExpired:
             return "Python execution timed out."
+    if name == "ssh_run":
+        alias_arg = _arg_str(args.get("host")) or _arg_str(args.get("target")) or _arg_str(args.get("host_alias"))
+        host = resolve_ssh_alias(alias_arg)
+        if not host.strip():
+            return ("Error: no host was given (checked the 'host', 'target', and 'host_alias' arguments, all "
+                     "empty). Call ssh_run again with host set to a saved alias name (e.g. \"dad\") or a literal "
+                     "user@host.")
+        username = args.get("username", "")
+        password = args.get("password", "")
+        cmd = args.get("command", "")
+        # Schema asks for a combined "user@host" in `host`, but models
+        # sometimes split it into separate username/password fields instead
+        # (observed directly from the Ornith backend) -- tolerate that shape
+        # rather than silently sending an unauthenticated/wrong-user request.
+        if username and "@" not in host:
+            host = f"{username}@{host}"
+        if "{{SUDO_PASSWORD}}" in cmd:
+            # Lets a command need sudo on a named alias (e.g. dad) without the
+            # model ever seeing the real password — substituted here, at
+            # execution time, from Keychain rather than the model's context.
+            sudo_pw = sudo_password_for_alias(alias_arg)
+            if sudo_pw is None:
+                return "Error: {{SUDO_PASSWORD}} placeholder used, but no stored sudo password for this host alias."
+            cmd = cmd.replace("{{SUDO_PASSWORD}}", sudo_pw)
+        print(f"  tool: ssh_run ({host}: {cmd})")
+        if not approve(f"ssh run {host}: {cmd}", category="ssh_run"):
+            return "User declined."
+        if password:
+            # Seed the cache so ssh_password_for skips its interactive
+            # getpass() prompt, which would otherwise block forever with no
+            # terminal attached to answer it during a model-initiated call.
+            SSH_PASSWORD_CACHE[host] = password
+        code, output = run_ssh_command(host, cmd)
+        source_label = alias_arg.strip() or host
+        return (f"[source: {source_label}]\n"
+                f"exit_code={code}\n{output[:MAX_FILE_CHARS] if output else '(no output)'}")
+    if name == "ssh_read":
+        alias_arg = _arg_str(args.get("host")) or _arg_str(args.get("target")) or _arg_str(args.get("host_alias"))
+        host = resolve_ssh_alias(alias_arg)
+        if not host.strip():
+            return ("Error: no host was given (checked the 'host', 'target', and 'host_alias' arguments, all "
+                     "empty). Call ssh_read again with host set to a saved alias name (e.g. \"dad\") or a literal "
+                     "user@host.")
+        source_label = alias_arg.strip() or host
+        path = args.get("path", "")
+        print(f"  tool: ssh_read ({host}:{path})")
+        if not approve(f"ssh read {host}:{path}", category="ssh_read"):
+            return "User declined."
+        code, output = run_ssh_command(host, f"cat {shlex.quote(path)}")
+        if code != 0:
+            return f"[source: {source_label}] Error reading remote file {host}:{path}: {output}"
+        note = "" if len(output) <= MAX_FILE_CHARS else "\n[truncated]"
+        return f"[source: {source_label}]\n" + output[:MAX_FILE_CHARS] + note
+    if name == "ssh_write":
+        alias_arg = _arg_str(args.get("host")) or _arg_str(args.get("target")) or _arg_str(args.get("host_alias"))
+        host = resolve_ssh_alias(alias_arg)
+        if not host.strip():
+            return ("Error: no host was given (checked the 'host', 'target', and 'host_alias' arguments, all "
+                     "empty). Call ssh_write again with host set to a saved alias name (e.g. \"dad\") or a literal "
+                     "user@host.")
+        source_label = alias_arg.strip() or host
+        path = args.get("path", "")
+        content = args.get("content", "")
+        print(f"  tool: ssh_write ({host}:{path}, {len(content)} chars)")
+        if not write_remote_file(host, path, content):
+            return "User declined or the remote write failed."
+        return f"[source: {source_label}] Wrote {len(content)} chars to {host}:{path}"
+    if name == "ha_api":
+        target = _arg_str(args.get("host")) or _arg_str(args.get("target"))
+        method = (args.get("method") or "GET").upper()
+        api_path = args.get("path", "")
+        data = args.get("data")
+        entry = load_host_aliases().get(target.strip().lower())
+        ha_cfg = None
+        if entry:
+            if entry.get("type") == "ha_api":
+                ha_cfg = entry
+            elif entry.get("ha_api"):
+                ha_cfg = entry["ha_api"]
+        if not ha_cfg:
+            return f"Error: '{target}' is not a known ha_api-capable alias."
+        token = keychain_get(target.strip().lower(), ha_cfg.get("keychain_service", ""))
+        if token is None:
+            return f"Error: no stored HA token for alias '{target}'."
+        print(f"  tool: ha_api ({target} {method} {api_path})")
+        if not approve(f"ha_api {target} {method} {api_path}", category="ha_api"):
+            return "User declined."
+        try:
+            base_url = ha_cfg["base_url"]
+            if method == "GET":
+                result = api(base_url, token, api_path)
+            else:
+                req = request(base_url, token, api_path, payload=data if data is not None else {})
+                req.get_method = lambda: method
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    result = json.load(r)
+            text = json.dumps(result, indent=2)
+            note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
+            return f"[source: {target}]\n" + text[:MAX_FILE_CHARS] + note
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:800]
+            return f"HTTP {exc.code} from {target}: {detail}"
+        except Exception as exc:
+            return f"Error calling ha_api on {target}: {exc}"
+    if name == "web_search":
+        query = args.get("query", "")
+        max_results = args.get("max_results", 5)
+        if not query.strip():
+            return "Error: web_search needs a non-empty 'query'."
+        print(f"  tool: web_search ({query!r})")
+        # Deliberately not in ALWAYS_APPROVED's startup seed set (unlike
+        # run_command/ssh_*/write_file) -- unlike every other tool here, this
+        # one leaves the user's own machines/services entirely and reaches
+        # the open internet, so it always prompts at least once per session
+        # before running, even though the user can still choose "a" (always
+        # allow) at that prompt the same as for any other category.
+        if not approve(f"web_search: {query!r} (max {max_results} results)", category="web_search"):
+            return "User declined."
+        try:
+            results = web_search(query, max_results=max_results)
+        except Exception as exc:
+            return f"Error running web_search: {exc}"
+        if not results:
+            return f"[web_search: {query!r}] No results."
+        lines = [f"[web_search: {query!r}] {len(results)} result(s):"]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
+        text = "\n".join(lines)
+        return text[:MAX_FILE_CHARS]
     if name == "read_file":
         print(f"  tool: read_file ({args.get('path', '')})")
         target = pathlib.Path(args["path"]).expanduser()
@@ -1197,7 +1517,9 @@ def exec_tool(name, args):
             return result
         except Exception as e:
             return f"Error: {e}"
-    return "Unknown tool."
+    return (f"Error: '{raw_name}' is not a real tool — it does not exist and was never offered to you. "
+            f"The only real tools are: {', '.join(KNOWN_TOOL_NAMES)}. "
+            "Call one of those by its exact name now instead of retrying the invented one.")
 
 
 # normalize_tool_name is imported from mlxlib (shared with mlxgui).
@@ -1632,6 +1954,25 @@ def do_ls(arg):
         print(f"  ... plus {len(entries) - 80} more")
 
 
+def do_transcript(arg):
+    """/transcript URL -- fetch a YouTube transcript and summarize it, without
+    leaving the REPL. Delegates to yt_summarize.py in the default directory
+    (same script the --transcript launch flag calls) rather than duplicating
+    its fetch/summarize logic here."""
+    url = arg.strip().strip('"').strip("'")
+    if not url:
+        print("(usage: /transcript <youtube-url>)")
+        return
+    script = load_default_dir() / "yt_summarize.py"
+    if not script.exists():
+        print(f"(no yt_summarize.py found in {load_default_dir()} -- nothing to delegate /transcript to)")
+        return
+    result = subprocess.run([sys.executable, str(script), url], capture_output=True, text=True)
+    print(result.stdout.strip())
+    if result.returncode != 0:
+        print(result.stderr.strip())
+
+
 def do_find(arg):
     try:
         parts = shlex.split(arg)
@@ -1924,6 +2265,16 @@ def maybe_handle_natural_language_action(user, state, messages, convert_mode, ur
     lowered = (user or "").lower().strip()
     if not lowered:
         return False
+    if REMOTE_MODE_HOST:
+        # Every shortcut in this function assumes a local filesystem (local
+        # /ls, local file auto-loading, local /namefind, etc.) -- none of
+        # them know about remote mode, so a phrase like "list files in the
+        # home directory" gets treated as a literal local path lookup and
+        # fails, even though a real remote host is active. Skip all of it
+        # and let the request reach the model instead, whose run_command/
+        # read_file/write_file tool calls are already transparently
+        # redirected to REMOTE_MODE_HOST in exec_tool.
+        return False
     direct_result = direct_top_files_request(user)
     if direct_result:
         print(direct_result)
@@ -2044,16 +2395,139 @@ def parse_remote_spec(raw):
     return host, path
 
 
+def read_masked_password(prompt):
+    """Read a password from the real controlling terminal (fd 0 — already
+    confirmed bound to the interactive session, unlike getpass's default
+    /dev/tty path, which can fail to open in some environments and then
+    silently falls back to a plain, unmasked, no-feedback input()). Echoes
+    '*' per character typed so there's immediate visual confirmation
+    keystrokes are actually being received, instead of the user having no
+    way to tell "is this frozen" from "is this working silently."
+    Falls back to getpass if stdin isn't a real terminal (e.g. headless)."""
+    if not sys.stdin.isatty():
+        try:
+            return getpass.getpass(prompt)
+        except EOFError:
+            # No TTY and nothing piped in either (e.g. a headless --run hit
+            # an unresolved/misspelled host with no cached or Keychain
+            # password) — there's genuinely no way to get one, so return
+            # empty and let the SSH attempt itself fail with a clear auth
+            # error instead of crashing mlxcli with an unhandled EOFError.
+            print("(no input available for password prompt; SSH will likely fail auth)")
+            return ""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    print(prompt, end="", flush=True)
+    chars = []
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                break
+            if ch == "\x03":  # Ctrl-C
+                raise KeyboardInterrupt
+            if ch in ("\x7f", "\x08"):  # backspace/delete
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            chars.append(ch)
+            sys.stdout.write("*")
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        print()
+    return "".join(chars)
+
+
+def keychain_get(account, service):
+    """Fetch a secret from the macOS Keychain. Returns None (never raises)
+    if the entry doesn't exist or `security` isn't available — callers fall
+    back to their normal interactive prompt in that case, so a missing
+    Keychain entry degrades gracefully instead of hard-failing."""
+    try:
+        p = subprocess.run(
+            ["security", "find-generic-password", "-a", account, "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            return None
+        return p.stdout.rstrip("\n")
+    except Exception:
+        return None
+
+
+SSH_KEY_AUTH = {}  # real_host -> {"identity_file": str, "port": str}, for
+                    # alias entries with "auth": "key" (e.g. unity's HAOS
+                    # SSH add-on, which has no password at all) -- lets
+                    # ssh_base_command skip sshpass/password auth entirely
+                    # and connect with -i/-p instead.
+
+
+def resolve_ssh_alias(host_arg):
+    """If host_arg names a known ssh-type alias (e.g. "dad", not
+    "dad@192.168.1.7"), expand it to the real user@host. Password-auth
+    aliases (the default) get SSH_PASSWORD_CACHE seeded from Keychain so
+    ssh_password_for's interactive prompt is never reached. Key-auth
+    aliases ("auth": "key" + identity_file, optionally a non-default port)
+    get SSH_KEY_AUTH seeded instead, so ssh_base_command connects with the
+    key/port directly and never touches sshpass or the password cache.
+    Returns host_arg unchanged for anything that isn't a recognized alias
+    (a literal host was passed directly, same as before this feature
+    existed)."""
+    host_arg = _arg_str(host_arg)
+    key = host_arg.strip().lower()
+    entry = load_host_aliases().get(key)
+    if not entry or entry.get("type") != "ssh":
+        return host_arg
+    real_host = f"{entry['user']}@{entry['host']}"
+    if entry.get("auth") == "key":
+        SSH_KEY_AUTH[real_host] = {
+            "identity_file": entry.get("identity_file", ""),
+            "port": str(entry.get("port", 22)),
+        }
+    elif real_host not in SSH_PASSWORD_CACHE:
+        pw = keychain_get(key, entry.get("keychain_service", ""))
+        if pw is not None:
+            SSH_PASSWORD_CACHE[real_host] = pw
+    return real_host
+
+
+def sudo_password_for_alias(host_arg):
+    """The sudo password for a named alias, for substituting into the
+    {{SUDO_PASSWORD}} placeholder (see exec_tool's ssh_run handling) — lets
+    a command need sudo without the model ever seeing the real password.
+    Returns None if host_arg isn't an alias with a stored password."""
+    host_arg = _arg_str(host_arg)
+    key = host_arg.strip().lower()
+    entry = load_host_aliases().get(key)
+    if not entry or entry.get("type") != "ssh":
+        return None
+    return keychain_get(key, entry.get("keychain_service", ""))
+
+
 def ssh_password_for(host):
     pw = SSH_PASSWORD_CACHE.get(host)
     if pw is not None:
         return pw
-    pw = getpass.getpass(f"({host}) Password: ")
+    pw = read_masked_password(f"({host}) Password: ")
     SSH_PASSWORD_CACHE[host] = pw
     return pw
 
 
 def ssh_base_command(host, password):
+    key_auth = SSH_KEY_AUTH.get(host)
+    if key_auth:
+        cmd = [
+            "ssh",
+            "-i", os.path.expanduser(key_auth["identity_file"]),
+            "-p", key_auth["port"],
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            host,
+        ]
+        return cmd, os.environ.copy()
     env = os.environ.copy()
     env["SSHPASS"] = password
     cmd = [
@@ -2072,24 +2546,36 @@ def ssh_base_command(host, password):
 
 
 def run_ssh_command(host, command):
-    password = ssh_password_for(host)
+    password = None if host in SSH_KEY_AUTH else ssh_password_for(host)
     base_cmd, env = ssh_base_command(host, password)
-    proc = subprocess.run(base_cmd + [command], capture_output=True, text=True, timeout=180, env=env)
+    try:
+        proc = subprocess.run(base_cmd + [command], capture_output=True, text=True, timeout=180, env=env)
+    except subprocess.TimeoutExpired:
+        return 124, (f"Error: ssh to {host} did not complete within 180s (connection stalled, or the "
+                     f"remote command is still running). The remote host may be slow, overloaded, or "
+                     f"briefly unreachable -- this is not necessarily a permanent failure, a retry with "
+                     f"a shorter/simpler command may succeed.")
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output.strip()
 
 
 def run_ssh_command_with_input(host, command, input_text):
-    password = ssh_password_for(host)
+    password = None if host in SSH_KEY_AUTH else ssh_password_for(host)
     base_cmd, env = ssh_base_command(host, password)
-    proc = subprocess.run(
-        base_cmd + [command],
-        input=input_text,
-        capture_output=True,
-        text=True,
-        timeout=180,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            base_cmd + [command],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, (f"Error: ssh to {host} did not complete within 180s (connection stalled, or the "
+                     f"remote command is still running). The remote host may be slow, overloaded, or "
+                     f"briefly unreachable -- this is not necessarily a permanent failure, a retry with "
+                     f"a shorter/simpler command may succeed.")
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output.strip()
 
@@ -2125,25 +2611,34 @@ def _append_system_content(messages, text):
 
 
 def remote_rag_context(messages, user_text, limit=4, collection_override=None, no_match_warning=True):
-    """Returns (status, results). status is None if RAG isn't configured (not
-    applicable to this turn), False if it was searched but found nothing,
+    """Returns (status, results). status is None if RAG isn't configured, or
+    if the message isn't an explicit RAG request (see below) -- either way,
+    not applicable to this turn. False if it was searched but found nothing,
     True if excerpts were injected. Callers use this to distinguish "not
-    grounded because RAG is off" from "searched and came up empty" — the
-    latter is the case where a model can confidently fabricate a
-    citation-shaped answer with nothing behind it. Unless
+    grounded because RAG is off/not requested" from "searched and came up
+    empty" — the latter is the case where a model can confidently fabricate
+    a citation-shaped answer with nothing behind it. Unless
     no_match_warning=False (used when the caller is about to skip the turn
     entirely, e.g. strict mode), an explicit instruction not to fabricate is
     inserted into messages on a no-match result. results is the raw list of
     retrieved excerpts (empty list if none) — callers can store this the
     same way /rag search results are stored, so a plain chat turn's
     retrieval is just as inspectable (numbered, full-text-on-demand) as an
-    explicit search."""
+    explicit search.
+
+    Only runs at all when user_text explicitly opts in with a leading
+    "from rag COLLECTION ..." phrase (_EXPLICIT_RAG_TRIGGER_RE) — e.g.
+    "from rag founding_docs do summarize article 1". Ordinary messages never
+    trigger a RAG lookup, so an unrelated request never pays for (or can be
+    disrupted by) a retrieval call it didn't ask for."""
     url, key, configured_collection = rag_remote_config()
     # None = defer to RAG_COLLECTION env var (unchanged default behavior);
     # "" = explicitly search all collections; anything else = that collection,
     # set for the rest of this session via /rag collection NAME.
     collection = configured_collection if collection_override is None else collection_override
     if not url:
+        return None, []
+    if not _EXPLICIT_RAG_TRIGGER_RE.match(user_text):
         return None, []
     # A leading "from COLLECTION, ..." phrase names its target explicitly and
     # wins over any session default — fuzzy-matched against the real,
@@ -2163,13 +2658,23 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
     reference_variants = find_embedded_bible_reference(search_text)
     seen_keys = set()
     results = []
-    for query in (reference_variants or [search_text]):
-        data = rag_remote_search(query, url, key, collection, limit=limit)
-        for result in data.get("results") or []:
-            dedupe_key = (result.get("id"), result.get("chunk_index"))
-            if dedupe_key not in seen_keys:
-                seen_keys.add(dedupe_key)
-                results.append(result)
+    try:
+        for query in (reference_variants or [search_text]):
+            data = rag_remote_search(query, url, key, collection, limit=limit)
+            for result in data.get("results") or []:
+                dedupe_key = (result.get("id"), result.get("chunk_index"))
+                if dedupe_key not in seen_keys:
+                    seen_keys.add(dedupe_key)
+                    results.append(result)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        # A RAG lookup happens implicitly on every plain chat message (both
+        # interactive and headless --run) -- this used to be completely
+        # unguarded, so a network hiccup reaching RAG_URL (e.g. the remote
+        # server being briefly unreachable on the LAN) crashed the entire
+        # session/job with an unhandled traceback instead of just skipping
+        # retrieval for this turn. Degrade gracefully instead.
+        print(f"(remote RAG unavailable: {e} — continuing without retrieval for this turn)")
+        return False, []
     results.sort(key=lambda r: r.get("score", 0), reverse=True)
     results = results[:limit]
     # The RAG server's score isn't a normalized similarity — it's small and
@@ -2590,7 +3095,19 @@ def maybe_handle_remote_natural_language_action(user, state):
         state["current_remote"] = host
         print(f"(routing to /sshrun {host} whoami)")
         do_sshrun(f"{host} whoami")
-        return True
+        # "connect to X" alone is just a connectivity check -- but "connect
+        # to X and list files" has a real request riding along that used to
+        # get silently dropped once the whoami probe returned True here.
+        # Peel off the "connect to X [and]" prefix and let whatever's left
+        # fall through to the patterns below, or to the normal agentic
+        # tool-calling flow (via this function returning False) if nothing
+        # here matches it either.
+        remainder = re.sub(r'^connect to\s+\S+\s*', '', text, flags=re.I).strip()
+        remainder = re.sub(r'^and\s+', '', remainder, flags=re.I).strip()
+        if not remainder:
+            return True
+        text = remainder
+        lowered = remainder.lower()
     if host_match:
         state["current_remote"] = host
 
@@ -3233,8 +3750,16 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
                "top_p": settings["top_p"],
                "top_k": settings["top_k"],
                "repetition_penalty": settings["repetition_penalty"]}
-    if agentic_mode:
-        payload["tools"] = TOOLS
+    # Tools are always offered, regardless of agentic_mode -- agentic_mode still
+    # controls the extra "Agentic local-resource task" system note (via
+    # request_messages_for_mode below), but gating the tools array itself on a
+    # keyword heuristic made every tool, including web_search, unreachable for
+    # any request that heuristic didn't recognize (e.g. a plain factual
+    # question has no reason to mention "file" or "script", so it never
+    # would have qualified) -- the model's own judgment plus each tool's
+    # description and the system prompt's usage rules are what should gate
+    # whether a given tool actually gets called, not whether it's offered.
+    payload["tools"] = TOOLS
     content_parts = []
     calls = {}
     usage = {}
@@ -3317,6 +3842,10 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
         tool_calls = parse_python_call_tool_call(content)
         if tool_calls:
             print("(compatibility: parsed a Python-call-style tool call; structured tool calls are preferred)")
+    if not tool_calls:
+        tool_calls = parse_attr_tag_tool_call(content)
+        if tool_calls:
+            print("(compatibility: parsed an attribute-tag-style tool call; structured tool calls are preferred)")
     # Text-adapter call syntax is protocol data, not assistant prose. Keeping it
     # in the assistant message can make Turbo parse the same call a second time.
     if tool_calls and "call:" in content:
@@ -3327,8 +3856,11 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
 def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
     # Guard the whole turn (all agentic tool-call retries included, not just
     # one HTTP request) so a long local generation can't get killed by the
-    # Mac going to sleep mid-turn.
-    with caffeinate_guard():
+    # Mac going to sleep mid-turn. server_busy_guard marks the same span as
+    # "the model server is actually in use" for external tooling (e.g. a job
+    # queue) that would otherwise only be able to check whether some mlxcli
+    # process merely still exists.
+    with caffeinate_guard(), server_busy_guard():
         return _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required, contract)
 
 
@@ -3531,9 +4063,40 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                 if tool_result_failed(result):
                     repeated_failure = True
             else:
-                result = exec_tool(fn, args)
+                try:
+                    result = exec_tool(fn, args)
+                except Exception as exc:
+                    # exec_tool is expected to catch its own failures and return
+                    # an error string -- but if something unexpected still raises
+                    # (e.g. a subprocess timeout deep in run_ssh_command), letting
+                    # it propagate would skip the messages.append(role="tool", ...)
+                    # below, leaving this call's tool_calls entry permanently
+                    # unanswered. Every later request in this process would then
+                    # be rejected by the server ("conversation ends with an
+                    # unresolved tool call") until the process is restarted --
+                    # so this must always resolve the call, not just log it.
+                    result = (f"Error: tool '{fn}' failed with an unexpected "
+                              f"{type(exc).__name__}: {exc}. Treat this the same as "
+                              f"a normal tool failure and try a different approach "
+                              f"or a smaller/simpler call.")
+                    log_error("exec_tool", f"{fn} raised {type(exc).__name__}: {exc}")
                 if cacheable:
                     seen_tool_calls[call_key] = result
+            command_looks_like_write = fn == "run_command" and re.search(
+                r'(^|[;&|])\s*\S.*(>>?|\btee\b)\s+\S', args.get("command", "") if isinstance(args, dict) else "")
+            if fn in ("ssh_write",) and not tool_result_failed(result):
+                # Mirrors write_file below, minus the local-artifact bookkeeping
+                # (record_last_artifact/smoke-test tracking assume a path on
+                # this machine, which a remote write isn't).
+                tool_state["write"] = True
+            if command_looks_like_write and not tool_result_failed(result):
+                # A remote-mode (or local) shell command that redirects output
+                # to a file (>, >>, tee) genuinely wrote something, even
+                # though it went through run_command rather than write_file --
+                # this used to be invisible to the write-contract check,
+                # causing a completed remote file write to be reported as
+                # "verification incomplete" and re-requested from the model.
+                tool_state["write"] = True
             if fn == "write_file" and not tool_result_failed(result):
                 tool_state["write"] = True
                 written_match = re.match(r"^Written: (.+?) \(", result)
@@ -3767,7 +4330,8 @@ def normalize_pasted_command(lines):
 
 def read_user_command():
     try:
-        first = input("\n> ")
+        status = f"remote:{REMOTE_MODE_HOST}" if REMOTE_MODE_HOST else "ready"
+        first = input(f"\n({status}) > ")
     except (EOFError, KeyboardInterrupt):
         raise
     lines = [first]
@@ -4067,6 +4631,8 @@ def parse_args(argv):
     show_thinking = False
     verify_command = None
     verify_history_dir = None
+    transcript_url = None
+    no_agentic = False
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
@@ -4075,6 +4641,12 @@ def parse_args(argv):
         elif argv[i] in ("-r", "--run") and i + 1 < len(argv):
             run_task = argv[i + 1]
             i += 2
+        elif argv[i] == "--transcript" and i + 1 < len(argv):
+            transcript_url = argv[i + 1]
+            i += 2
+        elif argv[i] == "--no-agentic":
+            no_agentic = True
+            i += 1
         elif argv[i] in ("-y", "--yes"):
             auto_yes = True
             i += 1
@@ -4096,7 +4668,7 @@ def parse_args(argv):
         else:
             model = argv[i]
             i += 1
-    return model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir
+    return model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir, transcript_url, no_agentic
 
 
 def print_repo_update_notice_if_any(root, label):
@@ -4125,11 +4697,42 @@ def print_repo_update_notice_if_any(root, label):
     print("\n".join(lines))
 
 
+def print_model_update_notice_if_any(repo_id, cache_path, label):
+    """Synchronous check for upstream changes to a Hugging Face model repo,
+    printed before the interactive prompt starts (same rationale as
+    print_repo_update_notice_if_any -- see its docstring). Silent when
+    there's nothing to report or on first-ever check (no baseline yet)."""
+    info = compute_model_update_status(repo_id, cache_path)
+    if not info:
+        return
+    print(
+        f"\n(⬆ upstream model {label} ({repo_id}) has changed since it was "
+        f"last checked here — new revision {info['new_sha'][:10]} "
+        f"(was {info['previous_sha'][:10]}), last modified {info['last_modified']}.\n"
+        "This only checks Hugging Face repo metadata — nothing is downloaded, "
+        "converted, or applied automatically. Re-run the conversion pipeline "
+        "manually if you want to pick up the change.)"
+    )
+
+
 def main():
     configure_readline()
     backend, url, key = load_cfg()
     global SHOW_THINKING
-    model_arg, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir = parse_args(sys.argv[1:])
+    global REMOTE_MODE_HOST
+    model_arg, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir, transcript_url, no_agentic = parse_args(sys.argv[1:])
+    if transcript_url:
+        # Delegates to yt_summarize.py (in the default directory) rather than
+        # duplicating its transcript-fetch/summarize logic here -- that script
+        # is the actual maintained implementation, this is just a convenience
+        # entry point so a transcript summary doesn't need a separate `cd` +
+        # python3 invocation.
+        script = load_default_dir() / "yt_summarize.py"
+        if not script.exists():
+            print(f"(no yt_summarize.py found in {load_default_dir()} -- nothing to delegate --transcript to)")
+            sys.exit(1)
+        result = subprocess.run([sys.executable, str(script), transcript_url])
+        sys.exit(result.returncode)
     if show_thinking:
         SHOW_THINKING = True
     if auto_yes:
@@ -4183,27 +4786,37 @@ def main():
             print(f"(suggestion: {backend_suggestion})")
         remote_rag_context(messages, run_task)
         messages.append({"role": "user", "content": run_task})
-        turn_mode = should_auto_enable_agentic(run_task) if requires_agentic_execution(run_task) else False
+        # --no-agentic bypasses the heuristic entirely: it exists for callers
+        # (e.g. yt_summarize.py) piping large arbitrary text -- like a video
+        # transcript -- into --run for a plain-completion task. That heuristic
+        # scans the whole prompt for action/target keyword co-occurrence
+        # ("run" + "app", "show" + "program", etc.), which fires on essentially
+        # any few thousand words of natural text regardless of actual intent,
+        # wrongly granting tool access and sending the model off trying to
+        # execute things instead of just answering in prose.
+        turn_mode = False if no_agentic else (should_auto_enable_agentic(run_task) if requires_agentic_execution(run_task) else False)
+        execution_required = False if no_agentic else requires_agentic_execution(run_task)
+        contract = None if no_agentic else execution_contract(run_task)
         max_verify_attempts = 3 if verify_command else 1
         for attempt in range(1, max_verify_attempts + 1):
             try:
                 chat_turn(
                     url, key, model, messages, totals, turn_mode, backend,
-                    execution_required=requires_agentic_execution(run_task),
-                    contract=execution_contract(run_task),
+                    execution_required=execution_required,
+                    contract=contract,
                 )
             except urllib.error.HTTPError as e:
                 body = e.read().decode(errors="replace")[:400]
                 log_error("chat_turn", f"HTTP {e.code} (backend={backend}, model={model}): {body}")
                 print(f"[server error {e.code}] {body}")
-                return
+                sys.exit(1)
             except urllib.error.URLError as e:
                 log_error("chat_turn", f"connection error (backend={backend}, model={model}): {e.reason}")
                 print(f"[connection error] {e.reason}")
-                return
+                sys.exit(1)
             except KeyboardInterrupt:
                 print("(interrupted)")
-                return
+                sys.exit(130)
             if not verify_command:
                 return
             passed, output = run_verify_suite(verify_command, verify_history_dir)
@@ -4216,7 +4829,7 @@ def main():
             if attempt == max_verify_attempts:
                 log_error("chat_turn", f"verification exhausted after {max_verify_attempts} attempts (backend={backend}, model={model}): {verify_command}")
                 print(f"(giving up after {max_verify_attempts} verification attempts)")
-                return
+                sys.exit(1)
             messages.append({"role": "user", "content": (
                 f"Verification failed. Running `{verify_command}` did not succeed:\n{output}\n"
                 "Fix the code so this verification command passes, then report completion again — "
@@ -4228,6 +4841,11 @@ def main():
     if notes_text:
         print(f"(loaded project notes from {notes_path})")
     print_repo_update_notice_if_any(TURBO_QWEN_ROOT, "turbo-fieldfare-qwen")
+    print_model_update_notice_if_any(
+        "mlx-community/Qwen3.6-35B-A3B-4bit",
+        pathlib.Path.home() / ".omlx" / "model_update_cache.json",
+        "Qwen 3.6 35B-A3B",
+    )
     totals = {"in": 0, "out": 0}
     last_turn = {"in": 0, "out": 0}
     last_user_request = ""
@@ -4271,6 +4889,32 @@ def main():
             continue
         if user == "/help":
             print(HELP)
+            continue
+        if user == "/remote":
+            print(f"(remote mode: {REMOTE_MODE_HOST or 'off (running locally)'})")
+            continue
+        if user.startswith("/remote "):
+            target = user.split(None, 1)[1].strip()
+            if "@" not in target:
+                print("usage: /remote USER@HOST  (or /local to go back to running locally)")
+                continue
+            # Establish the session up front (caches the password, confirms
+            # reachability) rather than deferring that to whatever the first
+            # redirected tool call happens to be.
+            code, _ = run_ssh_command(target, "whoami")
+            if code != 0:
+                print(f"(couldn't connect to {target} — remote mode not enabled)")
+                continue
+            REMOTE_MODE_HOST = target
+            print(f"(remote mode: on — run_command/read_file/write_file now target {target} "
+                  f"instead of this machine. /local to go back.)")
+            continue
+        if user == "/local":
+            if REMOTE_MODE_HOST:
+                print(f"(remote mode: off — was {REMOTE_MODE_HOST}, back to running locally)")
+            else:
+                print("(remote mode was already off)")
+            REMOTE_MODE_HOST = None
             continue
         if user == "/backend":
             print(f"(backend: {backend})")
@@ -4348,6 +4992,22 @@ def main():
             continue
         if user == "/tokens":
             print_tokens("session", totals["in"], totals["out"])
+            continue
+        if user == "/hosts":
+            aliases = load_host_aliases()
+            if not aliases:
+                print(f"(no saved host aliases — add them to {HOST_ALIASES_PATH})")
+            else:
+                for alias_name, entry in sorted(aliases.items()):
+                    kind = entry.get("type", "?")
+                    if kind == "ssh":
+                        detail = f"ssh -> {entry.get('user', '?')}@{entry.get('host', '?')}"
+                    elif kind == "ha_api":
+                        detail = f"ha_api -> {entry.get('base_url', '?')}"
+                    else:
+                        detail = kind
+                    extra = " (+ ha_api)" if entry.get("ha_api") else ""
+                    print(f"  {alias_name}: {detail}{extra}")
             continue
         if user == "/agentic":
             print(f"(agentic mode: {'on' if agentic_mode else 'off'})")
@@ -4509,6 +5169,9 @@ def main():
             continue
         if user.startswith("/read"):
             do_read(user[5:], messages, convert_mode)
+            continue
+        if user.startswith("/transcript"):
+            do_transcript(user[len("/transcript"):])
             continue
         if user.startswith("/find"):
             do_find(user[5:])
