@@ -67,11 +67,15 @@ OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
 MODELS_ROOT = pathlib.Path.home() / "Models"
 TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-nvmai"
-TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "NVMAIServer"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TinyTitanServer"
 TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
 TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
-# Ornith 1.5 shares the same NVMAI repo/binary as Qwen -- same install, just a
-# different repacked model file and port, so it can run side by side.
+# Ornith 1.5 shares the same repo/binary as Qwen -- same install, just a
+# different repacked model file and port, so it can run side by side. The
+# repo/binary was NVMAI/NVMAIServer before the 2026-09 upstream rename to
+# TinyTitan/TinyTitanServer -- the directory on disk is still literally
+# named turbo-fieldfare-nvmai (renaming it is a separate, more disruptive
+# change since other scripts/paths reference it by that name).
 TURBO_ORNITH_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "ornith15.gturbo"
 TURBO_ORNITH_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-ornith-server.log"
 TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"

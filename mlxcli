@@ -113,11 +113,15 @@ BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
 OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
 MODELS_ROOT = pathlib.Path.home() / "Models"
 TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-nvmai"
-TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "NVMAIServer"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TinyTitanServer"
 TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
 TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
-# Ornith 1.5 shares the same NVMAI repo/binary as Qwen -- same install, just a
-# different repacked model file and port, so it can run side by side.
+# Ornith 1.5 shares the same repo/binary as Qwen -- same install, just a
+# different repacked model file and port, so it can run side by side. The
+# repo/binary was NVMAI/NVMAIServer before the 2026-09 upstream rename to
+# TinyTitan/TinyTitanServer -- the directory on disk is still literally
+# named turbo-fieldfare-nvmai (renaming it is a separate, more disruptive
+# change since other scripts/paths reference it by that name).
 TURBO_ORNITH_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "ornith15.gturbo"
 TURBO_ORNITH_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-ornith-server.log"
 TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
@@ -833,7 +837,7 @@ def ensure_server(backend, url, key):
             # Raised to 1024MB and given a disk tier so cache entries also
             # survive a server restart/idle-unload -- disk space is not a
             # concern here (276GB free).
-            prompt_cache_dir = pathlib.Path.home() / ".omlx" / "nvmai-prompt-cache" / backend
+            prompt_cache_dir = pathlib.Path.home() / ".omlx" / "tinytitan-prompt-cache" / backend
             prompt_cache_dir.mkdir(parents=True, exist_ok=True)
             launch_args += [
                 "--ram-budget", "8G",
@@ -850,7 +854,11 @@ def ensure_server(backend, url, key):
             # this took the server down entirely on 2026-08-26), so only set
             # it once that export has actually been run for this model.
             if (paths["model_dir"] / "ane_prefill" / "ane_prefill.json").exists():
-                launch_env["NVMAI_PREFILL_ANE"] = "on"
+                # Renamed upstream from NVMAI_PREFILL_ANE to TINYTITAN_PREFILL_ANE
+                # in the TinyTitan rename (2026-09) -- the old name is silently
+                # ignored by the new binary (no crash, ANE prefill just never
+                # turns on), so this was a real functional regression until fixed.
+                launch_env["TINYTITAN_PREFILL_ANE"] = "on"
         subprocess.Popen(
             launch_args,
             cwd=paths["root"],
