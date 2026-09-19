@@ -2636,6 +2636,16 @@ class MlxGui(tk.Tk):
             for i, r in enumerate(results, 1):
                 lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
             return "\n".join(lines)[:MAX_FILE_CHARS]
+        if name in ("ssh_run", "ssh_read", "ssh_write"):
+            # This GUI has no SSH implementation at all (unlike mlxcli's
+            # terminal REPL, which fully supports these) -- rather than a
+            # bare "Unknown tool" that reads like a wiring bug, tell the
+            # model plainly so it relays the right next step to the user
+            # instead of retrying variations or claiming it tried.
+            return (f"'{name}' is not available in this GUI. Remote SSH access to a server "
+                    f"or device isn't implemented here — tell the user to run this request in "
+                    f"mlxcli (the terminal version) instead, which fully supports {name} and "
+                    f"saved host aliases. Do not attempt a workaround or retry with a different tool.")
         return f"Unknown tool: {name}"
 
     def finish_canceled_response(self, partial_text):

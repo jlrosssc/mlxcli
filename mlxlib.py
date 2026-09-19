@@ -554,8 +554,15 @@ TOOLS = [
         "description": "Call a Home Assistant instance's REST API on a saved alias (e.g. \"unity\", or "
                         "\"dad\" — which is also reachable this way in addition to ssh_run/ssh_read/"
                         "ssh_write). The auth token is resolved from local storage automatically — never "
-                        "ask the user for it. Common paths: GET /api/states or /api/states/<entity_id> to "
-                        "read state; POST /api/services/<domain>/<service> with `data` as the JSON body "
+                        "ask the user for it. There is no dedicated endpoint for automations, config review, "
+                        "or any other entity category — GET /api/states always returns every entity across "
+                        "every domain in one call; filter the result yourself afterward (e.g. entity_id "
+                        "starting with \"automation.\" for automations, \"switch.\"/\"light.\" for those "
+                        "domains). Never guess a narrower path like /api/states/automation, /api/automations, "
+                        "/api/config/automation/all, or a query-string filter (?domain=, ?entity_id=) — none "
+                        "of these exist and will 404. Other real paths: GET /api/states/<entity_id> for one "
+                        "entity's full state/attributes; GET /api/config for instance info (version, location, "
+                        "component list); POST /api/services/<domain>/<service> with `data` as the JSON body "
                         "to call a service (e.g. domain=light, service=turn_on).",
         "parameters": {"type": "object", "properties": {
             "host": {"type": "string", "description": "saved alias name, e.g. \"unity\" or \"dad\" — same "
