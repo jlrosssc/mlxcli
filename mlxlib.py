@@ -586,6 +586,108 @@ TOOLS = [
 ]
 
 
+# Deterministic, no-model-call safety net for ssh_run: catches well-known
+# destructive command shapes (rm -rf on a broad path, git reset --hard, git
+# clean -f, terraform destroy, docker volume rm, SQL DROP/TRUNCATE) before
+# run_ssh_command() ever sends them to a remote host. Pure string/regex
+# checks — no model turn, no network round-trip, so a bad command is caught
+# even if the model itself didn't flag it as risky. The rm/git-clean checks
+# tokenize the flag argument instead of enumerating exact flag orderings
+# (e.g. "-rf" vs "-fr" vs "-r -f" vs "--recursive --force" all mean the same
+# thing) — a hand-enumerated alternation list is exactly the kind of thing
+# that quietly misses a real-world variant. Overridable only by an explicit,
+# deliberate keyword in the user's own message ("discard", "wipe", "start
+# fresh", "force", "really do it") — a false negative here is worse than a
+# false positive, since the user can just rephrase to get past a block that
+# was actually fine.
+# Prefixes conventionally understood as ephemeral/scratch space — safe to
+# treat as low-risk even under rm -rf. Everything else absolute or
+# home-relative is treated as dangerous: a false negative on a real remote
+# host costs far more than an easily-overridden false positive.
+_SAFE_RM_PREFIXES = ("/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/")
+_SAFE_RM_EXACT = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp")
+
+
+def _rm_path_is_dangerous(path):
+    if path in (".", "..", "*", "/", "~"):
+        return True
+    if path in _SAFE_RM_EXACT:
+        return False
+    if path.startswith(_SAFE_RM_PREFIXES):
+        return False
+    return path.startswith("/") or path.startswith("~")
+
+
+def _rm_is_dangerous(cmd):
+    """True if `cmd` contains an `rm` call combining recursive+force flags
+    (any spelling/order) against a path outside known-safe scratch space."""
+    for match in re.finditer(r"\brm\s+([^\n;|&]*)", cmd):
+        has_recursive = has_force = False
+        path_tokens = []
+        for token in match.group(1).split():
+            if token in ("--recursive", "-r", "-R"):
+                has_recursive = True
+            elif token == "--force":
+                has_force = True
+            elif token.startswith("-") and not token.startswith("--"):
+                if any(c in token for c in "rR"):
+                    has_recursive = True
+                if "f" in token:
+                    has_force = True
+            elif not token.startswith("-"):
+                path_tokens.append(token)
+        if has_recursive and has_force and any(_rm_path_is_dangerous(p) for p in path_tokens):
+            return True
+    return False
+
+
+def _git_clean_is_dangerous(cmd):
+    """True if `cmd` contains a `git clean` call with a force flag in any
+    spelling (-f, -fd, -fdx, --force, ...) — force alone already deletes
+    untracked files regardless of -d/-x."""
+    for match in re.finditer(r"\bgit\s+clean\s+([^\n;|&]*)", cmd):
+        for token in match.group(1).split():
+            if token == "--force":
+                return True
+            if token.startswith("-") and not token.startswith("--") and "f" in token:
+                return True
+    return False
+
+
+_DESTRUCTIVE_COMMAND_CHECKS = [
+    (_rm_is_dangerous, "rm -rf (or equivalent) on a root/home/top-level path — irreversible deletion"),
+    (_git_clean_is_dangerous, "git clean with a force flag — deletes untracked files"),
+    (lambda c: re.search(r"\bgit\s+reset\s+--hard\b", c) is not None,
+     "git reset --hard — discards local commits and uncommitted changes"),
+    (lambda c: re.search(r"\bterraform\s+destroy\b", c) is not None,
+     "terraform destroy — tears down provisioned infrastructure"),
+    (lambda c: re.search(r"\bdocker\s+volume\s+rm\b", c) is not None,
+     "docker volume rm — removes persisted volume data"),
+    (lambda c: (re.search(r"\b(DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE\s+TABLE)\b", c, re.IGNORECASE) is not None
+                and re.search(r"\b(mysql|psql|sqlite3|mongosh|mongo|redis-cli)\b", c, re.IGNORECASE) is not None),
+     "SQL DROP/TRUNCATE passed to a database client — destroys table or database contents"),
+]
+
+_OVERRIDE_INTENT_KEYWORDS = ("discard", "wipe", "start fresh", "force", "really do it")
+
+
+def is_destructive_command(cmd):
+    """Return (True, description) if cmd matches a known destructive shape,
+    else (False, None). Pure lexical check — no model or network call."""
+    cmd = cmd or ""
+    for check, description in _DESTRUCTIVE_COMMAND_CHECKS:
+        if check(cmd):
+            return True, description
+    return False, None
+
+
+def has_override_intent(user_message):
+    """Whether the user's latest message contains an explicit, deliberate
+    override keyword permitting a destructive command to proceed anyway."""
+    lowered = (user_message or "").lower()
+    return any(keyword in lowered for keyword in _OVERRIDE_INTENT_KEYWORDS)
+
+
 def term_present(term, lowered_text):
     """Match a keyword as a real word, not a substring buried inside an unrelated
     word — e.g. "test" inside a path like "testLocalAI", or "put" inside "input".

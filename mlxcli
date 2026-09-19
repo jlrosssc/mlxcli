@@ -90,6 +90,7 @@ from mlxlib import (
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
+    is_destructive_command, has_override_intent,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -1170,7 +1171,7 @@ def _arg_str(value):
     return str(value)
 
 
-def exec_tool(name, args):
+def exec_tool(name, args, current_user_text=None):
     # Some local backends qualify function names as shell:run_command or shell.run_command.
     # Normalize those names before dispatching so valid tool calls are not silently lost.
     raw_name = str(name or "")
@@ -1280,6 +1281,19 @@ def exec_tool(name, args):
             if sudo_pw is None:
                 return "Error: {{SUDO_PASSWORD}} placeholder used, but no stored sudo password for this host alias."
             cmd = cmd.replace("{{SUDO_PASSWORD}}", sudo_pw)
+        # Lightweight, no-model-call safety net: reject well-known destructive
+        # command shapes before they ever reach the remote host, regardless of
+        # whether the model itself flagged the risk. Bypass only on an
+        # explicit override keyword in the user's own message (see
+        # has_override_intent / is_destructive_command in mlxlib.py).
+        if not has_override_intent(current_user_text):
+            is_bad, why = is_destructive_command(cmd)
+            if is_bad:
+                return (f"Blocked: this command matches a known destructive pattern "
+                        f"({why}). Refused to send it to {host} without explicit "
+                        f"confirmation. If this is intentional, rephrase the request "
+                        f"using a word like 'discard', 'wipe', 'start fresh', 'force', "
+                        f"or 'really do it' and it will be allowed through.")
         print(f"  tool: ssh_run ({host}: {cmd})")
         if not approve(f"ssh run {host}: {cmd}", category="ssh_run"):
             return "User declined."
@@ -4009,7 +4023,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                     repeated_failure = True
             else:
                 try:
-                    result = exec_tool(fn, args)
+                    result = exec_tool(fn, args, current_user_text=original_user_text)
                 except Exception as exc:
                     # exec_tool is expected to catch its own failures and return
                     # an error string -- but if something unexpected still raises
@@ -4076,7 +4090,64 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     return turn_in, turn_out
 
 
+# How many of the most recent user turns are left fully intact by
+# compact_old_tool_content — anything older has its bulky tool_calls
+# arguments/tool-role results blanked (same technique as
+# compact_turn_messages, just applied across turn boundaries instead of
+# within one). This runs before trim()'s hard structural cutoffs, so a
+# conversation keeps more of its actual back-and-forth (what was asked, what
+# the model said) in the same character budget, instead of old turns being
+# dropped wholesale just because their tool payloads were large. Blanked
+# content is gone the same as a hard cut once a turn ages past
+# MAX_HISTORY_TURNS entirely -- this only buys those turns more time before
+# that happens, it doesn't make trim() itself non-destructive.
+KEEP_RECENT_TURNS_INTACT = 3
+
+
+def compact_old_tool_content(messages, keep_recent_turns=KEEP_RECENT_TURNS_INTACT):
+    """Blank bulky tool_calls arguments / tool-role results belonging to
+    turns older than the most recent keep_recent_turns user turns. Same
+    marker style as compact_turn_messages; message count/order unchanged."""
+    starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(starts) <= keep_recent_turns:
+        return messages, 0
+    protect_from = starts[-keep_recent_turns]
+    new_messages = list(messages)
+    chars_saved = 0
+    for i in range(protect_from):
+        m = new_messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            compacted_calls = []
+            changed = False
+            for tc in m["tool_calls"]:
+                args_str = tc.get("function", {}).get("arguments") or ""
+                if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
+                    tc = copy.deepcopy(tc)
+                    tc["function"]["arguments"] = json.dumps({
+                        "__compacted__": True,
+                        "fn": tc.get("function", {}).get("name", "?"),
+                        "note": f"{len(args_str):,} chars omitted — from an earlier turn in this conversation",
+                    })
+                    chars_saved += len(args_str) - len(tc["function"]["arguments"])
+                    changed = True
+                compacted_calls.append(tc)
+            if changed:
+                m = dict(m)
+                m["tool_calls"] = compacted_calls
+                new_messages[i] = m
+        elif m.get("role") == "tool":
+            content = m.get("content") or ""
+            if len(content) > COMPACT_MIN_CHARS and not content.startswith("[compacted:"):
+                marker = f"[compacted: {len(content):,} chars omitted — from an earlier turn in this conversation]"
+                m = dict(m)
+                m["content"] = marker
+                new_messages[i] = m
+                chars_saved += len(content) - len(marker)
+    return new_messages, chars_saved
+
+
 def trim(messages):
+    messages, _ = compact_old_tool_content(messages)
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if len(starts) > MAX_HISTORY_TURNS:
         cut = starts[-MAX_HISTORY_TURNS]
