@@ -1063,6 +1063,62 @@ def _unique_call_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def repair_truncated_json(text):
+    """Best-effort recovery for a tool-call arguments string that's valid
+    JSON except for being cut off mid-way (a stream_error breaking the
+    response mid-tool-call, a max_tokens cutoff, a provider that reused a
+    streaming index across two different tool calls and glued their
+    fragments together) — closes an unterminated string and/or unclosed
+    braces/brackets, then re-checks that the result actually parses.
+
+    Deliberately conservative: only ever ADDS closing punctuation at the
+    end, never rewrites/removes anything from the interior, so it can't
+    turn a well-formed-but-semantically-wrong payload into something that
+    looks superficially more valid than it is. Returns the parsed dict on
+    success, or None if the string still isn't recoverable this way (the
+    caller's existing "fall back to an empty dict rather than crash"
+    behavior is unaffected either way)."""
+    if not text or not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    fixed = text
+    in_string = False
+    escaped = False
+    depth_stack = []
+    for ch in fixed:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth_stack.append(ch)
+        elif ch in "}]":
+            if depth_stack:
+                depth_stack.pop()
+
+    if in_string:
+        fixed += '"'
+    for opener in reversed(depth_stack):
+        fixed += "}" if opener == "{" else "]"
+
+    if fixed == text:
+        return None  # nothing to add — the JSON was just plain broken, not truncated
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        return None
+
+
 def parse_bare_json_tool_call(content):
     """Some backends occasionally emit a tool call as plain text: the bare
     function name on its own line, followed by a raw JSON object of arguments —

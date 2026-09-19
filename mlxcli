@@ -90,7 +90,7 @@ from mlxlib import (
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
-    is_destructive_command, has_override_intent,
+    is_destructive_command, has_override_intent, repair_truncated_json,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -4045,10 +4045,21 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
         for call in tool_calls:
             fn = normalize_tool_name(call["function"]["name"])
             call["function"]["name"] = fn
+            args_str = call["function"].get("arguments") or "{}"
             try:
-                args = json.loads(call["function"].get("arguments") or "{}")
+                args = json.loads(args_str)
             except json.JSONDecodeError:
-                args = {}
+                # A stream_error break, a max_tokens cutoff, or a streaming
+                # index collision can leave this arguments string truncated
+                # mid-object rather than genuinely malformed -- try to
+                # recover it before giving up to an empty dict, which would
+                # otherwise silently discard an otherwise-fine tool call
+                # (e.g. a real ssh host/command) over nothing worse than a
+                # missing closing brace.
+                repaired = repair_truncated_json(args_str)
+                if repaired is not None:
+                    print("  (recovered a truncated tool-call arguments string)")
+                args = repaired if repaired is not None else {}
             call_key = (fn, json.dumps(args, sort_keys=True, ensure_ascii=False))
             # run_command/python_interpreter results depend on external state
             # (the filesystem, running processes) that legitimately changes
