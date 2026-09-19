@@ -1051,13 +1051,42 @@ def prune_stopped_sandbox_containers():
             subprocess.run(["container", "delete", "-f", cid], capture_output=True)
 
 
+# Signature of the one specific failure ensure_sandbox_container knows how
+# to self-heal: the container-apiserver launchd service simply isn't up yet
+# (it doesn't auto-start on login/reboot). Any other failure (tool missing,
+# image missing, genuine timeout under load, etc.) falls straight through to
+# the existing give-up-and-fall-back behavior instead of retrying blindly.
+_APISERVER_DOWN_MARKERS = ("XPC connection error", "apiserver is not running", "container system start")
+
+
+def _apiserver_down(message):
+    return any(marker in message for marker in _APISERVER_DOWN_MARKERS)
+
+
+def _run_sandbox_container_once(workdir):
+    return subprocess.run(
+        ["container", "run", "-d", "--name", SANDBOX_CONTAINER_NAME,
+         "-v", f"{workdir}:/workspace", "-w", "/workspace",
+         SANDBOX_IMAGE, "sleep", "infinity"],
+        capture_output=True, text=True, timeout=60)
+
+
 def ensure_sandbox_container():
     """Start the sandbox container on first use (idempotent). The working
     directory is bind-mounted at /workspace so writes there are visible on
     the host in real time; writes elsewhere land only in the container's
     own ephemeral filesystem and vanish with it. Disables SANDBOX_MODE for
     the rest of the session (falling back to direct host execution, same as
-    a plain -y run today) if the container tool isn't actually available."""
+    a plain -y run today) if the container tool isn't actually available.
+
+    One self-healing retry: `container-apiserver` (Apple's container runtime
+    daemon) isn't launchd-registered to auto-start, so on a fresh login/
+    reboot the very first sandboxed run of the day would otherwise always
+    fail and permanently disable sandboxing for that whole session even
+    though the fix is a single `container system start` away. Detected by
+    matching the specific failure text rather than retrying on any error —
+    a missing binary or a genuinely broken image shouldn't retry, just fail
+    the same way it always did."""
     global _sandbox_started, SANDBOX_MODE
     if _sandbox_started or not SANDBOX_MODE:
         return
@@ -1066,15 +1095,21 @@ def ensure_sandbox_container():
     subprocess.run(["container", "delete", "-f", SANDBOX_CONTAINER_NAME],
                     capture_output=True)  # clear a stale container from a crashed prior run
     try:
-        p = subprocess.run(
-            ["container", "run", "-d", "--name", SANDBOX_CONTAINER_NAME,
-             "-v", f"{workdir}:/workspace", "-w", "/workspace",
-             SANDBOX_IMAGE, "sleep", "infinity"],
-            capture_output=True, text=True, timeout=60)
+        p = _run_sandbox_container_once(workdir)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         print(f"  (sandbox container failed to start ({e}) — falling back to unsandboxed execution)")
         SANDBOX_MODE = False
         return
+    if p.returncode != 0 and _apiserver_down(p.stderr):
+        print("  (container-apiserver isn't running yet — starting it and retrying once)")
+        subprocess.run(["container", "system", "start"], capture_output=True, timeout=30)
+        try:
+            p = _run_sandbox_container_once(workdir)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"  (sandbox container failed to start after apiserver restart ({e}) — "
+                  f"falling back to unsandboxed execution)")
+            SANDBOX_MODE = False
+            return
     if p.returncode != 0:
         print(f"  (sandbox container failed to start: {p.stderr.strip()} — falling back to unsandboxed execution)")
         SANDBOX_MODE = False
