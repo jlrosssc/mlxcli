@@ -53,7 +53,7 @@ from mlxlib import (
     load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
     MODEL_SETTING_BOUNDS, clamp_model_setting,
     record_last_artifact, last_artifact_system_note,
-    caffeinate_guard, log_error, tail_error_log, ERROR_LOG_PATH,
+    caffeinate_guard, server_busy_guard, log_error, tail_error_log, ERROR_LOG_PATH,
     rag_remote_config, rag_remote_search, web_search,
     load_host_aliases, keychain_get, request as ha_http_request, api as ha_http_api,
 )
@@ -3287,7 +3287,13 @@ class MlxGui(tk.Tk):
     def stream_reply(self, model):
         # Guard the whole turn (all agentic tool-call retries included) so a
         # long local generation can't get killed by the Mac going to sleep.
-        with caffeinate_guard():
+        # server_busy_guard is the other half: mlxcli already held this same
+        # exclusive lock for its own turns, but mlxgui never acquired it,
+        # meaning a GUI request could hit the model server concurrently with
+        # an in-flight mlxcli turn instead of waiting its turn -- a real
+        # incident traced to exactly this gap (a headless mlxcli --run died
+        # silently, no traceback, right around when a GUI command was sent).
+        with caffeinate_guard(), server_busy_guard():
             self._stream_reply_body(model)
 
     def _stream_reply_body(self, model):
