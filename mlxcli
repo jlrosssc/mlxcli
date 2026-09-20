@@ -46,6 +46,14 @@ Usage:
                              for summarization, where that heuristic false-positives on
                              ordinary words in the pasted text and wrongly grants tool
                              access the task never needed.
+  mlxcli --run "task" --max-steps N
+                             override the default MAX_TOOL_STEPS (mlxlib.py) for this
+                             run — for a task known up front to need a lot of
+                             exploratory tool calls, so it doesn't get cut off
+                             mid-write. On any abrupt stop (step limit, or the model
+                             repeating an already-failed call), files written so far
+                             this turn are listed as a warning — their contents may be
+                             incomplete or inconsistent, not a finished result.
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
@@ -1316,6 +1324,13 @@ def exec_tool(name, args, current_user_text=None):
         # rather than silently sending an unauthenticated/wrong-user request.
         if username and "@" not in host:
             host = f"{username}@{host}"
+        # Keep the placeholder form for anything shown to the user (print,
+        # approval prompt) -- only the copy actually sent over SSH gets the
+        # real password substituted in. The substituted `cmd` used to be what
+        # got printed/shown to approve(), leaking the plaintext sudo password
+        # into the terminal transcript and approval dialog every time this
+        # mechanism fired.
+        display_cmd = cmd
         if "{{SUDO_PASSWORD}}" in cmd:
             # Lets a command need sudo on a named alias (e.g. dad) without the
             # model ever seeing the real password — substituted here, at
@@ -1337,8 +1352,8 @@ def exec_tool(name, args, current_user_text=None):
                         f"confirmation. If this is intentional, rephrase the request "
                         f"using a word like 'discard', 'wipe', 'start fresh', 'force', "
                         f"or 'really do it' and it will be allowed through.")
-        print(f"  tool: ssh_run ({host}: {cmd})")
-        if not approve(f"ssh run {host}: {cmd}", category="ssh_run"):
+        print(f"  tool: ssh_run ({host}: {display_cmd})")
+        if not approve(f"ssh run {host}: {display_cmd}", category="ssh_run"):
             return "User declined."
         if password:
             # Seed the cache so ssh_password_for skips its interactive
@@ -3855,6 +3870,19 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
     return content, tool_calls, usage, stream_error, repetition_detected
 
 
+def _warn_incomplete_writes(written_paths):
+    """Called when a turn is abandoned (step limit or repeated-failure guard)
+    instead of finishing normally. written_paths is already tracked for the
+    successful-completion review pass -- reuse it here so a file the model
+    wrote mid-task doesn't sit on disk looking like a finished deliverable
+    when the turn actually never got to verify or finish it."""
+    if not written_paths:
+        return
+    print(f"(warning: {len(written_paths)} file(s) were written/modified this turn but it did not "
+          f"finish normally -- contents may be incomplete or inconsistent, verify before trusting: "
+          f"{', '.join(written_paths)})")
+
+
 def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
     # Guard the whole turn (all agentic tool-call retries included, not just
     # one HTTP request) so a long local generation can't get killed by the
@@ -4132,12 +4160,14 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
         if repeated_failure:
             log_error("chat_turn", f"stopped: repeated already-failed tool call (backend={backend}, model={model})")
             print("(stopped: the model repeated an already-failed tool call instead of adapting)")
+            _warn_incomplete_writes(written_paths)
             totals["in"] += turn_in
             totals["out"] += turn_out
             print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
             return turn_in, turn_out
     log_error("chat_turn", f"stopped: too many tool steps (backend={backend}, model={model})")
     print("(stopped: too many tool steps — break the task into smaller pieces)")
+    _warn_incomplete_writes(written_paths)
     totals["in"] += turn_in
     totals["out"] += turn_out
     print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
@@ -4703,6 +4733,7 @@ def parse_args(argv):
     verify_history_dir = None
     transcript_url = None
     no_agentic = False
+    max_steps = None
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
@@ -4732,13 +4763,24 @@ def parse_args(argv):
         elif argv[i] == "--verify-history" and i + 1 < len(argv):
             verify_history_dir = argv[i + 1]
             i += 2
+        elif argv[i] == "--max-steps" and i + 1 < len(argv):
+            # Overrides the default MAX_TOOL_STEPS (mlxlib.py) for this run —
+            # for tasks known up front to need a lot of exploratory tool
+            # calls, so they don't get silently cut off (see
+            # _warn_incomplete_writes) partway through a file write.
+            try:
+                max_steps = max(1, int(argv[i + 1]))
+            except ValueError:
+                print(f"(--max-steps expects an integer, got {argv[i + 1]!r} -- ignoring)")
+            i += 2
         elif argv[i] in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
         else:
             model = argv[i]
             i += 1
-    return model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir, transcript_url, no_agentic
+    return (model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir,
+            transcript_url, no_agentic, max_steps)
 
 
 def print_repo_update_notice_if_any(root, label):
@@ -4790,7 +4832,12 @@ def main():
     backend, url, key = load_cfg()
     global SHOW_THINKING
     global REMOTE_MODE_HOST
-    model_arg, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir, transcript_url, no_agentic = parse_args(sys.argv[1:])
+    global MAX_TOOL_STEPS
+    (model_arg, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir,
+     transcript_url, no_agentic, max_steps_override) = parse_args(sys.argv[1:])
+    if max_steps_override is not None:
+        MAX_TOOL_STEPS = max_steps_override
+        print(f"  (max tool steps for this run: {MAX_TOOL_STEPS})")
     if transcript_url:
         # Delegates to yt_summarize.py (in the default directory) rather than
         # duplicating its transcript-fetch/summarize logic here -- that script
