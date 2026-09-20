@@ -1448,6 +1448,11 @@ class MlxGui(tk.Tk):
         self.turn_start_time = None
         self.working_started_at = None
         self.working_after = None
+        self.indicator_active = False
+        self.indicator_start_index = None
+        self.indicator_label = ""
+        self.indicator_frame = 0
+        self.indicator_after = None
         self.resource_after = None
         self.context_widget = None
         self.cancel_requested = False
@@ -1547,6 +1552,8 @@ class MlxGui(tk.Tk):
             spacing3=10,
         )
         self.chat.tag_configure("meta", foreground="#667085", font=small_font, spacing1=8, spacing3=8)
+        working_font = tkfont.Font(family="Helvetica", size=13, slant="italic")
+        self.chat.tag_configure("working_indicator", foreground="#8a8f98", font=working_font, spacing1=4, spacing3=4)
         self.chat.tag_configure(
             "heading",
             foreground="#111111",
@@ -2104,6 +2111,51 @@ class MlxGui(tk.Tk):
         self.working_var.set(f"Working {elapsed}s")
         self.working_after = self.after(1000, self.update_working_elapsed)
 
+    # The small status-bar text and elapsed counter above are easy to miss
+    # since a user's attention during a turn is naturally on the chat pane --
+    # and once a model turn involves any tool call (effectively always, since
+    # tools are offered on every turn now), streamed text is buffered and
+    # nothing appears there at all until the whole turn finishes, which reads
+    # as a stall even when a slow ssh_run or shell command is actively
+    # running. This puts a live, animating placeholder directly in the chat
+    # pane, right where the eye already is, updated in place as tool status
+    # changes and cleared the moment real content is ready to display.
+    _INDICATOR_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def show_working_indicator(self, label):
+        self.indicator_label = label
+        if self.indicator_active:
+            return
+        self.indicator_active = True
+        self.indicator_start_index = self.chat.index("end-1c")
+        self.indicator_frame = 0
+        self._render_working_indicator()
+
+    def _render_working_indicator(self):
+        if not self.indicator_active or self.indicator_start_index is None:
+            self.indicator_after = None
+            return
+        frame = self._INDICATOR_FRAMES[self.indicator_frame % len(self._INDICATOR_FRAMES)]
+        self.indicator_frame += 1
+        elapsed = int(time.time() - self.working_started_at) if self.working_started_at else 0
+        self.chat.delete(self.indicator_start_index, "end-1c")
+        self.chat.insert(self.indicator_start_index, f"{frame} {self.indicator_label}... ({elapsed}s)",
+                          "working_indicator")
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+        self.indicator_after = self.after(150, self._render_working_indicator)
+
+    def hide_working_indicator(self):
+        if not self.indicator_active:
+            return
+        self.indicator_active = False
+        if self.indicator_after is not None:
+            self.after_cancel(self.indicator_after)
+            self.indicator_after = None
+        if self.indicator_start_index is not None:
+            self.chat.delete(self.indicator_start_index, "end-1c")
+            self.indicator_start_index = None
+
     def quit_app(self):
         self.stop_working()
         self.stop_resource_refresh()
@@ -2653,6 +2705,7 @@ class MlxGui(tk.Tk):
         return f"Unknown tool: {name}"
 
     def finish_canceled_response(self, partial_text):
+        self.hide_working_indicator()
         if self.current_stream_start and self.current_stream_end and partial_text:
             self.style_assistant_range(self.current_stream_start, self.current_stream_end)
         if self.pending_user_index is not None and self.pending_user_index < len(self.messages):
@@ -3228,6 +3281,7 @@ class MlxGui(tk.Tk):
         self.busy = True
         self.send_button.configure(state="disabled")
         self.start_working("Waiting for model response")
+        self.show_working_indicator("Waiting for model response")
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
 
     def stream_reply(self, model):
@@ -3503,6 +3557,7 @@ class MlxGui(tk.Tk):
                 elif kind == "tool_history":
                     self.messages.append(event[1])
                 elif kind == "append":
+                    self.hide_working_indicator()
                     self.append_model_text(event[1])
                 elif kind == "refined":
                     _raw_request, refined, usage = event[1], event[2], event[3]
@@ -3529,6 +3584,7 @@ class MlxGui(tk.Tk):
                     self.append(f"\n[refiner error] {event[1]}\n")
                 elif kind == "status":
                     self.status_var.set(event[1])
+                    self.show_working_indicator(event[1])
                 elif kind == "server_status":
                     self.update_hero_status(event[1])
                 elif kind == "repo_updates":
@@ -3555,6 +3611,7 @@ class MlxGui(tk.Tk):
                     if models:
                         self.model_var.set(labels[0])
                 elif kind == "done":
+                    self.hide_working_indicator()
                     content, usage = event[1], event[2]
                     self.pending_user_index = None
                     self.cancel_requested = False
