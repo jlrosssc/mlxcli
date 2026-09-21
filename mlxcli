@@ -4280,9 +4280,26 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                     written_paths.append(written_match.group(1))
                     if written_match.group(1).endswith(".py"):
                         written_py_paths.append(written_match.group(1))
+            # Captured before tool_state["run"] is updated below, so it means
+            # "a run already succeeded before this call" -- i.e. this call is
+            # itself a re-check, not the first execution.
+            already_ran = tool_state.get("run", False)
             if fn in {"run_command", "python_interpreter"} and not tool_result_failed(result):
                 tool_state["run"] = True
-            if fn == "read_file" or (fn in {"run_command", "python_interpreter"} and "stat " in (args.get("command", "") if isinstance(args, dict) else "")):
+            # "verify" used to require read_file or a command literally
+            # containing "stat " -- far too narrow. A real run (Ornith,
+            # 2026-09-21) asked to "run it and confirm the output" ran the
+            # script, then re-checked with `ls -l`, `wc -l`/`sed -n`, and
+            # re-running the script again -- all genuine confirmation, none
+            # of which matched "stat ". The contract never got satisfied, so
+            # the turn looped on "(verification incomplete: verify...)" for
+            # dozens of steps and ended unverified even though the on-disk
+            # result was already correct. Any successful run_command/
+            # python_interpreter call that happens *after* an earlier
+            # successful run is inherently a re-check of that run's result,
+            # so it counts as verification too.
+            if fn == "read_file" or (fn in {"run_command", "python_interpreter"} and (
+                    "stat " in (args.get("command", "") if isinstance(args, dict) else "") or already_ran)):
                 if not tool_result_failed(result):
                     tool_state["verify"] = True
             last_tool_results.append(result)
