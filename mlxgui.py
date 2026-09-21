@@ -3322,7 +3322,7 @@ class MlxGui(tk.Tk):
         # an in-flight mlxcli turn instead of waiting its turn -- a real
         # incident traced to exactly this gap (a headless mlxcli --run died
         # silently, no traceback, right around when a GUI command was sent).
-        with caffeinate_guard(), server_busy_guard():
+        with caffeinate_guard(), server_busy_guard(on_wait=self.status):
             self._stream_reply_body(model)
 
     def _stream_reply_body(self, model):

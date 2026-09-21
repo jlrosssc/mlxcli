@@ -4021,7 +4021,7 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
     # "the model server is actually in use" for external tooling (e.g. a job
     # queue) that would otherwise only be able to check whether some mlxcli
     # process merely still exists.
-    with caffeinate_guard(), server_busy_guard():
+    with caffeinate_guard(), server_busy_guard(on_wait=print):
         return _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required, contract)
 
 

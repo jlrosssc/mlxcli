@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1445,7 +1446,7 @@ SERVER_BUSY_LOCK_PATH = pathlib.Path.home() / ".omlx" / "mlx_server_busy.lock"
 
 
 @contextlib.contextmanager
-def server_busy_guard():
+def server_busy_guard(on_wait=None):
     """Hold an OS-level exclusive advisory lock for exactly the duration of
     an in-flight chat_turn — the real model-server request/response, plus
     any agentic tool-call retries within that same turn — not the whole
@@ -1460,11 +1461,35 @@ def server_busy_guard():
     the single-threaded model server at the same time — cleaner than
     letting them contend at the network layer. flock is released by the
     kernel the instant this process exits or dies for any reason (including
-    kill -9), so it can never leak stale like a PID-file convention could."""
+    kill -9), so it can never leak stale like a PID-file convention could.
+
+    on_wait, if given, is called once the moment the lock turns out to
+    already be held, and again every 30s while still waiting, each time
+    with a short human-readable message. Without this, a caller blocked
+    here looks identical to one that's genuinely hung -- zero CPU, zero
+    output, no way to tell "another session is mid-turn" from "something
+    is stuck" -- which cost a real multi-hour wait before the cause (an
+    unrelated stuck session still holding this same lock) was found by
+    manually sampling the process. mlxcli passes print; mlxgui passes its
+    own thread-safe status() callback."""
     SERVER_BUSY_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_file = open(SERVER_BUSY_LOCK_PATH, "w")
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if on_wait:
+                on_wait("Waiting for another mlxcli/mlxgui session to finish using the model server...")
+            waited = 0
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(1)
+                    waited += 1
+                    if on_wait and waited % 30 == 0:
+                        on_wait(f"Still waiting on the model server lock ({waited}s so far)...")
         yield
     finally:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
