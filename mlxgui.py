@@ -78,6 +78,12 @@ TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-ser
 # change since other scripts/paths reference it by that name).
 TURBO_ORNITH_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "ornith15.gturbo"
 TURBO_ORNITH_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-ornith-server.log"
+# KAT-Coder-V2.5-Dev installs under models/ (the installer's own "install to
+# models/<id>" path) rather than scratch/ like Qwen/Ornith's manually
+# repacked .gturbo files -- a different install convention, same
+# TinyTitanServer binary and MoE/expert-cache architecture.
+TURBO_KATCODER_MODEL_DIR = TURBO_QWEN_ROOT / "models" / "kat-coder-v2.5_35B_A3B_4Bit"
+TURBO_KATCODER_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-katcoder-server.log"
 TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
 MLXGUI_ICON_PATH = pathlib.Path(__file__).resolve().parent / "mlxgui_icon.png"
 RESOURCE_REFRESH_MS = 5000
@@ -92,7 +98,7 @@ RAG_CACHE_INDEX = "index.json"
 URL_MAX_FETCHES = 2
 URL_MAX_CHARS = 12000
 CONVERT_MODES = ("auto", "all", "off")
-SUPPORTED_BACKENDS = ("omlx", "turbofieldfare-qwen", "turbofieldfare-ornith")
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
 DEFAULT_SYSTEM = (
     "You are a concise assistant running locally on the user's Mac.\n"
     "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
@@ -212,7 +218,7 @@ def save_backend(backend):
 
 
 def is_turbo_backend(backend):
-    return backend in ("turbofieldfare-qwen", "turbofieldfare-ornith")
+    return backend in ("turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
 
 
 def backend_label(backend):
@@ -220,6 +226,7 @@ def backend_label(backend):
         "omlx": "oMLX",
         "turbofieldfare-qwen": "TurboFieldfare Qwen (Qwen 3.6)",
         "turbofieldfare-ornith": "TurboFieldfare Ornith (Ornith 1.5)",
+        "turbofieldfare-katcoder": "TurboFieldfare KAT-Coder (KAT-Coder-V2.5-Dev)",
     }.get(backend, backend)
 
 
@@ -228,6 +235,7 @@ def backend_description(backend):
         "omlx": "General / Flexible",
         "turbofieldfare-qwen": "Qwen 3.6 / Coding",
         "turbofieldfare-ornith": "Ornith 1.5 / Coding",
+        "turbofieldfare-katcoder": "KAT-Coder V2.5 / Coding",
     }.get(backend, "")
 
 
@@ -248,6 +256,14 @@ def backend_paths(backend):
             "log": TURBO_ORNITH_SERVER_LOG,
             "url": "http://127.0.0.1:8083",
         }
+    if backend == "turbofieldfare-katcoder":
+        return {
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_KATCODER_MODEL_DIR,
+            "log": TURBO_KATCODER_SERVER_LOG,
+            "url": "http://127.0.0.1:8082",
+        }
     return {}
 
 
@@ -260,6 +276,7 @@ def load_backend_cfg(backend):
     env_var = {
         "turbofieldfare-qwen": "TURBOFIELDFARE_QWEN_URL",
         "turbofieldfare-ornith": "TURBOFIELDFARE_ORNITH_URL",
+        "turbofieldfare-katcoder": "TURBOFIELDFARE_KATCODER_URL",
     }.get(backend, "TURBOFIELDFARE_URL")
     return os.environ.get(env_var, paths["url"]), os.environ.get("TURBOFIELDFARE_API_KEY", "")
 
@@ -345,20 +362,24 @@ def stop_turbo(backend):
         return False
 
 
+TURBO_BACKENDS = ("turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
+
+
 def stop_other_backend(target_backend, status):
-    # Qwen and Ornith run on different ports and could technically coexist,
-    # but both are ~35B models -- keeping only one loaded at a time avoids
-    # doubling resident RAM for no benefit, so switching to either one stops
-    # the other, same as it stops oMLX.
+    # All ~35B-class turbo backends run on different ports and could
+    # technically coexist, but only one stays loaded at a time to avoid
+    # doubling resident RAM for no benefit -- switching to any backend stops
+    # every other one (not just a single hardcoded "other", now that there
+    # are three turbo backends), same as it stops oMLX.
     if target_backend == "omlx":
-        stopped_qwen = stop_turbo("turbofieldfare-qwen")
-        stopped_ornith = stop_turbo("turbofieldfare-ornith")
-        status("Stopped TurboFieldfare" if stopped_qwen or stopped_ornith else "TurboFieldfare was not running")
+        stopped_any = any([stop_turbo(other) for other in TURBO_BACKENDS])
+        status("Stopped TurboFieldfare" if stopped_any else "TurboFieldfare was not running")
     else:
         stopped_omlx = stop_omlx()
         status("Stopped oMLX" if stopped_omlx else "oMLX was not running")
-        other = "turbofieldfare-ornith" if target_backend == "turbofieldfare-qwen" else "turbofieldfare-qwen"
-        stop_turbo(other)
+        for other in TURBO_BACKENDS:
+            if other != target_backend:
+                stop_turbo(other)
 
 
 def ensure_turbo_status_app():
@@ -389,7 +410,7 @@ def ensure_server(backend, url, key, status):
         log_handle.flush()
         launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
              "--max-context", str(SERVER_MAX_CONTEXT_TOKENS)]
-        if backend in ("turbofieldfare-qwen", "turbofieldfare-ornith"):
+        if backend in TURBO_BACKENDS:
             # Switched to the NVMAI fork (2026-08-23): ~3x measured decode speedup
             # over the old TurboFieldfareServer build. --rdadvise doesn't exist in
             # NVMAIServer's argument parser (unlike the old server) so it's dropped
@@ -1485,7 +1506,7 @@ class MlxGui(tk.Tk):
             textvariable=self.backend_var,
             state="readonly",
             values=[backend_label(name) for name in SUPPORTED_BACKENDS],
-            width=25,
+            width=30,
         )
         self.backend_box.pack(side="left", padx=(6, 12))
         self.backend_box.bind("<<ComboboxSelected>>", self.backend_selection_changed)
