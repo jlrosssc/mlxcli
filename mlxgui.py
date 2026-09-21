@@ -35,7 +35,7 @@ from mlxlib import (
     compute_repo_update_status, compute_model_update_status,
     load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
     MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, SERVER_MAX_CONTEXT_TOKENS,
-    CONVERTIBLE, REVIEWABLE_TEXT, TOOLS,
+    CONVERTIBLE, REVIEWABLE_TEXT, TOOLS, all_tool_schemas, plugin_tools,
     is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
     requires_agentic_execution as gui_requires_agentic_execution,
     execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
@@ -2702,6 +2702,14 @@ class MlxGui(tk.Tk):
                     f"or device isn't implemented here — tell the user to run this request in "
                     f"mlxcli (the terminal version) instead, which fully supports {name} and "
                     f"saved host aliases. Do not attempt a workaround or retry with a different tool.")
+        plugin = plugin_tools().get(name)
+        if plugin:
+            if plugin["requires_approval"] and not self.request_tool_approval(f"{name}:\n{args}"):
+                return "User declined."
+            try:
+                return plugin["run"](args)
+            except Exception as exc:
+                return f"Error running plugin tool '{name}': {exc}"
         return f"Unknown tool: {name}"
 
     def finish_canceled_response(self, partial_text):
@@ -3352,7 +3360,7 @@ class MlxGui(tk.Tk):
             # judgment plus each tool's description and the system prompt's
             # usage rules are what should gate whether a given tool actually
             # gets called, not whether it's offered.
-            payload["tools"] = TOOLS
+            payload["tools"] = all_tool_schemas()
             parts, calls, usage = [], {}, {}
             stream_error = None
             repetition_detected = False

@@ -1048,8 +1048,75 @@ def detect_repetition_loop(text):
     return False
 
 
-KNOWN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
-                     "ssh_run", "ssh_read", "ssh_write", "ha_api", "web_search")
+BUILTIN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
+                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "web_search")
+KNOWN_TOOL_NAMES = BUILTIN_TOOL_NAMES
+
+
+PLUGIN_DIR = pathlib.Path.home() / ".omlx" / "plugins"
+_PLUGIN_REGISTRY = None
+
+
+def load_plugin_tools():
+    """Load user-supplied tool plugins from ~/.omlx/plugins/*.py. Each plugin
+    file must define TOOL_SCHEMA (same shape as one entry in TOOLS, i.e.
+    {"type": "function", "function": {"name", "description", "parameters"}})
+    and a run(args) function returning the tool's result string. It may also
+    define APPROVAL_CATEGORY (str, defaults to the tool name -- used the same
+    way as the category argument to mlxcli's approve()) and REQUIRES_APPROVAL
+    (bool, default True -- set False only for a plugin with no side effects
+    and nothing leaving the local machine).
+
+    A plugin that fails to import, or is missing TOOL_SCHEMA/run, or claims a
+    name already used by a builtin or another plugin, is skipped with a
+    warning rather than aborting startup -- one broken plugin file should
+    never take down the whole CLI/GUI. This is how new tool capabilities get
+    added without editing mlxcli/mlxgui.py/mlxlib.py directly."""
+    registry = {}
+    if not PLUGIN_DIR.is_dir():
+        return registry
+    for path in sorted(PLUGIN_DIR.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"omlx_plugin_{path.stem}", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            schema = module.TOOL_SCHEMA
+            run = module.run
+            name = schema["function"]["name"]
+            if name in BUILTIN_TOOL_NAMES or name in registry:
+                print(f"[plugin] {path.name}: tool name '{name}' already in use, skipping", file=sys.stderr)
+                continue
+            registry[name] = {
+                "schema": schema,
+                "run": run,
+                "category": getattr(module, "APPROVAL_CATEGORY", name),
+                "requires_approval": bool(getattr(module, "REQUIRES_APPROVAL", True)),
+            }
+        except Exception as exc:
+            print(f"[plugin] failed to load {path.name}: {exc}", file=sys.stderr)
+    return registry
+
+
+def plugin_tools():
+    """Cached plugin registry (loaded once per process). Extends
+    KNOWN_TOOL_NAMES in place so the text-fallback tool-call parsers below
+    (parse_bare_json_tool_call, parse_xml_tag_tool_call, parse_attr_tag_tool_call)
+    also recognize plugin tool names from backends with weaker structured
+    function-calling support, not just the primary JSON tool_calls path."""
+    global _PLUGIN_REGISTRY, KNOWN_TOOL_NAMES
+    if _PLUGIN_REGISTRY is None:
+        _PLUGIN_REGISTRY = load_plugin_tools()
+        if _PLUGIN_REGISTRY:
+            KNOWN_TOOL_NAMES = BUILTIN_TOOL_NAMES + tuple(_PLUGIN_REGISTRY.keys())
+    return _PLUGIN_REGISTRY
+
+
+def all_tool_schemas():
+    """TOOLS plus every loaded plugin's schema -- what actually gets sent to
+    the model as the available tool list."""
+    return TOOLS + [p["schema"] for p in plugin_tools().values()]
 
 
 def _unique_call_id(prefix):
