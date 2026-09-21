@@ -57,7 +57,7 @@ Usage:
 
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
-  /convert  /model  /models  /resources  /mem  /tokens  /hosts  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
+  /convert  /model  /models  /resources  /mem  /tokens  /hosts  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /history [clear|remove N[,M,...]]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
 """
 import atexit
 import copy
@@ -323,6 +323,10 @@ HELP = """Commands:
   /models         list models the server offers
   /tflog          show the last lines of the TurboFieldfare server log
   /errorlog [n]   show the last n mlxcli/mlxgui chat-turn errors (default 20; ~/.omlx/error.log)
+  /history        list your past typed prompts (what up-arrow recalls), numbered
+  /history clear  remove ALL prompt history, asks to confirm first
+  /history remove N[,M,...]
+                  remove specific numbered entries shown by /history
   /health         show selected backend health and basic readiness
   /modelsettings  show/edit sampling params for the current backend (temperature, top_p, top_k,
                   repetition_penalty, max_tokens); "set <key> <value>" to change, "reset" to restore defaults
@@ -2612,6 +2616,97 @@ def do_errorlog(arg):
     print(f"{ERROR_LOG_PATH} (last {len(lines)}):")
     for line in lines:
         print(line)
+
+
+def _read_prompt_history():
+    """Every entry currently in the readline prompt-history buffer (not just
+    what's on disk — includes anything typed this session too), oldest
+    first. Returns [] if readline isn't available (e.g. non-interactive)."""
+    if readline is None:
+        return []
+    n = readline.get_current_history_length()
+    return [readline.get_history_item(i) for i in range(1, n + 1)]
+
+
+def _rewrite_prompt_history(lines):
+    """Replace the whole readline history buffer with `lines` (oldest
+    first) and persist immediately, rather than waiting for the atexit
+    save — so a clear/remove is final right away, not just until the next
+    crash. Uses clear_history/add_history rather than remove_history_item,
+    since libedit-backed readline (macOS's default) doesn't reliably
+    support the latter."""
+    if readline is None:
+        return
+    readline.clear_history()
+    for line in lines:
+        readline.add_history(line)
+    try:
+        READLINE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(str(READLINE_HISTORY_PATH))
+    except (OSError, AttributeError, RuntimeError):
+        pass
+
+
+def do_history(arg):
+    """/history                 list saved prompt history, numbered
+    /history clear           remove ALL prompt history (asks to confirm)
+    /history remove N[,M,...] remove specific numbered entries (from the listing)
+    Covers both the in-memory readline buffer and the on-disk file at
+    ~/.omlx/mlxcli_history -- this is your own past chat requests (not
+    replies), kept so the up-arrow key can recall them; it is not related
+    to the model's own conversation memory."""
+    if readline is None:
+        print("(readline isn't available in this session -- nothing to manage)")
+        return
+    raw = arg.strip()
+    entries = _read_prompt_history()
+
+    if not raw:
+        if not entries:
+            print(f"(no prompt history yet — {READLINE_HISTORY_PATH})")
+            return
+        print(f"{READLINE_HISTORY_PATH} ({len(entries)} entries):")
+        for i, line in enumerate(entries, start=1):
+            preview = line if len(line) <= 100 else line[:97] + "..."
+            print(f"  {i}: {preview}")
+        print('(use "/history clear" to remove all, or "/history remove N[,M,...]" for specific entries)')
+        return
+
+    if raw == "clear":
+        if not entries:
+            print("(history is already empty)")
+            return
+        confirm = input(f"Remove all {len(entries)} prompt history entries? This cannot be undone. [y/N] ").strip().lower()
+        if confirm != "y":
+            print("(cancelled)")
+            return
+        _rewrite_prompt_history([])
+        print(f"(cleared all {len(entries)} entries)")
+        return
+
+    if raw.startswith("remove"):
+        nums_raw = raw[len("remove"):].strip()
+        if not nums_raw:
+            print('(usage: /history remove N[,M,...] -- run "/history" first to see entry numbers)')
+            return
+        try:
+            targets = {int(x.strip()) for x in nums_raw.split(",") if x.strip()}
+        except ValueError:
+            print(f"(couldn't parse entry numbers from {nums_raw!r} -- expected e.g. \"3\" or \"3,7,12\")")
+            return
+        valid = {i for i in targets if 1 <= i <= len(entries)}
+        invalid = targets - valid
+        if invalid:
+            print(f"(ignoring out-of-range entr{'y' if len(invalid) == 1 else 'ies'}: {sorted(invalid)})")
+        if not valid:
+            print("(nothing to remove)")
+            return
+        kept = [line for i, line in enumerate(entries, start=1) if i not in valid]
+        _rewrite_prompt_history(kept)
+        print(f"(removed {len(valid)} entr{'y' if len(valid) == 1 else 'ies'}, {len(kept)} remaining)")
+        return
+
+    print('(unrecognized /history subcommand -- use "/history", "/history clear", or "/history remove N[,M,...]")')
 
 
 def _append_system_content(messages, text):
@@ -5301,6 +5396,9 @@ def main():
             continue
         if user == "/errorlog" or user.startswith("/errorlog "):
             do_errorlog(user[len("/errorlog"):])
+            continue
+        if user == "/history" or user.startswith("/history "):
+            do_history(user[len("/history"):])
             continue
         if user == "/defaultdir":
             print(f"(default directory: {load_default_dir()})")
