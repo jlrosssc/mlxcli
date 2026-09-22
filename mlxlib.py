@@ -584,6 +584,18 @@ TOOLS = [
             "query": {"type": "string", "description": "the search query"},
             "max_results": {"type": "integer", "description": "how many results to return (default 5, max 10)"}},
             "required": ["query"]}}},
+    # ask_user is a deliberately separate concern from the approve()/
+    # request_tool_approval() gate that already sits in front of every other
+    # tool call (run_command, write_file, ssh_*, ...): that gate is
+    # permission (may this action run at all?) and the model never even sees
+    # it -- it's a human-side check that happens transparently around
+    # exec_tool/execute_tool. ask_user is structure/logic (which of several
+    # interpretations, what's the right approach?) and the model calls it
+    # directly, on purpose, only when clarify mode is on. Keep these two
+    # asking-the-user paths separate rather than merging them -- e.g. never
+    # route ask_user answers through ALWAYS_APPROVED, and never have this
+    # tool ask a permission-shaped question the approval gate already
+    # covers.
     {"type": "function", "function": {
         "name": "ask_user",
         "description": "Pause and ask the human a direct clarifying question, then wait for their answer "
@@ -594,7 +606,12 @@ TOOLS = [
                         "genuine fork in the road where guessing wrong would produce the wrong outcome (which "
                         "of several plausible interpretations, the exact scope of a destructive or hard-to-"
                         "reverse action, a required detail that's actually missing) -- not for routine "
-                        "ambiguity you can reasonably resolve yourself.",
+                        "ambiguity you can reasonably resolve yourself. This is for deciding WHAT to build "
+                        "or HOW to interpret the request -- never for asking permission to use one of your "
+                        "other tools (writing a file, running a command, etc.). Permission for those is "
+                        "handled automatically and separately, outside this conversation; you do not need "
+                        "the human's go-ahead to call them, so never use ask_user as a substitute for just "
+                        "calling the tool the task actually needs.",
         "parameters": {"type": "object", "properties": {
             "question": {"type": "string", "description": "the specific question to ask the human"},
             "options": {"type": "array", "items": {"type": "string"},
@@ -708,14 +725,19 @@ def has_override_intent(user_message):
 _CLARIFY_INTENT_KEYWORDS = ("clarify", "ask me if unsure", "check with me first", "ask before")
 
 CLARIFY_MODE_SYSTEM_NOTE = (
-    "The user's request invited you to check in before making risky guesses. Before "
-    "proceeding, use the ask_user tool for any genuinely ambiguous or high-stakes "
-    "decision point in this task -- which of several plausible interpretations, the "
-    "exact scope of a destructive or hard-to-reverse action, a required detail that's "
-    "actually missing -- rather than silently picking one and hoping it's right. Ask "
-    "one focused question at a time and wait for the answer before continuing. Do not "
-    "overuse it: routine ambiguity you can reasonably resolve yourself, or a decision "
-    "with no real downside if guessed wrong, doesn't need a question."
+    "The user's request invited you to check in before making risky guesses about the "
+    "STRUCTURE of the outcome -- what to build, or how to interpret an underspecified "
+    "part of the request. Before proceeding, use the ask_user tool for any genuinely "
+    "ambiguous or high-stakes decision point of that kind -- which of several plausible "
+    "interpretations, the exact scope of a destructive or hard-to-reverse action, a "
+    "required detail that's actually missing -- rather than silently picking one and "
+    "hoping it's right. Ask one focused question at a time and wait for the answer "
+    "before continuing. Do not overuse it: routine ambiguity you can reasonably resolve "
+    "yourself, or a decision with no real downside if guessed wrong, doesn't need a "
+    "question. This is a separate, unrelated concern from permission to use your other "
+    "tools (writing a file, running a command, etc.) -- that permission is handled "
+    "automatically outside this conversation regardless of clarify mode, so never call "
+    "ask_user to ask whether you're allowed to do something; just do it."
 )
 
 
