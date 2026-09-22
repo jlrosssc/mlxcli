@@ -584,6 +584,22 @@ TOOLS = [
             "query": {"type": "string", "description": "the search query"},
             "max_results": {"type": "integer", "description": "how many results to return (default 5, max 10)"}},
             "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "ask_user",
+        "description": "Pause and ask the human a direct clarifying question, then wait for their answer "
+                        "before proceeding. Only call this when the user's own request explicitly invited it "
+                        "(it contained a word or phrase like \"clarify\", \"ask me if unsure\", \"check with me "
+                        "first\", or \"ask before\") -- for an ordinary request, use your own best judgment "
+                        "instead and never call this tool. Even when invited, use it sparingly: only for a "
+                        "genuine fork in the road where guessing wrong would produce the wrong outcome (which "
+                        "of several plausible interpretations, the exact scope of a destructive or hard-to-"
+                        "reverse action, a required detail that's actually missing) -- not for routine "
+                        "ambiguity you can reasonably resolve yourself.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "the specific question to ask the human"},
+            "options": {"type": "array", "items": {"type": "string"},
+                        "description": "optional short list of concrete choices, if this is a pick-one decision"}},
+            "required": ["question"]}}},
 ]
 
 
@@ -687,6 +703,31 @@ def has_override_intent(user_message):
     override keyword permitting a destructive command to proceed anyway."""
     lowered = (user_message or "").lower()
     return any(keyword in lowered for keyword in _OVERRIDE_INTENT_KEYWORDS)
+
+
+_CLARIFY_INTENT_KEYWORDS = ("clarify", "ask me if unsure", "check with me first", "ask before")
+
+CLARIFY_MODE_SYSTEM_NOTE = (
+    "The user's request invited you to check in before making risky guesses. Before "
+    "proceeding, use the ask_user tool for any genuinely ambiguous or high-stakes "
+    "decision point in this task -- which of several plausible interpretations, the "
+    "exact scope of a destructive or hard-to-reverse action, a required detail that's "
+    "actually missing -- rather than silently picking one and hoping it's right. Ask "
+    "one focused question at a time and wait for the answer before continuing. Do not "
+    "overuse it: routine ambiguity you can reasonably resolve yourself, or a decision "
+    "with no real downside if guessed wrong, doesn't need a question."
+)
+
+
+def has_clarify_intent(user_message):
+    """Whether the user's latest message asked mlxcli to pause and check in on
+    ambiguous/critical decisions instead of the local model just guessing.
+    Opt-in per request via a keyword, not a standing mode -- most requests
+    don't want every minor ambiguity escalated back to the human, so this
+    (unlike agentic mode) is never auto-detected from the task's content,
+    only from an explicit keyword the user chose to include."""
+    lowered = (user_message or "").lower()
+    return any(keyword in lowered for keyword in _CLARIFY_INTENT_KEYWORDS)
 
 
 def term_present(term, lowered_text):
@@ -1050,7 +1091,7 @@ def detect_repetition_loop(text):
 
 
 BUILTIN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
-                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "web_search")
+                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "web_search", "ask_user")
 KNOWN_TOOL_NAMES = BUILTIN_TOOL_NAMES
 
 

@@ -56,6 +56,7 @@ from mlxlib import (
     caffeinate_guard, server_busy_guard, log_error, tail_error_log, ERROR_LOG_PATH,
     rag_remote_config, rag_remote_search, web_search,
     load_host_aliases, keychain_get, request as ha_http_request, api as ha_http_api,
+    has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE,
 )
 
 
@@ -2562,6 +2563,16 @@ class MlxGui(tk.Tk):
                 return False
         return result["approved"]
 
+    def request_user_answer(self, question, options=None):
+        event = threading.Event()
+        result = {"answer": None, "cancelled": False}
+        self.events.put(("ask_user", question, options or [], event, result))
+        while not event.wait(0.1):
+            if self.cancel_requested:
+                result["cancelled"] = True
+                return None
+        return result["answer"]
+
     def execute_tool(self, name, args):
         name = str(name or "").strip().lower().replace(".", ":").replace("/", ":").rsplit(":", 1)[-1]
         if name == "run_command":
@@ -2713,6 +2724,16 @@ class MlxGui(tk.Tk):
             for i, r in enumerate(results, 1):
                 lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
             return "\n".join(lines)[:MAX_FILE_CHARS]
+        if name == "ask_user":
+            question = str(args.get("question") or "").strip()
+            options = args.get("options") or []
+            if not question:
+                return "Error: ask_user needs a non-empty 'question'."
+            answer = self.request_user_answer(question, options)
+            if answer is None:
+                return "The user did not provide an answer. Proceed using your own best judgment instead."
+            answer = answer.strip()
+            return answer if answer else "The user gave no answer. Proceed using your own best judgment instead."
         if name in ("ssh_run", "ssh_read", "ssh_write"):
             # This GUI has no SSH implementation at all (unlike mlxcli's
             # terminal REPL, which fully supports these) -- rather than a
@@ -3359,6 +3380,11 @@ class MlxGui(tk.Tk):
                 working_messages[0] = {"role": "system", "content": working_messages[0]["content"] + "\n\n" + agentic_note}
             else:
                 working_messages.insert(0, {"role": "system", "content": agentic_note})
+        if has_clarify_intent(self.last_user_text):
+            if working_messages and working_messages[0].get("role") == "system":
+                working_messages[0] = {"role": "system", "content": working_messages[0]["content"] + "\n\n" + CLARIFY_MODE_SYSTEM_NOTE}
+            else:
+                working_messages.insert(0, {"role": "system", "content": CLARIFY_MODE_SYSTEM_NOTE})
         effective_agentic = agentic
         model_settings = load_model_settings(self.backend)
         for _step in range(MAX_TOOL_STEPS):
@@ -3589,6 +3615,22 @@ class MlxGui(tk.Tk):
                     else:
                         approval_result["approved"] = messagebox.askyesno("Approve local tool action", description, parent=self)
                     approval_event.set()
+                elif kind == "ask_user":
+                    _kind, question, options, ask_event, ask_result = event
+                    if self.cancel_requested or ask_result.get("cancelled"):
+                        ask_result["answer"] = None
+                    else:
+                        prompt = question
+                        if options:
+                            prompt += "\n\n" + "\n".join(f"{i}) {opt}" for i, opt in enumerate(options, 1))
+                            prompt += "\n\n(type the number of a choice above, or your own answer)"
+                        answer = simpledialog.askstring("The model is asking", prompt, parent=self)
+                        if answer and options and answer.strip().isdigit():
+                            idx = int(answer.strip())
+                            if 1 <= idx <= len(options):
+                                answer = options[idx - 1]
+                        ask_result["answer"] = answer
+                    ask_event.set()
                 elif kind == "tool_history":
                     self.messages.append(event[1])
                 elif kind == "append":

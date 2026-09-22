@@ -55,6 +55,16 @@ Usage:
                              this turn are listed as a warning — their contents may be
                              incomplete or inconsistent, not a finished result.
 
+Clarify mode (both mlxcli and mlxgui): include a keyword — "clarify", "ask me if
+unsure", "check with me first", or "ask before" — anywhere in a request (REPL,
+--run, or the GUI's input box) to have the model pause and ask a direct question
+via the ask_user tool before making a risky guess on an ambiguous or high-stakes
+decision point, instead of silently picking one interpretation. It waits for your
+typed answer (a dialog box in mlxgui) before continuing. Off by default — ordinary
+requests get no extra questions — and skipped automatically in headless --run
+(nothing to answer it), where the model is told to proceed on its own judgment
+instead. Example: `create an app to show distance, ask me if unsure about units`.
+
 Commands:
   /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
   /convert  /model  /models  /resources  /mem  /tokens  /hosts  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /history [clear|remove N[,M,...]]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
@@ -98,7 +108,8 @@ from mlxlib import (
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
-    is_destructive_command, has_override_intent, repair_truncated_json,
+    is_destructive_command, has_override_intent, has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE,
+    repair_truncated_json,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -735,7 +746,7 @@ def collapse_system_messages(messages):
     return merged
 
 
-def request_messages_for_mode(messages, agentic_mode, backend):
+def request_messages_for_mode(messages, agentic_mode, backend, clarify_mode=False):
     scoped = list(request_messages_for_turn(messages))
     insert_at = 1 if scoped and scoped[0].get("role") == "system" else 0
     if agentic_mode:
@@ -750,6 +761,8 @@ def request_messages_for_mode(messages, agentic_mode, backend):
         scoped.insert(insert_at, {"role": "system", "content": (
             "Agentic mode is disabled. Do not attempt tool use; answer only from the provided conversation context."
         )})
+    if clarify_mode:
+        scoped.insert(insert_at + 1, {"role": "system", "content": CLARIFY_MODE_SYSTEM_NOTE})
     if is_turbo_backend(backend):
         scoped = collapse_system_messages(scoped)
     return scoped
@@ -1488,6 +1501,29 @@ def exec_tool(name, args, current_user_text=None):
             lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
         text = "\n".join(lines)
         return text[:MAX_FILE_CHARS]
+    if name == "ask_user":
+        question = _arg_str(args.get("question")).strip()
+        options = args.get("options") or []
+        if not question:
+            return "Error: ask_user needs a non-empty 'question'."
+        print(f"\n  [model is asking] {question}")
+        if options:
+            for i, opt in enumerate(options, 1):
+                print(f"    {i}) {opt}")
+        if not sys.stdin.isatty():
+            # Headless --run has no one to ask; tell the model plainly rather
+            # than hang forever on input() or silently return an empty answer
+            # it might mistake for a real (blank) response.
+            return ("No human is available to answer (this is a headless/non-interactive run). "
+                    "Proceed using your own best judgment instead, and note the assumption you made.")
+        try:
+            answer = input("  your answer: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "The user did not provide an answer. Proceed using your own best judgment instead."
+        if options and answer.isdigit() and 1 <= int(answer) <= len(options):
+            answer = options[int(answer) - 1]
+        return answer if answer else "The user gave no answer. Proceed using your own best judgment instead."
     if name == "read_file":
         print(f"  tool: read_file ({args.get('path', '')})")
         target = pathlib.Path(args["path"]).expanduser()
@@ -3881,7 +3917,7 @@ def print_tokens(label, in_tokens, out_tokens, elapsed=None):
 
 # ---------- chat ----------
 
-def stream_once(url, key, model, messages, agentic_mode, backend, display_content=True):
+def stream_once(url, key, model, messages, agentic_mode, backend, display_content=True, clarify_mode=False):
     """One streamed request. Returns (content, tool_calls, usage, stream_error).
 
     stream_error is set when the server sends an error payload mid-stream
@@ -3891,7 +3927,7 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
     response looks like an ordinary short/truncated answer.
     """
     settings = load_model_settings(backend)
-    payload = {"model": model, "messages": request_messages_for_mode(messages, agentic_mode, backend),
+    payload = {"model": model, "messages": request_messages_for_mode(messages, agentic_mode, backend, clarify_mode),
                "max_tokens": settings["max_tokens"], "stream": True,
                "stream_options": {"include_usage": True},
                "temperature": settings["temperature"],
@@ -4070,6 +4106,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     # loop's own injected follow-ups (which are also role="user").
     original_user_text = next(
         (m.get("content") for m in reversed(messages) if m.get("role") == "user"), "")
+    clarify_mode = has_clarify_intent(original_user_text)
     # Everything from here on (this turn's own tool_calls/tool-result
     # messages) is fair game for in-turn compaction; nothing before it is
     # ever touched — that's trim()'s job, between turns.
@@ -4080,7 +4117,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     for _ in range(MAX_TOOL_STEPS):
         content, tool_calls, usage, stream_error, repetition_detected = stream_once(
             url, key, model, messages, effective_agentic_mode, backend,
-            display_content=not execution_required,
+            display_content=not execution_required, clarify_mode=clarify_mode,
         )
         if repetition_detected:
             repetition_streak += 1
