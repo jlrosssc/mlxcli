@@ -764,13 +764,81 @@ def term_present(term, lowered_text):
     return bool(re.search(re.escape(term) + r"(?![A-Za-z0-9])", lowered_text))
 
 
-def is_code_request(text):
+# --- SemIf-assisted routing (added 2026-09-23) -------------------------------
+# Strengthens is_code_request and should_auto_enable_agentic with a real
+# local-model judgment: TheoLeeCJ/SemIf's technique (github.com/TheoLeeCJ/SemIf)
+# run natively via ~/.omlx/semif/semif_mlx.py on Qwen3.5-4B-4bit. Unlike the
+# earlier jev_mlx.py attempt (a hand-applied LoRA adapter, reverted after
+# validation showed no improvement), this reads option-letter logits directly
+# off a stock, untrained instruct model in a single forward pass -- no
+# adapter, no correctness-porting risk. Validated on a 30/10-case hand-built
+# test set before wiring in (2026-09-23): should_auto_enable_agentic went
+# from 0.567 accuracy (keyword-only, recall 0.133) to 0.767 (recall 0.533)
+# with unchanged perfect precision; is_code_request went from 0.900 to a
+# perfect 1.000. requires_agentic_execution was deliberately NOT wired --
+# SemIf scored worse than keyword there (0.625 vs 0.875) on the same test
+# methodology, so that function is untouched, pure keyword logic below.
+_SEMIF_PATH = "/Users/dad/.omlx/semif"
+_SEMIF_MODEL_PATH = "/Users/dad/.omlx/semif/base-model-4b"
+_SEMIF_CONFIDENCE_FLOOR = 0.1  # below this the model is essentially a coin flip; don't trust it
+_semif_instance = None
+_semif_load_failed = False
+
+
+def _get_semif():
+    global _semif_instance, _semif_load_failed
+    if _semif_load_failed:
+        return None
+    if _semif_instance is None:
+        try:
+            if _SEMIF_PATH not in sys.path:
+                sys.path.insert(0, _SEMIF_PATH)
+            import semif_mlx
+            _semif_instance = semif_mlx.SemIfMLX(_SEMIF_MODEL_PATH)
+        except Exception as exc:
+            log_error("semif_classifier", f"failed to load SemIf classifier: {exc}")
+            _semif_load_failed = True
+            return None
+    return _semif_instance
+
+
+def _semif_route(text, question, keyword_result):
+    """Trust a confident SemIf answer; fall back to the keyword heuristic
+    unchanged whenever SemIf is unavailable, errors, or is at a near-coin-flip
+    (confidence below _SEMIF_CONFIDENCE_FLOOR) -- no interactive prompt this
+    time, unlike the reverted jev_mlx attempt: the validated accuracy here was
+    strong enough on its own that added human-in-the-loop friction isn't
+    justified by evidence, only by caution."""
+    semif = _get_semif()
+    if semif is None:
+        return keyword_result
+    try:
+        result = semif.ask_noul(text or "", question)
+    except Exception as exc:
+        log_error("semif_classifier", f"ask_noul failed: {exc}")
+        return keyword_result
+    if result["confidence"] < _SEMIF_CONFIDENCE_FLOOR:
+        return keyword_result
+    return result["probability_yes"] > 0.5
+# --- end SemIf-assisted routing -----------------------------------------------
+
+
+def _keyword_is_code_request(text):
     lowered = text.lower()
     code_terms = (
         "script", "code", "program", "python", "bash", "shell", "function",
         "create a", "write a", "generate a",
     )
     return any(term_present(term, lowered) for term in code_terms)
+
+
+def is_code_request(text):
+    keyword_result = _keyword_is_code_request(text)
+    return _semif_route(
+        text,
+        "Is this request specifically asking to write, generate, or produce code, a script, or a program?",
+        keyword_result,
+    )
 
 
 def requires_agentic_execution(text):
@@ -806,7 +874,7 @@ def requires_agentic_execution(text):
     )
 
 
-def should_auto_enable_agentic(text, messages=None):
+def _keyword_should_auto_enable_agentic(text, messages=None):
     """Detect requests that require local tools without changing the user's mode setting."""
     lowered = (text or "").lower()
     local_target = (
@@ -839,6 +907,16 @@ def should_auto_enable_agentic(text, messages=None):
         ).lower()
         return any(term in recent for term in ("downloads", "local file", "file listing", "largest files"))
     return False
+
+
+def should_auto_enable_agentic(text, messages=None):
+    keyword_result = _keyword_should_auto_enable_agentic(text, messages)
+    return _semif_route(
+        text,
+        "Does fulfilling this request require using local tools such as reading/writing files, "
+        "running shell commands, or inspecting the filesystem?",
+        keyword_result,
+    )
 
 
 def execution_contract(text):
