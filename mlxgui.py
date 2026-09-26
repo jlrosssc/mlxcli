@@ -56,7 +56,6 @@ from mlxlib import (
     caffeinate_guard, server_busy_guard, log_error, tail_error_log, ERROR_LOG_PATH,
     rag_remote_config, rag_remote_search, web_search,
     load_host_aliases, keychain_get, request as ha_http_request, api as ha_http_api,
-    has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE,
 )
 
 
@@ -2563,16 +2562,6 @@ class MlxGui(tk.Tk):
                 return False
         return result["approved"]
 
-    def request_user_answer(self, question, options=None):
-        event = threading.Event()
-        result = {"answer": None, "cancelled": False}
-        self.events.put(("ask_user", question, options or [], event, result))
-        while not event.wait(0.1):
-            if self.cancel_requested:
-                result["cancelled"] = True
-                return None
-        return result["answer"]
-
     def execute_tool(self, name, args):
         name = str(name or "").strip().lower().replace(".", ":").replace("/", ":").rsplit(":", 1)[-1]
         if name == "run_command":
@@ -2669,7 +2658,9 @@ class MlxGui(tk.Tk):
         if name == "ha_api":
             target = str(args.get("host") or args.get("target") or "").strip().lower()
             method = str(args.get("method") or "GET").upper()
-            api_path = args.get("path", "")
+            api_path = args.get("path", "") or ("/api/states" if (args.get("domain") or args.get("state")) else "")
+            import mlxlib as _ml0
+            api_path, args = _ml0.ha_split_states_query(api_path, args)
             data = args.get("data")
             entry = load_host_aliases().get(target)
             ha_cfg = None
@@ -2694,6 +2685,10 @@ class MlxGui(tk.Tk):
                     req.get_method = lambda: method
                     with urllib.request.urlopen(req, timeout=30) as r:
                         result = json.load(r)
+                import mlxlib as _ml
+                view = _ml.ha_states_view(method, api_path, result, args, target)
+                if view is not None:
+                    return view
                 text = json.dumps(result, indent=2)
                 note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
                 return f"[source: {target}]\n" + text[:MAX_FILE_CHARS] + note
@@ -2724,16 +2719,6 @@ class MlxGui(tk.Tk):
             for i, r in enumerate(results, 1):
                 lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
             return "\n".join(lines)[:MAX_FILE_CHARS]
-        if name == "ask_user":
-            question = str(args.get("question") or "").strip()
-            options = args.get("options") or []
-            if not question:
-                return "Error: ask_user needs a non-empty 'question'."
-            answer = self.request_user_answer(question, options)
-            if answer is None:
-                return "The user did not provide an answer. Proceed using your own best judgment instead."
-            answer = answer.strip()
-            return answer if answer else "The user gave no answer. Proceed using your own best judgment instead."
         if name in ("ssh_run", "ssh_read", "ssh_write"):
             # This GUI has no SSH implementation at all (unlike mlxcli's
             # terminal REPL, which fully supports these) -- rather than a
@@ -3312,6 +3297,12 @@ class MlxGui(tk.Tk):
             self.input.delete("1.0", "end")
             self.refine_prompt(text[1:].strip() or None)
             return
+        import mlxlib as _ml
+        _tm = _ml.tokenmax_request(text)
+        if _tm is not None:
+            self.input.delete("1.0", "end")
+            self.run_tokenmax_job(text, _tm)
+            return
         model = self.selected_model_id()
         if not model:
             messagebox.showinfo("No model", "Wait for models to load first.")
@@ -3333,6 +3324,35 @@ class MlxGui(tk.Tk):
         self.start_working("Waiting for model response")
         self.show_working_indicator("Waiting for model response")
         threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
+
+    def run_tokenmax_job(self, text, rest):
+        """One request handed to tokenmax (chosen per request with 'using tokenmax, ...' or '/tokenmax ...')."""
+        import mlxlib as _ml
+        self.append_tagged(f"\n{text}\n", "user_bubble")
+        argv = _ml.tokenmax_argv(rest, self.backend, self.selected_model_id())
+        if argv is None:
+            self.append_tagged(_ml.TOKENMAX_USAGE + "\n", "meta")
+            return
+        self.append_tagged("tokenmax\n", "assistant_label")
+        self.busy = True
+        self.send_button.configure(state="disabled")
+        self.status("tokenmax is working...")
+
+        def worker():
+            try:
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                for line in proc.stdout:
+                    self.after(0, self.append_tagged, line, "assistant_body")
+                proc.wait()
+            except Exception as exc:
+                self.after(0, self.append_tagged, f"(could not run tokenmax: {exc})\n", "meta")
+            def done():
+                self.busy = False
+                self.send_button.configure(state="normal")
+                self.status("Ready")
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def stream_reply(self, model):
         # Guard the whole turn (all agentic tool-call retries included) so a
@@ -3380,11 +3400,6 @@ class MlxGui(tk.Tk):
                 working_messages[0] = {"role": "system", "content": working_messages[0]["content"] + "\n\n" + agentic_note}
             else:
                 working_messages.insert(0, {"role": "system", "content": agentic_note})
-        if has_clarify_intent(self.last_user_text):
-            if working_messages and working_messages[0].get("role") == "system":
-                working_messages[0] = {"role": "system", "content": working_messages[0]["content"] + "\n\n" + CLARIFY_MODE_SYSTEM_NOTE}
-            else:
-                working_messages.insert(0, {"role": "system", "content": CLARIFY_MODE_SYSTEM_NOTE})
         effective_agentic = agentic
         model_settings = load_model_settings(self.backend)
         for _step in range(MAX_TOOL_STEPS):
@@ -3408,6 +3423,9 @@ class MlxGui(tk.Tk):
             # usage rules are what should gate whether a given tool actually
             # gets called, not whether it's offered.
             payload["tools"] = all_tool_schemas()
+            # "-fast" strips tools/system prompt server-side; tool-bearing requests use the base model id.
+            if payload["model"].endswith("-fast"):
+                payload["model"] = payload["model"][:-len("-fast")]
             parts, calls, usage = [], {}, {}
             stream_error = None
             repetition_detected = False
@@ -3615,22 +3633,6 @@ class MlxGui(tk.Tk):
                     else:
                         approval_result["approved"] = messagebox.askyesno("Approve local tool action", description, parent=self)
                     approval_event.set()
-                elif kind == "ask_user":
-                    _kind, question, options, ask_event, ask_result = event
-                    if self.cancel_requested or ask_result.get("cancelled"):
-                        ask_result["answer"] = None
-                    else:
-                        prompt = question
-                        if options:
-                            prompt += "\n\n" + "\n".join(f"{i}) {opt}" for i, opt in enumerate(options, 1))
-                            prompt += "\n\n(type the number of a choice above, or your own answer)"
-                        answer = simpledialog.askstring("The model is asking", prompt, parent=self)
-                        if answer and options and answer.strip().isdigit():
-                            idx = int(answer.strip())
-                            if 1 <= idx <= len(options):
-                                answer = options[idx - 1]
-                        ask_result["answer"] = answer
-                    ask_event.set()
                 elif kind == "tool_history":
                     self.messages.append(event[1])
                 elif kind == "append":
@@ -3704,6 +3706,8 @@ class MlxGui(tk.Tk):
                     in_tokens, out_tokens = usage_counts(usage)
                     elapsed = (time.time() - self.turn_start_time) if self.turn_start_time else None
                     rate = f" / {out_tokens / elapsed:.1f} tok/s" if elapsed and elapsed > 0 and out_tokens > 0 else ""
+                    if elapsed and elapsed > 0:
+                        rate += f" / run time {elapsed:.1f}s" if elapsed < 60 else f" / run time {int(elapsed // 60)}m {int(elapsed % 60):02d}s"
                     self.turn_start_time = None
                     self.last_turn_tokens = {"in": in_tokens, "out": out_tokens}
                     self.totals["in"] += in_tokens

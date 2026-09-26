@@ -39,6 +39,23 @@ Usage:
                              bullet points, then exit (no REPL). Thin wrapper around
                              yt_summarize.py in the default directory — delegates to it
                              rather than duplicating its logic here.
+  mlxcli --check-updates    read-only report on the TinyTitanServer/NVMAI build and its
+                             locally-converted models (Qwen 3.6, Ornith 1.5, KAT-Coder),
+                             then exit (no REPL, no backend/model loaded). Never applies
+                             anything -- for that, use --update (yum-style: check-update
+                             lists, update applies).
+  mlxcli --update [ITEM ...] [--update-yes]
+                             apply pending updates, then exit (no REPL). ITEM is "repo",
+                             a model key (qwen36, ornith15, katcoder), or "all"; several
+                             may be given. With no ITEM: applies everything pending if
+                             there's no terminal to ask, or offers to pick if there is.
+                             Always prints one final "Apply N update(s)? [y/N]" unless
+                             --update-yes is also given (apply immediately, no prompt --
+                             for cron/scripts). A repo update creates a separate git
+                             worktree (never touches the live checkout); a model update
+                             bumps its pinned commit in prepare_agentworld.py and prints
+                             the install_models.sh command to run yourself -- neither
+                             downloads, converts, rebuilds, or restarts anything.
   mlxcli --run "task" --no-agentic
                              force a plain-completion turn regardless of the usual
                              action/target keyword heuristic — for callers piping large
@@ -66,7 +83,7 @@ requests get no extra questions — and skipped automatically in headless --run
 instead. Example: `create an app to show distance, ask me if unsure about units`.
 
 Commands:
-  /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
+  /tokenmax <request>  /tokenlocal <request>  /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
   /convert  /model  /models  /resources  /mem  /tokens  /hosts  /save [file]  /export [file]  /copy  /modelsettings  /errorlog [n]  /history [clear|remove N[,M,...]]  /defaultdir [path]  /rag [command]  /clear  /help  /exit
 """
 import atexit
@@ -234,6 +251,10 @@ DEFAULT_SYSTEM = (
     "run_command/python_interpreter) and every kind of request, not only host-specific facts. Only give an estimate, "
     "guess, or general-knowledge answer in place of a real result when the user's own request explicitly asks you to "
     "speculate, guess, or estimate -- and say plainly that it is one when you do.\n"
+    "To read or change a Home Assistant DASHBOARD (a Lovelace view, its cards or layout) use ha_lovelace: action=get with "
+    "the view's path, edit the JSON, then action=set_view with the COMPLETE modified view. Never edit /config/.storage/lovelace* "
+    "files by hand or with sed/awk/jq/python, and never write scripts against localhost:8123 - Home Assistant holds dashboards "
+    "in memory and overwrites hand edits, while ha_lovelace backs up the dashboard, saves through the supported API and verifies it.\n"
     "web_search reaches the open internet, unlike every other tool here, and always requires the user to approve "
     "it live, every call. Only use it when the user's own request actually needs current, external, or "
     "general-internet information that no local tool or your own knowledge can answer -- never call it by "
@@ -252,6 +273,13 @@ DEFAULT_SYSTEM = (
     "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes. Use python_interpreter only to run already-created code when explicitly needed.\n"
     "write_file creates parent directories; do not run a separate mkdir when the requested output directory may already exist.\n"
     "Before overwriting an existing requested file, inspect it and preserve stronger validation already present. write_file always shows the user a diff and asks for approval before an existing file is changed, so call it directly rather than staging a copy elsewhere first. Do not repeat an identical tool call after a successful result; reuse the returned evidence.\n"
+    "Finding text in a large file (local or over ssh): use grep -n, or awk that prints only matching lines together "
+    "with the nearest heading/alias/name line, and pipe through head. Never print line ranges (sed -n 'A,Bp', "
+    "awk 'NR>=A') of a big file to look for something -- config files often contain huge description fields that "
+    "flood your context. Do not re-run the same range with a different tool. If an exact phrase is not found, it "
+    "may be built from a template or variable (e.g. Home Assistant '{{ friendly_name }}'): search for a fixed "
+    "fragment or an entity/variable name instead of concluding it does not exist. In YAML lists where each item "
+    "starts with '- id:' at column 0, the name is on an indented '  alias:' line, not '  - alias:'.\n"
     "Keep replies brief and avoid repeating large imported text unless asked.\n"
     "Respect local LLM memory limits: summarize when possible, use only relevant imported context, and suggest /clear when old context is no longer needed.\n"
     "Work in small steps. Be direct, respectful, and practical."
@@ -334,6 +362,18 @@ HELP = """Commands:
                   "don't hide what it said," not literal chain-of-thought)
   /notes          show the loaded project notes file, if any (.mlxcli-notes.md,
                   AGENTS.md, or CLAUDE.md in the directory mlxcli was launched from)
+  /tokenlocal REQUEST
+                  force the FULL local agent (tools, files, hosts) for this request and skip the fast lane. Also:
+                  start a request with "tokenlocal,". Nothing is sent to Claude. By default, self-contained prompts
+                  (code, logic, formulas, explanations) already use a fast lane: ONE small no-tools local call that
+                  includes your recent conversation; anything touching files, hosts, URLs, the web, or following a
+                  tool-using turn uses the full agent automatically.
+  /tokenmax [--share|--local-only|--claude|--dry-run] REQUEST
+                  one job at a time: hand THIS request to tokenmax (Claude (Haiku) plans, local KAT does the
+                  small checkable work, read-only tools fetch data). Private by default (Claude sees only a
+                  redacted description); --share lets Claude see your data and take over hard steps.
+                  Also triggered by starting a request with "using tokenmax," or "tokenmax:". Works the same in
+                  the REPL, mlxcli --run "using tokenmax, ...", and the GUI. Other requests are unaffected.
   /backend        show active backend
   /backend NAME   switch backend: omlx, turbofieldfare-qwen, turbofieldfare-ornith, or turbofieldfare-katcoder
   /convert MODE   set paste conversion: auto, all, or off
@@ -345,6 +385,13 @@ HELP = """Commands:
   /system default restore the built-in dialogue defaults
   /model          switch models (picker; history kept)
   /models         list models the server offers
+  /update [ITEM ...]
+                  check for updates to the TinyTitanServer/NVMAI build and its models (Qwen/Ornith/KAT-Coder)
+                  and, after a final y/N, initiate them. ITEM is "repo", a model key (qwen36, ornith15,
+                  katcoder), or "all"; several may be given. With none, pick from a numbered/id list shown.
+                  A repo update is a separate git worktree (never touches the live checkout); a model update
+                  bumps its pinned commit and prints the install command to run yourself — nothing is
+                  downloaded, rebuilt, or restarted automatically. Headless equivalent: mlxcli --update.
   /tflog          show the last lines of the TurboFieldfare server log
   /errorlog [n]   show the last n mlxcli/mlxgui chat-turn errors (default 20; ~/.omlx/error.log)
   /history        list your past typed prompts (what up-arrow recalls), numbered
@@ -828,6 +875,15 @@ def stop_turbofieldfare(backend=None):
 
 TURBO_BACKENDS = ("turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
 
+# Which key in tools/prepare_agentworld.py's MODELS table (parsed by mlxlib.parse_pinned_model_sources)
+# each turbo backend's local .gturbo/model dir was actually converted from. "agentworld" also exists in
+# that table but isn't exposed as a backend here, so it's deliberately left out of update checks.
+TURBO_BACKEND_MODEL_KEY = {
+    "turbofieldfare-qwen": "qwen36",
+    "turbofieldfare-ornith": "ornith15",
+    "turbofieldfare-katcoder": "katcoder",
+}
+
 
 def stop_other_backend(target_backend):
     # All ~35B-class turbo backends run on different ports and could
@@ -1273,6 +1329,108 @@ def _arg_str(value):
     return str(value)
 
 
+def _ha_lovelace_tool(args):
+    """ha_lovelace tool: list/get/replace views of a Home Assistant storage-mode dashboard over the websocket API.
+    Dashboards can only be changed that way (HA holds them in memory and overwrites edits made to the .storage files),
+    so this is what the local model must use instead of ssh+sed/jq hacks. Writes are approval-gated, back up the whole
+    dashboard first, and are verified by reading the view back."""
+    import asyncio
+    import datetime
+    target = (_arg_str(args.get("host")) or _arg_str(args.get("target"))).strip().lower()
+    action = (_arg_str(args.get("action")) or "get").strip().lower()
+    view = _arg_str(args.get("view")).strip()
+    dashboard = _arg_str(args.get("dashboard")).strip() or None
+    if action not in ("list", "get", "set_view"):
+        return "Error: action must be list, get or set_view."
+    if action in ("get", "set_view") and not view:
+        return "Error: `view` (the view's path, e.g. \"hvac\") is required. Use action=list to see the paths."
+    new_view = None
+    if action == "set_view":
+        new_view = args.get("view_config")
+        if isinstance(new_view, str):
+            try:
+                new_view = json.loads(new_view)
+            except ValueError:
+                return "Error: view_config must be a JSON object: the complete new view."
+        if (not isinstance(new_view, dict) or new_view.get("path") != view
+                or not (isinstance(new_view.get("cards"), list) or isinstance(new_view.get("sections"), list))):
+            return ("Error: view_config must be the COMPLETE view object, with \"path\": \"" + view + "\" and a "
+                    "\"cards\" or \"sections\" list. Call action=get first, change that JSON, and send the whole view back.")
+    entry = load_host_aliases().get(target)
+    ha_cfg = None
+    if entry:
+        ha_cfg = entry if entry.get("type") == "ha_api" else entry.get("ha_api")
+    if not ha_cfg:
+        return f"Error: '{target}' is not a known ha_api-capable alias."
+    token = keychain_get(target, ha_cfg.get("keychain_service", ""))
+    if token is None:
+        return f"Error: no stored HA token for alias '{target}'."
+    print(f"  tool: ha_lovelace ({target} {action} {view or ''} dashboard={dashboard or 'main'})")
+    if not approve(f"ha_lovelace {target} {action} {view}".strip(), category="ha_lovelace"):
+        return "User declined."
+    try:
+        import websockets
+    except ImportError:
+        return "Error: the python 'websockets' package is not installed for mlxcli (pip install websockets)."
+    ws_url = ha_cfg["base_url"].rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/api/websocket"
+
+    async def run():
+        async with websockets.connect(ws_url, additional_headers={"User-Agent": "curl/8.7.1"},
+                                      max_size=None, open_timeout=20) as ws:
+            await ws.recv()
+            await ws.send(json.dumps({"type": "auth", "access_token": token}))
+            if json.loads(await ws.recv()).get("type") != "auth_ok":
+                return "Error: Home Assistant rejected the stored token for this alias."
+            n = [0]
+
+            async def call(**kw):
+                n[0] += 1
+                await ws.send(json.dumps({"id": n[0], **kw}))
+                while True:
+                    m = json.loads(await ws.recv())
+                    if m.get("id") == n[0]:
+                        if not m.get("success"):
+                            raise RuntimeError(f"{kw.get('type')} failed: {m.get('error')}")
+                        return m.get("result")
+
+            cfg = await call(type="lovelace/config", url_path=dashboard)
+            views = cfg.get("views", [])
+            if action == "list":
+                lines = [f"{i}. path={v.get('path')!r} title={v.get('title')!r} type={v.get('type', 'masonry')} "
+                         f"cards={len(v.get('cards', []))} sections={len(v.get('sections', []))}"
+                         for i, v in enumerate(views)]
+                return f"[source: {target}] dashboard={dashboard or 'main'}, {len(views)} views\n" + "\n".join(lines)
+            idx = next((i for i, v in enumerate(views) if v.get("path") == view), None)
+            if action == "get":
+                if idx is None:
+                    return f"Error: no view with path {view!r}. Paths: {[v.get('path') for v in views]}"
+                text = json.dumps(views[idx], separators=(",", ":"))
+                note = "" if len(text) <= 24000 else "\n[truncated: too large to edit whole]"
+                return f"[source: {target}] view {view!r} (complete JSON):\n" + text[:24000] + note
+            # set_view: back up the whole dashboard, replace (or append) the view, save, verify by reading back
+            bdir = pathlib.Path.home() / "LocalAI" / "lovelace_backups"
+            bdir.mkdir(parents=True, exist_ok=True)
+            backup = bdir / f"{target}_{dashboard or 'main'}_{datetime.datetime.now():%Y%m%d_%H%M%S}.json"
+            backup.write_text(json.dumps(cfg))
+            if idx is None:
+                views.append(new_view)
+            else:
+                views[idx] = new_view
+            await call(type="lovelace/config/save", config=cfg, url_path=dashboard)
+            again = await call(type="lovelace/config", url_path=dashboard)
+            got = next((v for v in again.get("views", []) if v.get("path") == view), None)
+            if got != new_view:
+                return (f"Saved, but the read-back of view {view!r} differs from what was sent - check it in the UI. "
+                        f"Backup of the previous dashboard: {backup}")
+            return (f"[source: {target}] Saved view {view!r} ({'replaced' if idx is not None else 'added'}); read-back "
+                    f"matches. Backup of the previous dashboard: {backup}")
+
+    try:
+        return asyncio.run(asyncio.wait_for(run(), timeout=60))
+    except Exception as exc:
+        return f"Error running ha_lovelace on {target}: {type(exc).__name__}: {exc}"
+
+
 def exec_tool(name, args, current_user_text=None):
     # Some local backends qualify function names as shell:run_command or shell.run_command.
     # Normalize those names before dispatching so valid tool calls are not silently lost.
@@ -1329,6 +1487,23 @@ def exec_tool(name, args, current_user_text=None):
                 p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "sh", "-c", sandboxed_cmd],
                                    capture_output=True, text=True, timeout=180)
                 location = "\nworking_directory=/workspace (sandboxed)"
+                # The sandbox only sees the working directory. A host path outside it fails with "No such file or
+                # directory" even though it exists, and the model then tells the user the file does not exist.
+                if p.returncode != 0:
+                    root = load_default_dir().resolve()
+                    hidden = []
+                    for m_ in re.finditer(r"(?<![\w/.])(~?/[^\s'\";|&<>()]+)", cmd):
+                        try:
+                            hp = pathlib.Path(m_.group(1)).expanduser()
+                            if hp.exists() and not hp.resolve().is_relative_to(root) and str(hp) not in hidden:
+                                hidden.append(str(hp))
+                        except (OSError, ValueError):
+                            pass
+                    if hidden:
+                        location += ("\n[sandbox note: " + ", ".join(hidden[:3]) + " exist(s) on the host, but this sandbox can only see "
+                                     f"{root} (mounted as /workspace), so a 'No such file' error here does NOT mean the file is missing. "
+                                     "Do not tell the user it does not exist: read it with read_file (host access), or say it needs an "
+                                     "unsandboxed run (the user can start mlxcli with --ask).]")
             else:
                 cwd = infer_command_cwd(cmd)
                 p = subprocess.run(cmd, shell=True, capture_output=True,
@@ -1413,8 +1588,13 @@ def exec_tool(name, args, current_user_text=None):
             SSH_PASSWORD_CACHE[host] = password
         code, output = run_ssh_command(host, cmd)
         source_label = alias_arg.strip() or host
+        trunc_note = ""
+        if output and len(output) > MAX_FILE_CHARS:
+            trunc_note = (f"\n[output truncated: showing {MAX_FILE_CHARS} of {len(output)} chars. Do not re-print "
+                          f"ranges of this file -- narrow the search instead (grep -n, awk printing only matches "
+                          f"with their nearest heading, and | head -30).]")
         return (f"[source: {source_label}]\n"
-                f"exit_code={code}\n{output[:MAX_FILE_CHARS] if output else '(no output)'}")
+                f"exit_code={code}\n{output[:MAX_FILE_CHARS] if output else '(no output)'}{trunc_note}")
     if name == "ssh_read":
         alias_arg = _arg_str(args.get("host")) or _arg_str(args.get("target")) or _arg_str(args.get("host_alias"))
         host = resolve_ssh_alias(alias_arg)
@@ -1449,7 +1629,9 @@ def exec_tool(name, args, current_user_text=None):
     if name == "ha_api":
         target = _arg_str(args.get("host")) or _arg_str(args.get("target"))
         method = (args.get("method") or "GET").upper()
-        api_path = args.get("path", "")
+        api_path = args.get("path", "") or ("/api/states" if (args.get("domain") or args.get("state")) else "")
+        import mlxlib as _ml0
+        api_path, args = _ml0.ha_split_states_query(api_path, args)
         data = args.get("data")
         entry = load_host_aliases().get(target.strip().lower())
         ha_cfg = None
@@ -1475,6 +1657,10 @@ def exec_tool(name, args, current_user_text=None):
                 req.get_method = lambda: method
                 with urllib.request.urlopen(req, timeout=30) as r:
                     result = json.load(r)
+            import mlxlib as _ml
+            view = _ml.ha_states_view(method, api_path, result, args, target)
+            if view is not None:
+                return view
             text = json.dumps(result, indent=2)
             note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
             return f"[source: {target}]\n" + text[:MAX_FILE_CHARS] + note
@@ -1483,6 +1669,8 @@ def exec_tool(name, args, current_user_text=None):
             return f"HTTP {exc.code} from {target}: {detail}"
         except Exception as exc:
             return f"Error calling ha_api on {target}: {exc}"
+    if name == "ha_lovelace":
+        return _ha_lovelace_tool(args)
     if name == "web_search":
         query = args.get("query", "")
         max_results = args.get("max_results", 5)
@@ -2625,6 +2813,7 @@ def ssh_base_command(host, password):
             "-p", key_auth["port"],
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "LogLevel=ERROR",  # drops the 3-line post-quantum banner that otherwise eats context on every call
             host,
         ]
         return cmd, os.environ.copy()
@@ -2640,6 +2829,8 @@ def ssh_base_command(host, password):
         "PubkeyAuthentication=no",
         "-o",
         "NumberOfPasswordPrompts=1",
+        "-o",
+        "LogLevel=ERROR",
         host,
     ]
     return cmd, env
@@ -3917,9 +4108,15 @@ def resume_compare_batched(url, key, model, backend, files, convert_mode, user_r
     return final_content, total_in, total_out, time.time() - start
 
 
+def fmt_runtime(seconds):
+    """12.3s, or 4m 07s once past a minute -- whole-turn wall time, including prompt processing and any tool steps."""
+    return f"{seconds:.1f}s" if seconds < 60 else f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
+
+
 def print_tokens(label, in_tokens, out_tokens, elapsed=None):
     rate = f" / {out_tokens / elapsed:.1f} tok/s" if elapsed and elapsed > 0 and out_tokens > 0 else ""
-    print(f"[tokens: in {in_tokens:,} / out {out_tokens:,}{rate}]", flush=True)
+    when = f" / run time {fmt_runtime(elapsed)}" if elapsed and elapsed > 0 else ""
+    print(f"[tokens: in {in_tokens:,} / out {out_tokens:,}{rate}{when}]", flush=True)
 
 
 # ---------- chat ----------
@@ -3951,6 +4148,10 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
     # description and the system prompt's usage rules are what should gate
     # whether a given tool actually gets called, not whether it's offered.
     payload["tools"] = all_tool_schemas()
+    # The "-fast" alias strips tools and the system prompt server-side, which would leave the model unable to
+    # act; a request that carries tools goes to the base model id (same weights).
+    if is_turbo_backend(backend) and model.endswith("-fast"):
+        payload["model"] = model[:-len("-fast")]
     content_parts = []
     calls = {}
     usage = {}
@@ -4926,6 +5127,10 @@ def parse_args(argv):
     transcript_url = None
     no_agentic = False
     max_steps = None
+    check_updates = False
+    update_flag = False
+    update_items = []
+    update_assume_yes = False
     i = 0
     while i < len(argv):
         if argv[i] in ("-p", "--prompt") and i + 1 < len(argv):
@@ -4937,6 +5142,21 @@ def parse_args(argv):
         elif argv[i] == "--transcript" and i + 1 < len(argv):
             transcript_url = argv[i + 1]
             i += 2
+        elif argv[i] == "--check-updates":
+            check_updates = True
+            i += 1
+        elif argv[i] == "--update":
+            # Greedily collects every following bare token (not starting with "-") as an item id/number/"all"
+            # to target -- e.g. "--update qwen36 katcoder" -- so a later flag like --update-yes still parses
+            # correctly regardless of where it's placed on the command line.
+            update_flag = True
+            i += 1
+            while i < len(argv) and not argv[i].startswith("-"):
+                update_items.append(argv[i])
+                i += 1
+        elif argv[i] == "--update-yes":
+            update_assume_yes = True
+            i += 1
         elif argv[i] == "--no-agentic":
             no_agentic = True
             i += 1
@@ -4972,7 +5192,215 @@ def parse_args(argv):
             model = argv[i]
             i += 1
     return (model, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir,
-            transcript_url, no_agentic, max_steps)
+            transcript_url, no_agentic, max_steps, check_updates, update_flag, update_items, update_assume_yes)
+
+
+def _model_update_items():
+    """[(label, backend, key, repo_id, pinned, status_or_None)] for every turbo backend whose model key is found
+    in prepare_agentworld.py's MODELS table. status_or_None is compute_pinned_model_update_status's result."""
+    import mlxlib as _ml
+    pins = _ml.parse_pinned_model_sources(TURBO_QWEN_ROOT)
+    items = []
+    for backend, key in TURBO_BACKEND_MODEL_KEY.items():
+        if key not in pins:
+            continue
+        repo_id, pinned = pins[key]
+        status = _ml.compute_pinned_model_update_status(repo_id, pinned)
+        items.append((backend_label(backend), backend, key, repo_id, pinned, status))
+    return items
+
+
+def _find_existing_pending_worktree(target_sha):
+    """Return the path of an existing sibling worktree already checked out at target_sha, or None.
+    Prevents /update repo from creating a duplicate worktree when run twice before the first one
+    is merged/removed (each run otherwise creates its own timestamped directory)."""
+    r = subprocess.run(["git", "-C", str(TURBO_QWEN_ROOT), "worktree", "list", "--porcelain"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    cur_path = None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur_path = line[len("worktree "):]
+        elif line.startswith("HEAD ") and cur_path:
+            if line[len("HEAD "):] == target_sha and pathlib.Path(cur_path) != TURBO_QWEN_ROOT:
+                return cur_path
+            cur_path = None
+    return None
+
+
+def _initiate_repo_update(info, assume_yes=False):
+    """Create a SEPARATE git worktree tracking the remote that is ahead, so building and testing it never
+    touches the live TURBO_QWEN_ROOT checkout or any server running from it. Never rebuilds or restarts
+    anything itself -- that stays a manual step, same as the passive startup notice has always said."""
+    remote_ref = max(info["remotes"], key=info["remotes"].get)
+
+    target_sha = subprocess.run(["git", "-C", str(TURBO_QWEN_ROOT), "rev-parse", remote_ref],
+                                capture_output=True, text=True).stdout.strip()
+    existing = _find_existing_pending_worktree(target_sha) if target_sha else None
+    if existing:
+        print(f"A worktree already tracks {remote_ref} at this commit: {existing}\n"
+              f"Build and test it there instead of creating another copy:\n"
+              f"  cd {existing} && swift build -c release --product TinyTitanServer")
+        return
+
+    dest = TURBO_QWEN_ROOT.parent / f"{TURBO_QWEN_ROOT.name}-update-{datetime.now():%Y%m%d_%H%M%S}"
+    print(f"This creates a separate git worktree at {dest}, tracking {remote_ref}. It does not touch "
+          f"{TURBO_QWEN_ROOT} or any server running from it.")
+    if not assume_yes and not approve(f"git worktree add {dest} {remote_ref}", category="update"):
+        print("Not initiated.")
+        return
+    r = subprocess.run(["git", "-C", str(TURBO_QWEN_ROOT), "worktree", "add", str(dest), remote_ref],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"git worktree add failed:\n{r.stderr.strip()}")
+        return
+    print(f"Created {dest}.\nBuild and test it there on an alternate port before touching the live server:\n"
+          f"  cd {dest} && swift build -c release --product TinyTitanServer")
+
+
+def _initiate_model_update(backend, key, repo_id, pinned, latest, assume_yes=False):
+    """Bump ONE model's pinned commit in tools/prepare_agentworld.py (backing the file up first) so a future
+    install picks up the new upstream revision. Deliberately does not run the installer itself -- fetching and
+    converting a ~35B model is a large, multi-GB, long-running download, and this only prints the exact command
+    for the user to run themselves when they're ready for that."""
+    script = TURBO_QWEN_ROOT / "tools" / "prepare_agentworld.py"
+    print(f"This edits one line of {script} (backed up first), moving {key}'s pinned commit from "
+          f"{pinned[:10]} to {latest[:10]}. It does not download or convert anything.")
+    if not assume_yes and not approve(f"bump {key} pin to {latest[:10]} in prepare_agentworld.py", category="update"):
+        print("Not initiated.")
+        return
+    try:
+        text = script.read_text()
+    except Exception as exc:
+        print(f"Could not read {script}: {exc}")
+        return
+    pattern = re.compile(r'("' + re.escape(key) + r'"\s*:\s*\("' + re.escape(repo_id) + r'"\s*,\s*)"'
+                        + re.escape(pinned) + r'"(\s*\))')
+    new_text, n = pattern.subn(lambda m: f'{m.group(1)}"{latest}"{m.group(2)}', text)
+    if n != 1:
+        print(f"Could not find exactly one match for {key}'s current pin in {script} (found {n}) -- "
+              "not edited; the file may have changed format since this was written.")
+        return
+    backup = script.with_name(script.name + f".bak-update-{datetime.now():%Y%m%d_%H%M%S}")
+    try:
+        backup.write_text(text)
+        script.write_text(new_text)
+    except Exception as exc:
+        print(f"Could not write the change: {exc}")
+        return
+    print(f"Backed up to {backup} and updated the pin.\n"
+          f"Run this yourself to fetch and convert (large download, not run automatically):\n"
+          f"  cd {TURBO_QWEN_ROOT} && ./tools/install_models.sh {key}")
+
+
+def _report_updates():
+    """Print one line per tracked item (up to date, or what's pending) and return only the pending ones as
+    [(id, kind, payload), ...] in the same order printed. `id` is what both /update and --update accept to
+    target that item: "repo" for the TinyTitanServer/NVMAI repo, or a model key ("qwen36", "ornith15",
+    "katcoder") for a model -- the same string install_models.sh takes."""
+    print("Checking for updates on the TinyTitanServer/NVMAI build and its models...")
+    entries = []
+    repo_info = compute_repo_update_status(TURBO_QWEN_ROOT)
+    if repo_info:
+        detail = ", ".join(f"{k} +{v}" for k, v in repo_info["remotes"].items())
+        print(f"  [repo] TinyTitanServer/NVMAI repo ({repo_info['branch']}): {detail}")
+        entries.append(("repo", "repo", repo_info))
+    else:
+        print("  [repo] TinyTitanServer/NVMAI repo: up to date (or offline/not reachable)")
+    for label, backend, key, repo_id, pinned, status in _model_update_items():
+        if status:
+            print(f"  [{key}] {label} — {repo_id} pinned {pinned[:10]}, upstream now {status['latest'][:10]} "
+                  f"(changed {status['last_modified']})")
+            entries.append((key, "model", (backend, key, repo_id, pinned, status["latest"])))
+        else:
+            print(f"  [{key}] {label}: up to date (pinned {pinned[:10]}) (or offline/not reachable)")
+    return entries
+
+
+ALL_UPDATE_IDS = {"repo"} | set(TURBO_BACKEND_MODEL_KEY.values())
+
+
+def _resolve_update_selection(tokens, entries):
+    """tokens: ids, 1-based list numbers, and/or "all", as typed at /update's prompt or passed to --update.
+    Returns (chosen_entries_in_original_order_deduped, already_current_ids, truly_unknown_tokens) -- kept
+    separate so the caller can say "already up to date" rather than the misleading "not recognized" for a
+    valid id (e.g. "qwen36") that just isn't pending right now."""
+    if any(t.lower() == "all" for t in tokens):
+        return list(entries), [], []
+    by_id = {e[0]: e for e in entries}
+    chosen, current, unknown = [], [], []
+    for t in tokens:
+        if t in by_id:
+            chosen.append(by_id[t])
+        elif t.isdigit() and 1 <= int(t) <= len(entries):
+            chosen.append(entries[int(t) - 1])
+        elif t in ALL_UPDATE_IDS:
+            current.append(t)
+        else:
+            unknown.append(t)
+    seen, ordered = set(), []
+    for e in chosen:
+        if e[0] not in seen:
+            seen.add(e[0])
+            ordered.append(e)
+    return ordered, current, unknown
+
+
+def _apply_update_entry(kind, payload, assume_yes=False):
+    if kind == "repo":
+        _initiate_repo_update(payload, assume_yes)
+    else:
+        _initiate_model_update(*payload, assume_yes=assume_yes)
+
+
+def apply_updates(items, assume_yes):
+    """Shared by /update (REPL) and --update (headless) -- a yum-style check-then-confirm-then-apply flow.
+    `items` is whatever the caller already named (ids like "qwen36"/"repo", list numbers, or "all"); an empty
+    list means "let a human pick" when there's a terminal to ask, or "everything pending" when there isn't (same
+    default as plain `yum update`). Either way this always asks one final y/N before touching anything, unless
+    `assume_yes` -- and refuses outright with nothing applied if there's no terminal AND assume_yes is False,
+    since then there is truly no one to ask. Safe to call anytime: the report itself is read-only, and each
+    initiate action prints exactly what it did (see _initiate_repo_update / _initiate_model_update)."""
+    entries = _report_updates()
+    if not entries:
+        print("Nothing to update.")
+        return
+    interactive = sys.stdin.isatty()
+    if items:
+        chosen, current, unknown = _resolve_update_selection(items, entries)
+        if current:
+            print(f"(already up to date, nothing to initiate: {', '.join(current)})")
+        if unknown:
+            print(f"(not a recognized id: {', '.join(unknown)})")
+    elif interactive:
+        print("\nAvailable to initiate: " + ", ".join(f"[{i}] {e[0]}" for i, e in enumerate(entries, 1)))
+        raw = input("Initiate which? [numbers/ids separated by spaces, 'all', or Enter to skip]: ").strip()
+        if not raw:
+            print("Nothing initiated.")
+            return
+        chosen, current, unknown = _resolve_update_selection(raw.split(), entries)
+        if current:
+            print(f"(already up to date, nothing to initiate: {', '.join(current)})")
+        if unknown:
+            print(f"(not a recognized id: {', '.join(unknown)})")
+    else:
+        chosen = entries  # no terminal, nothing named -> everything pending (same default as `yum update`)
+    if not chosen:
+        print("Nothing to initiate — none of the given items are pending.")
+        return
+    names = ", ".join(e[0] for e in chosen)
+    if not assume_yes:
+        if not interactive:
+            print(f"(not a terminal and --update-yes was not given — nothing initiated for: {names}. "
+                  "Re-run with --update-yes to apply without asking.)")
+            return
+        ans = input(f"Apply {len(chosen)} update(s) — {names}? [y/N]: ").strip().lower()
+        if ans != "y":
+            print("Nothing initiated.")
+            return
+    for _id, kind, payload in chosen:
+        _apply_update_entry(kind, payload, assume_yes)
 
 
 def print_repo_update_notice_if_any(root, label):
@@ -5019,6 +5447,24 @@ def print_model_update_notice_if_any(repo_id, cache_path, label):
     )
 
 
+def _run_tokenmax_job(rest, backend, model=None):
+    """Hand ONE request to tokenmax with the terminal attached (interactive session or --run)."""
+    import mlxlib as _ml
+    argv = _ml.tokenmax_argv(rest, backend, model)
+    if argv is None:
+        print(_ml.TOKENMAX_USAGE)
+        return 2
+    print(f"(handing this one request to tokenmax: {' '.join(argv[1:-1]) or 'private mode'})")
+    try:
+        return subprocess.run(argv).returncode
+    except KeyboardInterrupt:
+        print("\n(tokenmax interrupted)")
+        return 130
+    except Exception as e:
+        print(f"(could not run tokenmax: {e})")
+        return 1
+
+
 def main():
     configure_readline()
     backend, url, key = load_cfg()
@@ -5026,10 +5472,23 @@ def main():
     global REMOTE_MODE_HOST
     global MAX_TOOL_STEPS
     (model_arg, system, run_task, auto_yes, show_thinking, verify_command, verify_history_dir,
-     transcript_url, no_agentic, max_steps_override) = parse_args(sys.argv[1:])
+     transcript_url, no_agentic, max_steps_override, check_updates,
+     update_flag, update_items, update_assume_yes) = parse_args(sys.argv[1:])
     if max_steps_override is not None:
         MAX_TOOL_STEPS = max_steps_override
         print(f"  (max tool steps for this run: {MAX_TOOL_STEPS})")
+    if check_updates:
+        # Read-only report, no backend/model/server needed -- exits before any of that loads. Never applies
+        # anything, even interactively -- that's --update's job (mirrors `yum check-update` vs `yum update`).
+        entries = _report_updates()
+        if not entries:
+            print("Nothing to update.")
+        else:
+            print("\n(read-only — run `mlxcli --update` to initiate, or /update inside the REPL)")
+        sys.exit(0)
+    if update_flag:
+        apply_updates(update_items, assume_yes=update_assume_yes)
+        sys.exit(0)
     if transcript_url:
         # Delegates to yt_summarize.py (in the default directory) rather than
         # duplicating its transcript-fetch/summarize logic here -- that script
@@ -5049,7 +5508,8 @@ def main():
         # both headless --run and the interactive REPL. Pass --ask to opt back
         # into per-call prompts (see the --ask branch below for the sandbox
         # implication of that).
-        ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run"})
+        ALWAYS_APPROVED.update({"run_command", "write_file", "python_interpreter", "ssh_read", "ssh_write", "ssh_run",
+                                "ha_api", "ha_lovelace"})
         # No human is watching each tool call before it runs in this mode, so
         # route the agentic tool-execution layer through the Apple `container`
         # sandbox instead of the host directly (see ensure_sandbox_container).
@@ -5060,6 +5520,11 @@ def main():
             print("  (note: tool calls are auto-approved by default, but Apple's `container` tool wasn't "
                   "found — tool calls will run unsandboxed directly on this machine; pass --ask to review "
                   "each call instead)")
+    if run_task:
+        import mlxlib as _ml
+        _tm = _ml.tokenmax_request(run_task)
+        if _tm is not None:
+            sys.exit(_run_tokenmax_job(_tm, backend, model_arg))
     if not model_arg and not run_task:
         selected_backend = pick_backend(backend)
         if selected_backend != backend:
@@ -5190,8 +5655,24 @@ def main():
                 continue
         if user in ("/exit", "/quit"):
             break
+        import mlxlib as _ml
+        _tm = _ml.tokenmax_request(user)
+        if _tm is not None:
+            _run_tokenmax_job(_tm, backend, model)
+            continue
+        force_agent = False
+        _tl = _ml.tokenlocal_request(user)
+        if _tl is not None:
+            if not _tl:
+                print(_ml.TOKENLOCAL_USAGE)
+                continue
+            user, force_agent = _tl, True
+            print("(tokenlocal: full local agent; fast lane skipped; nothing is sent to Claude)")
         if user == "/commands":
             print(commands_only_from_help())
+            continue
+        if user == "/update" or user.startswith("/update "):
+            apply_updates(user[len("/update"):].split(), assume_yes=False)
             continue
         if user == "/verbs":
             print(verbs_text())
@@ -5601,6 +6082,31 @@ def main():
             if rag_strict_mode and rag_status is False:
                 print("(strict RAG mode: no source material found — not generating a response)")
                 continue
+            if (not force_agent and not agentic_mode and not REMOTE_MODE_HOST and not pending_export_path and not rag_results
+                    and not request_agentic_mode and _ml.fast_lane_ok(user, messages)):
+                _fl_t0 = time.time()
+                try:
+                    _fl_text, _fl_in, _fl_out, _fl_problems = _ml.fast_lane_complete(url, key, model, backend, messages, user)
+                except KeyboardInterrupt:
+                    print("\n(interrupted; returning to mlxcli prompt)")
+                    continue
+                except Exception as _fl_err:
+                    _fl_text, _fl_in, _fl_out, _fl_problems = "", 0, 0, [f"fast lane call failed: {_fl_err}"]
+                if not _fl_problems:
+                    print("(local fast lane: one call, no tools, no Claude. Start with 'tokenlocal,' to force the full agent)")
+                    print()
+                    print(_fl_text)
+                    if "```" not in _fl_text and len(_fl_text) > 60:
+                        print("(from the model's own knowledge: not checked against files, tools or the web)")
+                    messages.append({"role": "user", "content": user})
+                    messages.append({"role": "assistant", "content": _fl_text})
+                    messages = trim(messages)
+                    totals["in"] += _fl_in
+                    totals["out"] += _fl_out
+                    last_turn = {"in": _fl_in, "out": _fl_out}
+                    print_tokens("turn", _fl_in, _fl_out, elapsed=time.time() - _fl_t0)
+                    continue
+                print(f"(fast lane answer not used: {'; '.join(_fl_problems)}; using the full local agent instead)")
             messages.append({"role": "user", "content": user})
             if agentic_mode:
                 for note in apply_agentic_preflight(user, messages, convert_mode):

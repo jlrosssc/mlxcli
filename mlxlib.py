@@ -555,16 +555,14 @@ TOOLS = [
         "description": "Call a Home Assistant instance's REST API on a saved alias (e.g. \"unity\", or "
                         "\"dad\" — which is also reachable this way in addition to ssh_run/ssh_read/"
                         "ssh_write). The auth token is resolved from local storage automatically — never "
-                        "ask the user for it. There is no dedicated endpoint for automations, config review, "
-                        "or any other entity category — GET /api/states always returns every entity across "
-                        "every domain in one call; filter the result yourself afterward (e.g. entity_id "
-                        "starting with \"automation.\" for automations, \"switch.\"/\"light.\" for those "
-                        "domains). Never guess a narrower path like /api/states/automation, /api/automations, "
-                        "/api/config/automation/all, or a query-string filter (?domain=, ?entity_id=) — none "
-                        "of these exist and will 404. Other real paths: GET /api/states/<entity_id> for one "
-                        "entity's full state/attributes; GET /api/config for instance info (version, location, "
-                        "component list); POST /api/services/<domain>/<service> with `data` as the JSON body "
-                        "to call a service (e.g. domain=light, service=turn_on).",
+                        "ask the user for it. To list or COUNT entities of one kind, use path "
+                        "/api/states?domain=<domain>&state=<state> (state is optional): this tool filters and "
+                        "counts for you and its result starts with the exact COUNT line, so never count by hand. "
+                        "Example: disabled automations = /api/states?domain=automation&state=off (an automation "
+                        "is \"on\" when enabled and \"off\" when disabled). Plain /api/states returns only "
+                        "per-domain counts. Other paths: GET /api/states/<entity_id> for one entity; "
+                        "GET /api/config for instance info; POST /api/services/<domain>/<service> with `data` "
+                        "as the JSON body to call a service. Never write scripts against localhost:8123.",
         "parameters": {"type": "object", "properties": {
             "host": {"type": "string", "description": "saved alias name, e.g. \"unity\" or \"dad\" — same "
                                                         "field name as ssh_run/ssh_read/ssh_write"},
@@ -572,6 +570,27 @@ TOOLS = [
             "path": {"type": "string", "description": "API path, e.g. /api/states/sensor.example"},
             "data": {"type": "object", "description": "JSON body for POST calls (e.g. service data)"}},
             "required": ["host", "path"]}}},
+    {"type": "function", "function": {
+        "name": "ha_lovelace",
+        "description": "Read or change a Home Assistant DASHBOARD (Lovelace views and cards) on a saved alias such as "
+                        "\"unity\" or \"dad\". This is the ONLY correct way to edit a dashboard: HA keeps dashboards in "
+                        "memory and overwrites hand edits to /config/.storage/lovelace*, and ha_api (REST) cannot touch "
+                        "them, so never use sed/awk/jq/python on those files. The auth token is resolved from local "
+                        "storage automatically. Workflow: (1) action=\"list\" shows each view's path, title and card "
+                        "count; (2) action=\"get\" with `view` (the view's path, e.g. \"hvac\") returns that whole view as "
+                        "JSON; (3) change the JSON yourself (move a card into another card's `cards` list, reorder, "
+                        "delete, etc.); (4) action=\"set_view\" with `view` and `view_config` = the COMPLETE modified "
+                        "view object (it replaces the view; must contain \"path\" and a \"cards\" or \"sections\" list). "
+                        "set_view backs up the whole dashboard first, saves, then re-reads to verify, and reports the "
+                        "backup path. `dashboard` is optional (a dashboard's url_path such as \"map\"); omit it for the "
+                        "host's main dashboard.",
+        "parameters": {"type": "object", "properties": {
+            "host": {"type": "string", "description": "saved alias name, e.g. \"unity\" or \"dad\""},
+            "action": {"type": "string", "description": "list, get, or set_view"},
+            "view": {"type": "string", "description": "the view's path (e.g. \"hvac\"); needed for get and set_view"},
+            "view_config": {"type": "object", "description": "set_view only: the complete new view object"},
+            "dashboard": {"type": "string", "description": "optional dashboard url_path; omit for the main dashboard"}},
+            "required": ["host", "action"]}}},
     {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the public internet and return a list of result titles, URLs, and snippets. "
@@ -1191,7 +1210,7 @@ def detect_repetition_loop(text):
 
 
 BUILTIN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
-                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "web_search", "ask_user")
+                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "ha_lovelace", "web_search", "ask_user")
 KNOWN_TOOL_NAMES = BUILTIN_TOOL_NAMES
 
 
@@ -1789,3 +1808,292 @@ def compute_model_update_status(repo_id, cache_path, timeout=10):
             "last_modified": last_modified,
         }
     return None
+
+
+def parse_pinned_model_sources(turbo_root):
+    """Read tools/prepare_agentworld.py's MODELS table -- the source of truth for which upstream Hugging Face
+    repo/commit each locally-converted TinyTitan/turbo model (qwen36, ornith15, katcoder, ...) was actually built
+    from, since the local .gturbo files carry no such record themselves. Returns {key: (repo_id, commit)}, or {}
+    if the script is missing, moved, or its MODELS table isn't the plain dict literal expected. This only reads
+    and parses the file with `ast` -- it is never imported or executed."""
+    import ast
+    script = turbo_root / "tools" / "prepare_agentworld.py"
+    try:
+        tree = ast.parse(script.read_text(), filename=str(script))
+    except Exception:
+        return {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == "MODELS"):
+            try:
+                table = ast.literal_eval(node.value)
+                if isinstance(table, dict):
+                    return table
+            except Exception:
+                pass
+            return {}
+    return {}
+
+
+def compute_pinned_model_update_status(repo_id, pinned_commit, timeout=10):
+    """Best-effort, read-only check for whether a Hugging Face model repo's current default-branch commit differs
+    from a fixed pinned commit. Unlike compute_model_update_status (which compares against whatever this tool
+    happened to see on a PREVIOUS run), the baseline here is the actual commit the local build was converted
+    from, so the first call already means something. Never raises -- returns None on any failure (offline, HF
+    API down, repo_id typo, etc.) or when the pinned commit is still current."""
+    try:
+        req = urllib.request.Request(
+            f"https://huggingface.co/api/models/{repo_id}",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        latest_sha = data.get("sha")
+        last_modified = data.get("lastModified")
+    except Exception:
+        return None
+    if not latest_sha or latest_sha == pinned_commit:
+        return None
+    return {"repo_id": repo_id, "pinned": pinned_commit, "latest": latest_sha, "last_modified": last_modified}
+
+
+# --- tokenmax per-request handoff (added 2026-09-24) --------------------------
+# tokenmax is chosen JOB BY JOB: a request that starts with "/tokenmax", "using tokenmax,",
+# "use/with/via/through tokenmax", or "tokenmax:" / "tokenmax," is handed to the tokenmax planner
+# (Claude plans, local KAT does the small checkable work, read-only tools fetch data).
+# Everything else in the same session is handled normally. Same trigger in mlxcli (REPL and --run) and mlxgui.
+TOKENMAX_TRIGGER = re.compile(
+    r"^\s*(?:/tokenmax\b|(?:using|use|with|via|through)\s+tokenmax\b|tokenmax\s*[:,])[\s,:;]*(?:to\s+)?(.*)$", re.I | re.S)
+TOKENMAX_USAGE = (
+    "usage: /tokenmax [--share|--local-only|--claude|--dry-run|--confirm] your request\n"
+    "       or start any request with:  using tokenmax, <your request>\n"
+    "Private by default: Claude (Haiku) sees only a redacted description; the local model and read-only tools do the "
+    "small, checkable work. Add --share to let Claude see your data and take over steps the local model cannot do.\n"
+    "Each run is ONE SELF-CONTAINED REQUEST, not a conversation: it does not remember anything after it finishes. If "
+    "the plan needs something from you first, it will ask (once, right there); otherwise, to continue afterwards, "
+    "run tokenmax again with the follow-up written out in full, the same way you'd start any new request.")
+
+
+def tokenmax_request(text):
+    """The request text after a tokenmax trigger (may be empty), or None if this input is not a tokenmax job."""
+    m = TOKENMAX_TRIGGER.match(text or "")
+    return m.group(1).strip() if m else None
+
+
+TOKENMAX_BACKENDS = ("turbofieldfare-katcoder", "turbofieldfare-qwen", "turbofieldfare-ornith")
+
+
+def tokenmax_argv(rest, backend=None, model=None):
+    """Build the tokenmax command line for one job. Returns None when there is no request (show TOKENMAX_USAGE).
+
+    Any TurboFieldfare backend (KAT, Qwen, Ornith) and any model on it, including the "-fast" variant, is
+    passed through so tokenmax uses what mlxcli has selected. oMLX is not used by tokenmax."""
+    exe = shutil.which("tokenmax") or str(pathlib.Path.home() / "bin" / "tokenmax")
+    flags = []
+    while rest.startswith("--"):
+        head, _, tail = rest.partition(" ")
+        flags.append(head)
+        rest = tail.strip()
+        if head in ("--backend", "--model", "--planner-model", "--exec-model") and rest:
+            val, _, tail = rest.partition(" ")
+            flags.append(val)
+            rest = tail.strip()
+    if not rest:
+        return None
+    if "--backend" not in flags and backend in TOKENMAX_BACKENDS:
+        flags += ["--backend", backend]
+    if "--model" not in flags and model and backend in TOKENMAX_BACKENDS:
+        flags += ["--model", model]
+    return [exe] + flags + [rest]
+
+
+def model_for_tools(model):
+    """The TinyTitan server's "<model>-fast" alias strips the system prompt, tool definitions and tool-call history
+    from every request (chat-only speed), so an agentic request sent to it can never call a tool. Requests that
+    carry tools must use the base model id; the same weights are loaded either way."""
+    return model[:-len("-fast")] if model and model.endswith("-fast") else model
+
+
+def ha_states_view(method, api_path, result, args, target):
+    """Compact, exactly-counted view of GET /api/states for the ha_api tool (None = not applicable, use the raw JSON).
+
+    The full state list is far larger than the model's window: a truncated dump never even reached the automations,
+    so the model could not count them and started inventing scripts. Filtering and counting are done here."""
+    if method != "GET" or api_path.rstrip("/") != "/api/states" or not isinstance(result, list):
+        return None
+    dom = str(args.get("domain") or "").strip().lower().rstrip(".")
+    st = str(args.get("state") or "").strip()
+    if not dom:
+        counts = {}
+        for e in result:
+            d = str(e.get("entity_id", "")).split(".", 1)[0]
+            counts[d] = counts.get(d, 0) + 1
+        lines = [f"{len(result)} entities total. Per-domain counts (call again with `domain` "
+                 f"(and optionally `state`) to list or count one domain):"]
+        lines += [f"  {d}: {n}" for d, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+        return f"[source: {target}]\n" + "\n".join(lines)
+    dom_all = [e for e in result if str(e.get("entity_id", "")).startswith(dom + ".")]
+    match = [e for e in dom_all if not st or str(e.get("state")) == st]
+    states = {}
+    for e in dom_all:
+        k = str(e.get("state"))
+        states[k] = states.get(k, 0) + 1
+    head = (f"COUNT: {len(match)} '{dom}' entities" + (f" in state '{st}'" if st else "") +
+            f" (of {len(dom_all)} '{dom}' entities total; by state: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(states.items())) + ")")
+    body = [f"{e['entity_id']}: {e.get('state')}"
+            + (f" ({e['attributes']['friendly_name']})" if (e.get("attributes") or {}).get("friendly_name") else "")
+            for e in sorted(match, key=lambda e: e["entity_id"])]
+    text = head + "\n" + "\n".join(body)
+    note = "" if len(text) <= MAX_FILE_CHARS else "\n[list truncated; the COUNT line above is complete and exact]"
+    return f"[source: {target}]\n" + text[:MAX_FILE_CHARS] + note
+
+
+def ha_split_states_query(api_path, args):
+    """('/api/states?domain=automation&state=off') -> ('/api/states', {'domain': 'automation', 'state': 'off'}).
+    Kept out of the tool schema on purpose: extra tool parameters made the model's tool-call JSON malformed under the
+    server's repetition penalty. The query is applied locally; Home Assistant itself never sees it."""
+    from urllib.parse import urlsplit, parse_qs
+    parts = urlsplit(api_path or "")
+    filt = dict(args) if isinstance(args, dict) else {}
+    if parts.path.rstrip("/") == "/api/states" and parts.query:
+        q = parse_qs(parts.query)
+        for k in ("domain", "state"):
+            if q.get(k):
+                filt[k] = q[k][0]
+        return "/api/states", filt
+    return api_path, filt
+
+
+# --- local fast lane (added 2026-09-25) ---------------------------------------------------------------------------
+# Default for self-contained prompts (code, logic, formulas, explanations): ONE small no-tools call to the local model with
+# the recent conversation included -- no tool prompt (~5,000-17,000 tokens), no Claude. Anything that touches files, hosts,
+# URLs or the web, follows a tool-using turn, or fails the cheap checks below uses the normal full agent instead.
+TOKENLOCAL_TRIGGER = re.compile(
+    r"^\s*(?:/tokenlocal\b|(?:using|use|with|via|through)\s+tokenlocal\b|tokenlocal\s*[:,])[\s,:;]*(?:to\s+)?(.*)$", re.I | re.S)
+TOKENLOCAL_USAGE = ("usage: /tokenlocal your request   (or start any request with:  tokenlocal, <your request>)\n"
+                    "Forces the full local agent (tools, files, hosts) and skips the fast lane. Nothing is sent to Claude.")
+FAST_LANE_INSTRUCTIONS = ("Answer the request below directly and completely, using the conversation above only if it is relevant. Follow any "
+                          "output-format instruction exactly (for example 'just the number', 'only the code', 'two sentences'). If asked for "
+                          "code, reply with exactly one fenced code block and nothing else unless told otherwise. You have no tools here. If you "
+                          "are not confident you can answer correctly, or the request needs files, the web or a machine you cannot reach, begin "
+                          "your whole reply with the exact token [[UNSURE]]. Factual grounding: never invent a specific-sounding name, statistic, percentage, "
+                          "date, quote, link or citation to make an answer sound more complete; if you do not know something, or required input "
+                          "is missing, say so plainly instead of guessing.")
+_FL_RESOURCE = re.compile(r"(?:(?<=\s)|^)~?/[\w.@%+=,~-]+(?:/[\w.@%+=,~-]*)*|https?://|\b\w+\.(?:py|txt|csv|json|md|pdf|docx?|xlsx?|yaml|yml|sh|log|swift|js|ts|html|zip)\b", re.I)
+_FL_ACTION = re.compile(
+    r"\b(save|open|edit|delete|remove|rename|move|copy|install|uninstall|download|upload|restart|reboot|connect|ssh|ping|scan|commit|push|deploy|"
+    r"email|schedule|remind me|search (the )?(web|internet|online)|google|look ?up|latest|news|weather|stock price|price of|today'?s|right now|"
+    r"currently|status of|check (the|my|if|whether)|find (the|my|all)|list (the|my|all)|read (the|my)|show me (the|my)|file|files|folder|"
+    r"director(y|ies)|repo(sitory)?|clipboard|screenshot|attachment|spreadsheet|home assistant|router|server|network|wifi|wi-fi|terminal|"
+    r"command line|shell|processes|disk|memory usage)\b", re.I)
+
+
+def tokenlocal_request(text):
+    """The request after a tokenlocal trigger (may be empty), or None if this input is not a tokenlocal request."""
+    m = TOKENLOCAL_TRIGGER.match(text or "")
+    return m.group(1).strip() if m else None
+
+
+def _last_turn_used_tools(messages):
+    return any(m.get("role") == "tool" or m.get("tool_calls") for m in (messages or [])[-12:])
+
+
+def fast_lane_ok(text, messages=None):
+    """True when this prompt is self-contained and safe to answer with one no-tools local call."""
+    t = (text or "").strip()
+    if not t or t.startswith("/") or len(t) > 12000: return False
+    if _FL_RESOURCE.search(t) or _FL_ACTION.search(t): return False
+    if _last_turn_used_tools(messages): return False          # follow-ups to a tool-using turn keep their tools
+    try:
+        aliases = json.loads((pathlib.Path.home() / ".omlx" / "host_aliases.json").read_text())
+    except Exception:
+        aliases = {}
+    for name in aliases:
+        if name.isdigit():
+            if re.search(rf"\b{name}\b", t) and re.search(r"\b(router|server|host|extension)\b", t, re.I): return False
+        elif re.search(rf"\b{re.escape(name)}\b", t, re.I): return False
+    try:
+        if should_auto_enable_agentic(t, messages): return False
+    except Exception:
+        return False
+    return True
+
+
+def fast_lane_messages(messages, user):
+    hist, total = [], 0
+    for m in (messages or [])[-8:]:
+        c = m.get("content")
+        if m.get("role") in ("user", "assistant") and isinstance(c, str) and c.strip() and not m.get("tool_calls"):
+            hist.append({"role": m["role"], "content": c[:2000]}); total += min(len(c), 2000)
+    while total > 6000 and hist: total -= len(hist.pop(0)["content"])
+    while hist and hist[0]["role"] != "user": hist.pop(0)
+    return hist + [{"role": "user", "content": FAST_LANE_INSTRUCTIONS + "\n\nRequest:\n" + user}]
+
+
+def fast_lane_problems(request, text, finish):
+    """Cheap, deterministic reasons NOT to trust a fast-lane answer (empty list = accept)."""
+    p, t = [], (text or "").strip()
+    if not t: p.append("empty answer")
+    if t.startswith("[[UNSURE]]"): p.append("the model said it was unsure or needs tools")
+    if finish == "length": p.append("answer cut off")
+    if re.search(r"(?i)\b(i (can'?t|cannot|don'?t have|do not have) (access|browse|see|open)|as an ai (language )?model)\b", t): p.append("the model said it lacks access")
+    if len(t) > 200 and re.search(r"(.{20,}?)\1{3,}", t, re.S): p.append("answer looped on itself")
+    if re.search(r"\bpython\b", request, re.I) and t:
+        import ast
+        m = re.search(r"```(?:python|py)?\n(.*?)```", t, re.S); code = m.group(1) if m else t
+        try:
+            ast.parse(code)
+            for fn in re.findall(r"\bfunction\s+([A-Za-z_]\w*)\s*\(", request):
+                if not re.search(rf"\bdef\s+{fn}\b", code): p.append(f"code does not define {fn}()")
+        except SyntaxError as e:
+            p.append(f"code has a syntax error ({e.msg})")
+    return p
+
+
+def fast_lane_complete(url, key, model, backend, messages, user):
+    """(text, in_tokens, out_tokens, problems). Short answers get a 3-sample majority vote (a cheap check on arithmetic/logic)."""
+    from collections import Counter
+    st = load_model_settings(backend)
+    def call(temp, max_tokens):
+        payload = {"model": model, "messages": fast_lane_messages(messages, user), "max_tokens": max_tokens, "stream": False,
+                   "temperature": temp, "top_p": st["top_p"], "top_k": st["top_k"], "repetition_penalty": st["repetition_penalty"]}
+        d = api(url, key, "/v1/chat/completions", payload)
+        ch = (d.get("choices") or [{}])[0]
+        txt = re.sub(r"<think>.*?</think>", "", (ch.get("message") or {}).get("content") or "", flags=re.S).strip()
+        u = d.get("usage") or {}
+        return txt, ch.get("finish_reason"), int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
+    text, fin, tin, tout = call(0.2, 1500)
+    problems = fast_lane_problems(user, text, fin)
+    # A small model asked for an "exact" statistic invents a different plausible number every time it is asked (measured: five
+    # different Fort Mill census figures in five tries, none correct). Specific figures in a prose answer must therefore recur in a
+    # repeated answer, or the answer is rejected and the request goes to the full agent, which can look things up.
+    if not problems and len(text) > 40 and "```" not in text:
+        def figs(t):
+            keep = lambda n: len(n.replace(",", "").split(".")[0]) >= 3
+            mine = {n.replace(",", "") for n in re.findall(r"\d[\d,]*\d(?:\.\d+)?", t) if keep(n)}
+            return mine - {n.replace(",", "") for n in re.findall(r"\d[\d,]*\d", user)}    # numbers the user supplied do not count
+        mine = figs(text)
+        if mine:
+            others = []
+            for _ in range(3):
+                try:
+                    t2, _f, i2, o2 = call(0.9, 300); others.append(figs(t2)); tin += i2; tout += o2
+                except Exception:
+                    pass
+            # a figure the model really knows recurs; a guessed one does not. Require it in a majority of the repeat answers.
+            need = 2 if len(others) >= 3 else max(1, len(others))
+            if others and any(sum(n in o for o in others) < need for n in mine):
+                problems = ["the specific figures did not recur when asked again (likely guessed)"]
+    if not problems and len(text) <= 40:
+        norm = lambda x: re.sub(r"[^\w]+", " ", x.lower()).strip()
+        samples = [text]
+        for _ in range(2):
+            try:
+                t2, _f, i2, o2 = call(0.8, 200); samples.append(t2); tin += i2; tout += o2
+            except Exception:
+                pass
+        best, n = Counter(norm(x) for x in samples).most_common(1)[0]
+        if n >= 2: text = next(x for x in samples if norm(x) == best)
+        else: problems = ["repeated answers disagreed"]
+    return text, tin, tout, problems
