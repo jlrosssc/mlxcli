@@ -1554,7 +1554,12 @@ class MlxGui(tk.Tk):
         )
         self.chat.tag_configure(
             "user_bubble",
-            justify="right",
+            # No justify="right" here (unlike the indent-only styling below): a right-justified
+            # paragraph combined with a tag background is a known weak spot for Tk's Aqua text
+            # renderer on some macOS/Tk combinations -- scrolling it out of and back into view can
+            # fail to redraw, making the text vanish, while a left-justified background tag (like
+            # assistant_body just below) redraws fine. The indent still reads as a right-side
+            # "bubble"; it just wraps from the left edge of that indent instead of hugging the right.
             background="#f2f1ef",
             foreground="#202020",
             font=tkfont.Font(family="Helvetica", size=17),
