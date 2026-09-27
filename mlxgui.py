@@ -1506,7 +1506,6 @@ class MlxGui(tk.Tk):
         self.model_box = ttk.Combobox(top, textvariable=self.model_var, state="readonly", width=38)
         self.model_box.pack(side="left", padx=(6, 12))
 
-        ttk.Label(top, text="Backend").pack(side="left")
         self.backend_box = ttk.Combobox(
             top,
             textvariable=self.backend_var,
@@ -1514,8 +1513,13 @@ class MlxGui(tk.Tk):
             values=[backend_label(name) for name in SUPPORTED_BACKENDS],
             width=30,
         )
-        self.backend_box.pack(side="left", padx=(6, 12))
         self.backend_box.bind("<<ComboboxSelected>>", self.backend_selection_changed)
+        if os.environ.get("MLXCLI_CHAT_ONLY") != "1":
+            # This build is locked to a single backend (see choose_backend_on_launch), so the picker is
+            # pure clutter here -- it also crowds the resource/token labels off-screen at the default
+            # window size. Keep the widget itself (unpacked) for switch_backend's sake.
+            ttk.Label(top, text="Backend").pack(side="left")
+            self.backend_box.pack(side="left", padx=(6, 12))
 
         ttk.Button(top, text="New Chat", command=self.new_chat).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
@@ -3008,6 +3012,20 @@ class MlxGui(tk.Tk):
             return
         self.events.put(("models", models))
         self.status("Ready")
+        if models:
+            # Send a throwaway completion now, in the background, so the server loads the model's weights and
+            # compiles its Metal kernels while the window first appears rather than on the user's first real
+            # message -- that one-time cost is the same either way, but far more noticeable when it happens
+            # to sit in the middle of an actual reply. Best-effort: failures here are silent and change nothing
+            # (the same warm-up happens naturally on the first real request if this doesn't run).
+            threading.Thread(target=self.warm_up_model, args=(models[0],), daemon=True).start()
+
+    def warm_up_model(self, model):
+        try:
+            api(self.url, self.key, "/v1/chat/completions",
+                {"model": model, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 1, "stream": False})
+        except Exception:
+            pass
 
     def choose_backend_on_launch(self):
         # mlxcli-chat's launcher sets this so a casual chat user only ever sees the message window --
