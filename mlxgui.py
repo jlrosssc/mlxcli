@@ -3010,6 +3010,18 @@ class MlxGui(tk.Tk):
         self.status("Ready")
 
     def choose_backend_on_launch(self):
+        # mlxcli-chat's launcher sets this so a casual chat user only ever sees the message window --
+        # no backend picker, no server internals. The general mlxcli/mlxgui build (turbo backends etc.)
+        # is unaffected: without the env var this behaves exactly as before.
+        if os.environ.get("MLXCLI_CHAT_ONLY") == "1":
+            self.backend = "omlx"
+            self.url, self.key = load_backend_cfg(self.backend)
+            save_backend(self.backend)
+            self.backend_var.set(backend_label(self.backend))
+            self.update_hero_subtitle()
+            stop_other_backend(self.backend, self.status)
+            threading.Thread(target=self.start_server_and_models, daemon=True).start()
+            return
         choices = "\n".join(
             f"{index}) {backend_label(name)} - {backend_description(name)}"
             for index, name in enumerate(SUPPORTED_BACKENDS, 1)
