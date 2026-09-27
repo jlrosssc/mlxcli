@@ -1274,6 +1274,12 @@ def format_uptime(seconds):
 
 
 def trim(messages):
+    """Bound the history, then make sure no tool result is left without its call (see drop_orphan_tool_messages)."""
+    from mlxlib import drop_orphan_tool_messages
+    return drop_orphan_tool_messages(_trim_impl(messages))
+
+
+def _trim_impl(messages):
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if len(starts) > MAX_HISTORY_TURNS:
         cut = starts[-MAX_HISTORY_TURNS]
