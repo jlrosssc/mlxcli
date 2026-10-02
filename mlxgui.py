@@ -31,6 +31,7 @@ try:
     import psutil
 except ImportError:
     psutil = None
+import mlxlib as _gml
 from mlxlib import (
     compute_repo_update_status, compute_model_update_status,
     load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
@@ -43,6 +44,7 @@ from mlxlib import (
     infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
     python_syntax_error, missing_local_imports,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
+    has_clarify_intent, apply_clarify_mode,
     detect_repetition_loop as gui_detect_repetition_loop,
     parse_bare_json_tool_call as gui_parse_bare_json_tool_call,
     parse_xml_tag_tool_call as gui_parse_xml_tag_tool_call,
@@ -1448,9 +1450,9 @@ class MlxGui(tk.Tk):
         self.system_prompt = load_system_prompt()
         self.gui_defaults = load_gui_defaults()
         self.messages = [{"role": "system", "content": self.system_prompt}]
-        notes_path, notes_text = find_project_notes()
-        if notes_text:
-            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
+        notes = _gml.notes_system_text((pathlib.Path.cwd(), load_default_dir()))
+        if notes:
+            self.messages[0]["content"] += f"\n\n{notes}"
         artifact_note = last_artifact_system_note()
         if artifact_note:
             self.messages[0]["content"] += f"\n\n{artifact_note}"
@@ -2230,10 +2232,108 @@ class MlxGui(tk.Tk):
         self.status_var.set("Refining prompt")
         self.start_working("Refining")
         threading.Thread(
-            target=self.refine_prompt_worker,
-            args=(model, raw_request, compact_refinement_context(self.messages)),
+            target=self.apple_refine_worker,
+            args=(model, raw_request, compact_refinement_context(self.messages), list(self.messages)),
             daemon=True,
         ).start()
+
+    def apple_refine_worker(self, model, raw_request, context, messages=None):
+        """Try Apple Intelligence first; fall back to the oMLX refiner on any failure."""
+        import mlxlib as _ml
+        chat = None
+        if not os.environ.get("MLXGUI_NO_APPLE"):
+            try:
+                chat = _ml.AppleChat()
+                if chat.available():
+                    first = chat.ask(_ml.apple_refine_first_prompt(raw_request, _ml.apple_context(messages or [], {"model": model, "cwd": os.getcwd()})), first=True)
+                    self.after(0, lambda: self.open_apple_chat(chat, raw_request, first))
+                    return
+            except Exception as exc:
+                log_error("apple_refine", f"{type(exc).__name__}: {exc}")
+            if chat:
+                chat.close()
+        self.refine_prompt_worker(model, raw_request, context)
+
+    def finish_apple_refine(self, text, status):
+        self.refining = False
+        self.refine_button.configure(state="normal")
+        self.stop_working()
+        if text:
+            self.input.delete("1.0", "end")
+            self.input.insert("1.0", text)
+            self.input.focus_set()
+        self.status_var.set(status)
+
+    def open_apple_chat(self, chat, raw_request, first_reply):
+        win = tk.Toplevel(self)
+        win.title("Apple Intelligence - prompt help")
+        win.geometry("640x460")
+        win.transient(self)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        log = tk.Text(frame, wrap="word", height=16, padx=8, pady=8, state="disabled")
+        log.pack(fill="both", expand=True)
+        log.tag_configure("you", foreground="#555555")
+        log.tag_configure("apple", foreground="#0a6a8a")
+        state = {"last": first_reply, "busy": False, "done": False}
+
+        def add(who, text):
+            log.configure(state="normal")
+            log.insert("end", ("You: " if who == "you" else "Apple: ") + text + "\n\n", who)
+            log.configure(state="disabled")
+            log.see("end")
+
+        add("you", raw_request)
+        add("apple", first_reply)
+        entry = ttk.Entry(frame)
+        entry.pack(fill="x", pady=(8, 0))
+        entry.focus_set()
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(8, 0))
+
+        def close(text, status):
+            if state["done"]:
+                return
+            state["done"] = True
+            chat.close()
+            win.destroy()
+            self.finish_apple_refine(text, status)
+
+        def send(_event=None):
+            msg = entry.get().strip()
+            if not msg or state["busy"]:
+                return
+            entry.delete(0, "end")
+            add("you", msg)
+            state["busy"] = True
+            send_btn.configure(state="disabled")
+
+            def work():
+                try:
+                    reply, err = chat.ask(msg), None
+                except Exception as exc:
+                    reply, err = None, str(exc)
+                def show():
+                    if state["done"]:
+                        return
+                    state["busy"] = False
+                    send_btn.configure(state="normal")
+                    if err:
+                        add("apple", f"[error] {err}")
+                    else:
+                        state["last"] = reply
+                        add("apple", reply)
+                win.after(0, show)
+            threading.Thread(target=work, daemon=True).start()
+
+        send_btn = ttk.Button(row, text="Ask Apple", command=send)
+        send_btn.pack(side="left")
+        ttk.Button(row, text="Use this prompt", command=lambda: close(
+            state["last"], "Prompt from Apple Intelligence; review and press Send")).pack(side="right")
+        ttk.Button(row, text="Cancel", command=lambda: close(
+            None, "Apple prompt help cancelled; original prompt retained")).pack(side="right", padx=(0, 8))
+        entry.bind("<Return>", send)
+        win.protocol("WM_DELETE_WINDOW", lambda: close(None, "Apple prompt help cancelled; original prompt retained"))
 
     def refine_prompt_worker(self, model, raw_request, context):
         try:
@@ -2577,8 +2677,28 @@ class MlxGui(tk.Tk):
                 return False
         return result["approved"]
 
+    def request_user_answer(self, question, options):
+        event = threading.Event()
+        result = {"answer": None}
+        self.events.put(("ask_user", question, options, event, result))
+        while not event.wait(0.1):
+            if self.cancel_requested:
+                return None
+        return result["answer"]
+
     def execute_tool(self, name, args):
         name = str(name or "").strip().lower().replace(".", ":").replace("/", ":").rsplit(":", 1)[-1]
+        if name == "ask_user":
+            question = str(args.get("question") or "").strip()
+            options = [str(o) for o in (args.get("options") or []) if str(o).strip()]
+            if not question:
+                return "Error: ask_user needs a non-empty 'question'."
+            answer = self.request_user_answer(question, options)
+            if not answer:
+                return "The user gave no answer. Proceed using your own best judgment instead, and say what you assumed."
+            if options and answer.isdigit() and 1 <= int(answer) <= len(options):
+                answer = options[int(answer) - 1]
+            return answer
         if name == "run_command":
             command = args.get("command", "")
             try:
@@ -2595,20 +2715,20 @@ class MlxGui(tk.Tk):
             try:
                 cwd = gui_infer_command_cwd(command)
                 proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=180, cwd=cwd)
-                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                output = _gml.clip_output((proc.stdout + proc.stderr).strip())
                 location = f"\nworking_directory={cwd}" if cwd else ""
                 return f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
             except subprocess.TimeoutExpired:
                 return "Command timed out."
         if name == "python_interpreter":
             code = args.get("code", "")
-            if any(term in code for term in ("open(", "write_text(", "makedirs(", "mkdir(", "os.remove(", "unlink(")):
+            if _gml.python_code_writes_files(code):
                 return "Error: use write_file for file creation and run_command for execution; python_interpreter is disabled for filesystem writes."
             if not self.request_tool_approval(f"Run Python code ({len(code)} chars)"):
                 return "User declined."
             try:
                 proc = subprocess.run(["python3", "-c", code], capture_output=True, text=True, timeout=180)
-                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                output = _gml.clip_output((proc.stdout + proc.stderr).strip())
                 return f"exit_code={proc.returncode}\n{output or '(no output)'}"
             except subprocess.TimeoutExpired:
                 return "Python execution timed out."
@@ -2618,14 +2738,19 @@ class MlxGui(tk.Tk):
                 return (f"Error: {path} is a directory, not a file. "
                         f"Use run_command with 'ls' or 'find' to see its contents.")
             try:
+                import mlxlib as _mlr
                 text = path.read_text(errors="replace")
-                return text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
+                _mlr.note_file_known(path)
+                return _mlr.read_text_window(text, args)
             except Exception as exc:
                 return f"Error: {exc}"
         if name == "write_file":
             raw_path = args.get("path", "")
             content = args.get("content", args.get("text", ""))
             target = resolve_output_path(raw_path)
+            need_read = _gml.overwrite_needs_read(target)
+            if need_read:
+                return need_read
             old = ""
             if target.exists():
                 try:
@@ -2650,9 +2775,14 @@ class MlxGui(tk.Tk):
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
+                _gml.note_file_known(target)
                 record_last_artifact(target, self.last_user_text)
                 note = f" (previous version backed up to {backup_path})" if backup_path else ""
                 result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
+                problem = _gml.validate_written_file(target)
+                if problem:
+                    return (f"{result} Error: the file was written but fails its check -- {problem}. It will not "
+                            f"work as is: fix it with write_file before reporting completion.")
                 if target.suffix == ".py":
                     syntax_error = python_syntax_error(content)
                     if syntax_error:
@@ -2712,6 +2842,21 @@ class MlxGui(tk.Tk):
                 return f"HTTP {exc.code} from {target}: {detail}"
             except Exception as exc:
                 return f"Error calling ha_api on {target}: {exc}"
+        if name == "pla_admin":
+            target = str(args.get("host") or args.get("target") or "").strip().lower()
+            action = str(args.get("action") or "status").strip().lower()
+            entry = load_host_aliases().get(target)
+            if not entry or entry.get("type") != "pla_web":
+                return f"Error: '{target}' is not a pla_web alias (use extender_base or extender_den)."
+            if action not in ("status", "reboot"):
+                return "Error: action must be status or reboot."
+            pw = keychain_get(target, entry.get("keychain_service", ""))
+            if pw is None:
+                return f"Error: no stored password for alias '{target}'."
+            if action == "reboot" and not self.request_tool_approval(f"Powerline adapter reboot:\n{target} ({entry.get('host')}) -- restarts the powerline modem, link down about a minute"):
+                return "User declined."
+            import mlxlib as _mlp
+            return f"[source: {target}] " + _mlp.pla_admin_run(entry["host"], pw, action)
         if name == "web_search":
             query = args.get("query", "")
             max_results = args.get("max_results", 5)
@@ -3131,10 +3276,9 @@ class MlxGui(tk.Tk):
         try:
             for path in paths:
                 text, label = convert_file(path, mode)
-                clipped = text[:MAX_FILE_CHARS]
-                note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
-                sections.append(f"Contents of {label}:\n\n{clipped}{note}")
-                labels.append(label)
+                content, display, _ = _gml.loaded_file_message(path, label, text)
+                sections.append(content)
+                labels.append(display)
         except Exception as exc:
             messagebox.showerror("Import failed", f"No files were imported.\n\n{exc}")
             return
@@ -3284,9 +3428,9 @@ class MlxGui(tk.Tk):
         if not keep_rag:
             self.chat_rag_folder_var.set("")
         self.messages = [{"role": "system", "content": self.system_prompt}]
-        notes_path, notes_text = find_project_notes()
-        if notes_text:
-            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
+        notes = _gml.notes_system_text((pathlib.Path.cwd(), load_default_dir()))
+        if notes:
+            self.messages[0]["content"] += f"\n\n{notes}"
         artifact_note = last_artifact_system_note()
         if artifact_note:
             self.messages[0]["content"] += f"\n\n{artifact_note}"
@@ -3442,10 +3586,24 @@ class MlxGui(tk.Tk):
             else:
                 working_messages.insert(0, {"role": "system", "content": agentic_note})
         effective_agentic = agentic
+        # Same rule as mlxcli: the user's own keyword turns on the full clarify note; otherwise
+        # agentic turns get the automatic one. Someone is always at the window to answer.
+        clarify_mode = has_clarify_intent(self.last_user_text) or ("auto" if agentic else False)
         model_settings = load_model_settings(self.backend)
+        # Same guards as mlxcli's turn loop (see _chat_turn_body there for the incidents behind them):
+        # stop when two steps in a row (or A,B,A,B) return nothing new, and shrink older tool results
+        # once the prompt nears the server's context window instead of letting it overflow.
+        turn_start_index = len(working_messages)
+        # The clarify reminder stays on this turn's original user message even after the loop
+        # injects nudges (also role="user"): moving it edited an earlier message, and the server's
+        # prompt cache only reuses an exact prefix, so every nudge re-prefilled the whole prompt.
+        clarify_anchor = next((i for i in range(len(working_messages) - 1, -1, -1)
+                               if working_messages[i].get("role") == "user"), None)
+        recent_step_blobs = []
+        stuck_repeat_streak = 0
         for _step in range(MAX_TOOL_STEPS):
             payload = {
-                "model": model, "messages": working_messages,
+                "model": model, "messages": apply_clarify_mode(working_messages, clarify_mode, clarify_anchor),
                 "max_tokens": model_settings["max_tokens"], "stream": True,
                 "stream_options": {"include_usage": True},
                 "temperature": model_settings["temperature"],
@@ -3468,6 +3626,7 @@ class MlxGui(tk.Tk):
             if payload["model"].endswith("-fast"):
                 payload["model"] = payload["model"][:-len("-fast")]
             parts, calls, usage = [], {}, {}
+            finish_reason = None
             stream_error = None
             repetition_detected = False
             chunks_since_check = 0
@@ -3495,6 +3654,7 @@ class MlxGui(tk.Tk):
                         choices = chunk.get("choices") or []
                         if not choices:
                             continue
+                        finish_reason = choices[0].get("finish_reason") or finish_reason
                         delta = choices[0].get("delta") or {}
                         piece = delta.get("content")
                         if piece:
@@ -3553,6 +3713,11 @@ class MlxGui(tk.Tk):
                     self.events.put(("status", "Server rejected an unexpected tool call; retrying with tools enabled"))
                     continue
                 self.events.put(("append", f"\n[server error mid-generation: {stream_error}; response above may be incomplete]\n"))
+            prompt_tokens = (usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0
+            if prompt_tokens >= SERVER_MAX_CONTEXT_TOKENS * 0.75:
+                working_messages, chars_saved = _gml.compact_turn_for_context(working_messages, turn_start_index)
+                if chars_saved:
+                    self.events.put(("status", f"Context at {prompt_tokens:,} tokens; shrank {chars_saved:,} chars of older or superseded tool results"))
             tool_calls = [{"id": slot["id"] or f"gui_call_{index}", "type": "function",
                            "function": {"name": slot["name"], "arguments": slot["arguments"]}}
                           for index, slot in sorted(calls.items())]
@@ -3613,6 +3778,8 @@ class MlxGui(tk.Tk):
                     return
                 if effective_agentic and content:
                     self.events.put(("append", content))
+                if finish_reason == "length":
+                    self.events.put(("append", "\n[reply cut off: the model hit its output-token limit, so the answer above is incomplete]\n"))
                 self.events.put(("done", content, usage))
                 return
             clean_content = "" if "call:" in content else content
@@ -3620,6 +3787,7 @@ class MlxGui(tk.Tk):
             working_messages.append(assistant_tool_message)
             self.events.put(("tool_history", assistant_tool_message))
             repeated_failure = False
+            this_step_results = []
             for call in tool_calls:
                 call["function"]["name"] = gui_normalize_tool_name(call["function"]["name"])
                 try:
@@ -3628,31 +3796,48 @@ class MlxGui(tk.Tk):
                     args = {}
                 self.events.put(("status", f"Running tool: {call['function']['name']}"))
                 call_key = (call["function"]["name"], json.dumps(args, sort_keys=True, ensure_ascii=False))
-                if call_key in seen_tool_calls:
+                # Never replay run_command/python_interpreter: their result depends on state that
+                # legitimately changes between identical calls ("run the test" after "fix the file"),
+                # so a cached copy reports a since-fixed failure as still failing.
+                cacheable = call["function"]["name"] not in {"run_command", "python_interpreter"}
+                if cacheable and call_key in seen_tool_calls:
                     result = seen_tool_calls[call_key]
                     self.events.put(("status", "Duplicate tool call suppressed; reusing prior result"))
                     if gui_tool_failed(result):
                         repeated_failure = True
                 else:
                     result = self.execute_tool(call["function"]["name"], args)
-                    seen_tool_calls[call_key] = result
+                    if cacheable:
+                        seen_tool_calls[call_key] = result
+                this_step_results.append(result)
                 if self.cancel_requested:
                     self.events.put(("canceled", content))
                     return
                 if not gui_tool_failed(result):
+                    # A successful run after an earlier successful run is itself a re-check (matches mlxcli):
+                    # requiring a literal "stat " left real verification (ls -l, wc, re-running) uncounted.
+                    already_ran = tool_state["run"]
                     if call["function"]["name"] == "write_file":
                         tool_state["write"] = True
                     if call["function"]["name"] in {"run_command", "python_interpreter"}:
                         tool_state["run"] = True
                     if call["function"]["name"] == "read_file" or (
                         call["function"]["name"] in {"run_command", "python_interpreter"}
-                        and "stat " in args.get("command", "")
+                        and ("stat " in str(args.get("command", "")) or already_ran)
                     ):
                         tool_state["verify"] = True
                 working_messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
                 self.events.put(("tool_history", working_messages[-1]))
             if repeated_failure:
                 self.events.put(("append", "\n[stopped: the model repeated an already-failed tool call instead of adapting]\n"))
+                self.events.put(("done", "", usage))
+                return
+            this_step_blob = "\x00".join(this_step_results)
+            stuck_repeat_streak = stuck_repeat_streak + 1 if this_step_blob in recent_step_blobs else 0
+            recent_step_blobs = (recent_step_blobs + [this_step_blob])[-2:]
+            if stuck_repeat_streak >= 2:
+                self.events.put(("append", "\n[stopped: the model repeated the same tool call(s) with no new information "
+                                           "instead of concluding; try narrowing the request]\n"))
                 self.events.put(("done", "", usage))
                 return
         self.events.put(("append", "\n[stopped: too many tool steps]\n"))
@@ -3674,6 +3859,16 @@ class MlxGui(tk.Tk):
                     else:
                         approval_result["approved"] = messagebox.askyesno("Approve local tool action", description, parent=self)
                     approval_event.set()
+                elif kind == "ask_user":
+                    _kind, question, options, answer_event, answer_result = event
+                    if not self.cancel_requested:
+                        prompt = question
+                        if options:
+                            prompt += "\n\n" + "\n".join(f"{i}) {o}" for i, o in enumerate(options, 1))
+                            prompt += "\n\nType a number or your own answer:"
+                        answer = simpledialog.askstring("The model has a question", prompt, parent=self)
+                        answer_result["answer"] = (answer or "").strip() or None
+                    answer_event.set()
                 elif kind == "tool_history":
                     self.messages.append(event[1])
                 elif kind == "append":

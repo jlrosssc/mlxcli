@@ -200,3 +200,13 @@ python3 omlxpanel.py
 ```
 
 The panel stores its WebKit session data under `~/.omlxpanel-data`.
+
+## Apple Intelligence prompt help (optional, macOS 26+)
+
+Typing `?` (or `? your rough request`) in `mlxcli`, or pressing Refine in `mlxgui`, opens a side chat
+with Apple's on-device model to turn a rough request into a precise prompt. It sees a compact view of the
+current session. In `mlxcli`, Enter accepts and sends, typing asks for changes, `/cancel` aborts.
+If Apple Intelligence is unavailable the original oMLX refiner is used (`MLXCLI_NO_APPLE=1` /
+`MLXGUI_NO_APPLE=1` force that). Build the helper once:
+
+    swiftc -parse-as-library -O src/applefm.swift -o ~/bin/applefm

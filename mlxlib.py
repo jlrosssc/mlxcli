@@ -13,6 +13,7 @@ mlxgui) since those are fundamentally different interaction models.
 """
 import ast
 import contextlib
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -24,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -69,6 +71,60 @@ def keychain_get(account, service):
         return p.stdout.rstrip("\n")
     except Exception:
         return None
+
+
+def pla_admin_run(host, password, action):
+    """Zyxel PLA6456 powerline adapter (web page only: no ssh, no shell). action = status | reboot.
+    status: uptime, firmware, G.hn link rates. reboot: presses the page's Hardware Reset (restarts the powerline modem, NOT a
+    factory reset; the web page stays up, the link drops for about a minute and re-forms). The adapter allows ONE logged-in client,
+    so this always logs out; if someone else is logged in it retries briefly. Returns text for the model."""
+    import http.cookiejar, html as _html
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    fetch = lambda path, data=None: op.open(f"http://{host}{path}", data=data, timeout=10).read().decode("utf-8", "replace")
+    title = lambda pg: (re.search(r"<title>([^<]*)", pg) or [0, ""])[1]
+    text_of = lambda pg: re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<script.*?</script>|<style.*?</style>|<!--.*?-->", " ", pg))))
+    login = urllib.parse.urlencode({".CSRFTOKEN": "", ".REDIRECT": "/", ".PASSWORD": password}).encode()
+    for attempt in range(3):
+        try:
+            page = fetch("/", login)
+        except Exception as exc:
+            return f"Error: adapter {host} not reachable ({exc.__class__.__name__})."
+        if "405" not in title(page):
+            break
+        time.sleep(8)
+    else:
+        return f"Error: adapter {host} is busy (another client is logged in to its web page); try again shortly."
+    if "Authentication" in title(page):
+        return f"Error: login to {host} failed (wrong stored password)."
+    try:
+        dev = text_of(fetch("/device.html"))
+        up = re.search(r"System uptime (\d+) days?, (\d+)h (\d+)m (\d+)s", dev)
+        uptime = f"{up.group(1)}d {up.group(2)}h {up.group(3)}m" if up else "unknown"
+        fw = (re.search(r"FW version\s*(\S+)", dev) or [0, "?"])[1]
+        ghn = fetch("/ghn.html")
+        def jsvar(name):
+            m = re.search(r"var\s+%s\s*=\s*(?:new Array\(([^)]*)\)|['\"]([^'\"]*)['\"])" % name, ghn)
+            if not m: return None
+            return [x.strip().strip("'\"") for x in m.group(1).split(",")] if m.group(1) is not None else m.group(2)
+        mv = jsvar("pcmastr")   # a comma-separated STRING of MACs, unlike pcptx/pcprx which are arrays
+        macs = [m.strip() for m in (mv.split(",") if isinstance(mv, str) else (mv or [])) if m.strip()]
+        tx, rx = jsvar("pcptx") or [], jsvar("pcprx") or []
+        me = (jsvar("mymac") or "").lower()
+        peers = [f"{m.lower()} TX {tx[i] if i < len(tx) else '?'} / RX {rx[i] if i < len(rx) else '?'} Mbps" for i, m in enumerate(macs) if i > 0 and m.lower() != me and m != "00:00:00:00:00:00"]
+        summary = f"Zyxel PLA6456 {host}: uptime {uptime}, firmware {fw}, powerline peers: " + ("; ".join(peers) or "none seen")
+        if action != "reboot":
+            return summary
+        fetch("/advanced.html", urllib.parse.urlencode({"CSRFTOKEN": "", "REDIRECT": "reset.html", "SYSTEM.GENERAL.HW_RESET": "1"}).encode())
+        return summary + "\nHardware reset sent (powerline modem restarts; the link re-forms in about a minute). Check status again after ~90 s: uptime should be under 2 minutes."
+    except Exception as exc:
+        if action == "reboot" and exc.__class__.__name__ in ("RemoteDisconnected", "ConnectionResetError"):
+            return "Hardware reset sent (the adapter closed the connection as it restarted, which is normal)."
+        return f"Error talking to adapter {host}: {exc.__class__.__name__}: {exc}"
+    finally:
+        try:
+            fetch("/top_nav.html", urllib.parse.urlencode({"CSRFTOKEN": "", "REDIRECT": "/", "LOG_OUT_OK": "Log Out"}).encode())
+        except Exception:
+            pass
 
 
 def request(url, key, path, payload=None):
@@ -501,9 +557,15 @@ TOOLS = [
             "command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Read a text file (truncated to 8000 chars).",
+        "description": "Read a text file on this Mac (any path, not limited to the sandbox). Returns at most "
+                        "8000 chars; the result says which lines you got and how many the file has. For logs "
+                        "and other files that grow at the end, the newest entries are at the END: use "
+                        "tail_lines to read them. Use start_line to read further into a long file.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"}}, "required": ["path"]}}},
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "description": "1-based line to start from (default 1)"},
+            "tail_lines": {"type": "integer", "description": "read only the last N lines instead"}},
+            "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "write_file",
         "description": "Write a new file or overwrite an existing file. Shows the user a preview and asks for approval before writing.",
@@ -592,6 +654,18 @@ TOOLS = [
             "dashboard": {"type": "string", "description": "optional dashboard url_path; omit for the main dashboard"}},
             "required": ["host", "action"]}}},
     {"type": "function", "function": {
+        "name": "pla_admin",
+        "description": "Check or reboot a powerline adapter on a saved alias of type pla_web: \"extender_base\" (192.168.1.176, the "
+                        "far end next to the 3000) or \"extender_den\" (192.168.1.177, the master next to the router). These adapters "
+                        "have NO ssh/shell, only a web page, so ssh_run cannot reach them: use this tool. action=\"status\" (default) "
+                        "returns uptime, firmware and the powerline link rates. action=\"reboot\" presses the adapter's Hardware Reset "
+                        "(restarts the powerline modem, never a factory reset; needs the user's approval; the link is down about a "
+                        "minute). Credentials are resolved from the Keychain automatically: never ask the user for a password.",
+        "parameters": {"type": "object", "properties": {
+            "host": {"type": "string", "description": "saved alias name: extender_base or extender_den"},
+            "action": {"type": "string", "description": "status (default) or reboot"}},
+            "required": ["host"]}}},
+    {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the public internet and return a list of result titles, URLs, and snippets. "
                         "This leaves the local machine and always requires the user's explicit approval before "
@@ -618,10 +692,9 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "ask_user",
         "description": "Pause and ask the human a direct clarifying question, then wait for their answer "
-                        "before proceeding. Only call this when the user's own request explicitly invited it "
-                        "(it contained a word or phrase like \"clarify\", \"ask me if unsure\", \"check with me "
-                        "first\", or \"ask before\") -- for an ordinary request, use your own best judgment "
-                        "instead and never call this tool. Even when invited, use it sparingly: only for a "
+                        "before proceeding. Only call this when a system note in this conversation says clarify "
+                        "mode is on -- otherwise use your own best judgment instead and never call this tool. "
+                        "Even when it is on, use it sparingly: only for a "
                         "genuine fork in the road where guessing wrong would produce the wrong outcome (which "
                         "of several plausible interpretations, the exact scope of a destructive or hard-to-"
                         "reverse action, a required detail that's actually missing) -- not for routine "
@@ -758,6 +831,71 @@ CLARIFY_MODE_SYSTEM_NOTE = (
     "automatically outside this conversation regardless of clarify mode, so never call "
     "ask_user to ask whether you're allowed to do something; just do it."
 )
+
+
+# Auto-enabled counterpart of CLARIFY_MODE_SYSTEM_NOTE: turned on for interactive
+# agentic turns without the user typing a keyword (the user asked for this
+# 2026-09-28, after a "is my hourly email automation running?" request with no
+# hint of where to look ran 100+ blind ls/find/ha_api calls without ever asking).
+# Narrower than the keyword version on purpose: its main job is one question up
+# front when the request doesn't say WHERE to look or WHAT exactly to do, before
+# a broad search starts -- not a license to check in on every step.
+CLARIFY_AUTO_SYSTEM_NOTE = (
+    "Clarify mode is on for this request. Before doing the work, check two things:\n"
+    "1. Can the request reasonably be read in two or more ways that would give a DIFFERENT result? "
+    "Typical forks: a counting, numbering or ordering rule (what counts as the 1st, 2nd, 3rd item; "
+    "whether a repeating sequence restarts or carries on; what happens to an item that is skipped), "
+    "which of several files or items is meant, which output format or layout is wanted, or the exact "
+    "scope of a change that is hard to undo.\n"
+    "2. Does the request leave out WHERE the thing lives (which machine, service, file, folder or config), "
+    "so that finding it would take more than one quick, targeted check?\n"
+    "If either is true and earlier messages don't already settle it, call ask_user ONCE before starting: "
+    "say in a sentence what you are unsure about and give the concrete readings as options. A question "
+    "costs the user seconds; building the wrong thing or running dozens of speculative searches costs "
+    "minutes. If only one reading makes sense, the difference is cosmetic, or the user already answered "
+    "it, do not ask; just proceed. Ask at most twice per request, one question at a time. Never use "
+    "ask_user to ask permission to run a tool -- that is handled separately and automatically."
+)
+
+
+# Short reminder attached to the end of the user's own message (on the copy sent to the
+# model, never the saved history). Local models weigh the latest user turn far more than
+# one paragraph inside a long merged system block, which is where the notes above end up.
+CLARIFY_USER_REMINDER = (
+    "\n\n[Note: clarify mode is on. If this request can be read more than one way in a way "
+    "that changes the result, call ask_user with the options before doing the work.]"
+)
+
+
+def apply_clarify_mode(messages, clarify_mode, anchor_index=None):
+    """Return a copy of an outgoing request with clarify instructions added, or the same
+    list when clarify_mode is off. The note goes LAST among the system messages (after
+    every other note) and a one-line reminder is appended to a user message: the one at
+    anchor_index (in `messages`) when given, else the latest one. Callers in a tool loop
+    pass the turn's original user message as the anchor -- following the latest user
+    message moved the reminder whenever the loop injected a nudge, which edited an
+    earlier message and threw away the server's prompt cache for the whole prompt.
+    clarify_mode: "auto" (switched on by the app) or any other truthy value (the user's
+    own message asked for it, see has_clarify_intent)."""
+    if not clarify_mode:
+        return messages
+    note = CLARIFY_AUTO_SYSTEM_NOTE if clarify_mode == "auto" else CLARIFY_MODE_SYSTEM_NOTE
+    out = list(messages)
+    last_system = max((i for i, m in enumerate(out) if m.get("role") == "system"), default=-1)
+    out.insert(last_system + 1, {"role": "system", "content": note})
+    if anchor_index is not None:
+        # Shifted by one if the note was inserted at or before it.
+        i = anchor_index + 1 if last_system + 1 <= anchor_index else anchor_index
+        m = out[i] if 0 <= i < len(out) else {}
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            out[i] = dict(m, content=m["content"] + CLARIFY_USER_REMINDER)
+            return out
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            out[i] = dict(m, content=m["content"] + CLARIFY_USER_REMINDER)
+            break
+    return out
 
 
 def has_clarify_intent(user_message):
@@ -938,6 +1076,35 @@ def should_auto_enable_agentic(text, messages=None):
     )
 
 
+# Words that make a following "run"/"test" a noun ("the last run", "a test") and words that make the
+# sentence a question about what already happened ("did it run", "has the job run").
+_RUN_NOUN_BEFORE = {"the", "a", "an", "that", "this", "each", "every", "last", "latest", "previous", "next",
+                    "first", "recent", "hourly", "daily", "nightly", "weekly", "scheduled", "test", "dry", "trial",
+                    "its", "his", "her", "their", "our", "my", "your", "unit", "integration", "smoke"}
+_PAST_QUESTION = {"did", "does", "do", "has", "have", "had", "was", "were", "is", "are", "when", "whether"}
+
+
+def _verb_requested(term, lowered):
+    """Whether `term` ("run", "execute", "test") appears as something the user wants DONE, not a noun or a
+    question about the past. A bare word match made "when did the job last run, and did that run
+    succeed?" demand a run_command, so a question answered by one read_file was forced into four
+    pointless commands and 8 minutes (seen 2026-09-28)."""
+    # Clause by clause (sentence punctuation, "and", "then"), so "what's in the log? run the script" and
+    # "read the file and run it" still count, but a question word anywhere earlier in the same clause
+    # rules it out however long the path in between ("is the script in ~/a/b/c.py run by cron?").
+    for clause in re.split(r"[.?!;,](?=\s|$)|\band\b|\bthen\b", lowered):
+        words = re.findall(r"[a-z0-9_']+", clause)
+        for i, w in enumerate(words):
+            if w != term:
+                continue
+            if (words[i - 1] if i else "") in _RUN_NOUN_BEFORE:
+                continue
+            if any(x in _PAST_QUESTION for x in words[:i]):
+                continue
+            return True
+    return False
+
+
 def execution_contract(text):
     lowered = (text or "").lower()
     # A literal filesystem path is itself an unambiguous target, same as in
@@ -948,17 +1115,321 @@ def execution_contract(text):
     target = has_path_literal or any(term_present(term, lowered) for term in ("file", "files", "directory", "folder", "path", "csv", "script", "downloads"))
     return {
         "write": target and any(term_present(term, lowered) for term in ("create", "write", "save", "generate", "place", "put", "update", "modify", "edit", "add", "change")),
-        "run": target and any(term_present(term, lowered) for term in ("run", "execute", "test")),
+        "run": target and any(_verb_requested(term, lowered) for term in ("run", "execute", "test")),
         "verify": target and any(term_present(term, lowered) for term in ("verify", "inspect", "confirm", "byte size", "exists")),
     }
+
+
+def read_text_window(text, args, max_chars=None):
+    """The part of a file read_file returns, with a header saying exactly what was
+    shown. Used to be a bare text[:8000] with a "[truncated]" tail, so a model
+    reading a log (newest entries at the END) only ever saw the oldest ones, with
+    no way to ask for more -- seen 2026-09-28 reporting wrong "last run" times
+    from a 16K-char log whose recent runs were all past the cut."""
+    max_chars = max_chars or MAX_FILE_CHARS
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    tail = _int(args.get("tail_lines"))
+    start = _int(args.get("start_line"))
+    if tail and tail > 0:
+        first = max(total - tail, 0)
+        chunk = lines[first:]
+        # Keep the END when a tail window is still too big.
+        body = "".join(chunk)
+        if len(body) > max_chars:
+            body = body[-max_chars:]
+            first = total - body.count("\n") - (0 if body.endswith("\n") else 1)
+        shown_from, shown_to = first + 1, total
+    else:
+        first = max((start or 1) - 1, 0)
+        body, shown_to = "", first
+        for line in lines[first:]:
+            if len(body) + len(line) > max_chars:
+                break
+            body += line
+            shown_to += 1
+        if not body and first < total:  # a single line longer than the budget
+            body, shown_to = lines[first][:max_chars], first + 1
+        shown_from = first + 1
+    if total == 0:
+        return "[empty file]"
+    if shown_from <= 1 and shown_to >= total:
+        return body
+    more = []
+    if shown_from > 1:
+        more.append(f"lines 1-{shown_from - 1} not shown (start_line={max(shown_from - 200, 1)} to go back)")
+    if shown_to < total:
+        more.append(f"lines {shown_to + 1}-{total} not shown (start_line={shown_to + 1} for the next part, "
+                    f"tail_lines=N for the end)")
+    return (f"[showing lines {shown_from}-{shown_to} of {total}; " + "; ".join(more) + "]\n" + body)
+
+
+# --- macOS Seatbelt sandbox (the default; the Linux `container` sandbox is the fallback) ------------
+# Modeled on Codex CLI: commands can READ anything on the Mac but can only WRITE inside the working
+# folder (plus temp dirs). The container sandbox could only see the working folder, so the model read
+# empty results about ~/Library as facts and "installed" files that never left the container
+# (2026-09-28). With Seatbelt, reads are real and a write outside the folder fails with a real
+# "Operation not permitted".
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def seatbelt_available():
+    return os.path.exists(SANDBOX_EXEC) and os.environ.get("MLXCLI_SANDBOX", "").lower() != "container"
+
+
+def seatbelt_profile(workdir):
+    home = pathlib.Path.home()
+    writable = [pathlib.Path(workdir).resolve(), pathlib.Path("/private/tmp"), pathlib.Path("/private/var/folders"),
+                pathlib.Path("/dev"), home / ".cache"]
+    paths = " ".join('(subpath "%s")' % str(p).replace("\\", "\\\\").replace('"', '\\"') for p in writable)
+    return f"(version 1)(allow default)(deny file-write* (require-not (require-any {paths})))"
+
+
+# Commands that change the Mac's state WITHOUT writing a file, so Seatbelt's write rule can't stop them
+# (verified 2026-09-28: `defaults write` succeeds from inside the sandbox). Refused in the sandbox with
+# an honest "not done" instead.
+_MAC_STATE_CHANGERS = (
+    (r"\bdefaults\s+(-currentHost\s+)?(write|delete|import|rename)\b", "changes macOS settings (defaults write/delete)"),
+    (r"\blaunchctl\s+(load|unload|bootstrap|bootout|kickstart|kill|enable|disable|remove|submit|start|stop|"
+     r"setenv|unsetenv|config|reboot)\b", "loads, unloads or controls launchd jobs"),
+    (r"\bosascript\b", "runs AppleScript, which can control apps and the system"),
+    (r"(^|[;&|(]\s*|\bthen\s+|\bdo\s+)open\s", "opens apps or files in the GUI"),
+    (r"\b(killall|pkill)\b", "kills running processes"),
+    (r"\bbrew\s+(install|uninstall|upgrade|reinstall|remove|rm|services|link|unlink|tap|untap|cleanup|autoremove)\b",
+     "installs or changes Homebrew packages or services"),
+    (r"\bsudo\b", "needs administrator rights"),
+    (r"\b(shutdown|reboot|halt)\b", "shuts down or restarts the Mac"),
+    (r"\bcrontab\b(?!\s+-l\b)", "changes the crontab"),
+    (r"\bpmset\s+(?!-g\b)", "changes power settings"),
+    (r"\b(networksetup\s+-set|scutil\s+--set|systemsetup\s+-set|nvram\s+\w+=|tccutil\s+reset)",
+     "changes system or network settings"),
+    (r"\bdscl\s+\S+\s+-(create|delete|passwd|append|merge)", "changes user accounts"),
+    (r"\bsecurity\s+(add|delete|import|set|unlock|create|remove)", "changes the keychain"),
+    (r"\bsoftwareupdate\s+(-i|--install|-a|--all)", "installs software updates"),
+    (r"\btmutil\s+(delete|enable|disable|start|stop|setdestination|thin|exclude|include)", "changes Time Machine"),
+    (r"\bdiskutil\s+(erase|partition|unmount|mount|eject|rename|apfs|repair)", "changes disks or volumes"),
+)
+
+
+def mac_state_change(cmd):
+    """Why a sandboxed shell command would change Mac state outside the file system, or None."""
+    for pattern, why in _MAC_STATE_CHANGERS:
+        if re.search(pattern, cmd or ""):
+            return why
+    return None
+
+
+# --- Checks run on every file write_file produces (like Aider's auto-lint) --------------------------
+try:
+    import yaml as _yaml
+
+    class _YamlAnyTagLoader(_yaml.SafeLoader):
+        """SafeLoader that accepts app-specific tags (Home Assistant's !include, !secret, ...)."""
+
+    _YamlAnyTagLoader.add_multi_constructor("!", lambda loader, suffix, node: None)
+except ImportError:
+    _yaml = None
+
+
+def validate_written_file(path):
+    """A problem with a file that was just written, as a short message, or None if it checks out (or no
+    checker applies). Catches files that "were written successfully" but won't load: a plist launchd
+    rejects, JSON/YAML that won't parse, a shell script with a syntax error, Python with undefined names."""
+    path = pathlib.Path(path)
+    ext = path.suffix.lower()
+
+    def _run(args):
+        try:
+            p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return None if p.returncode == 0 else ((p.stdout + p.stderr).strip()[:600] or f"exit code {p.returncode}")
+
+    try:
+        if ext == ".plist":
+            problem = _run(["/usr/bin/plutil", "-lint", str(path)]) if os.path.exists("/usr/bin/plutil") else None
+            return f"plutil -lint failed: {problem}" if problem else None
+        if ext == ".json":
+            json.loads(path.read_text())
+            return None
+        if ext in (".yaml", ".yml") and _yaml is not None:
+            _yaml.load(path.read_text(), Loader=_YamlAnyTagLoader)
+            return None
+        if ext == ".toml":
+            import tomllib
+            tomllib.loads(path.read_text())
+            return None
+        if ext in (".sh", ".bash"):
+            problem = _run(["/bin/bash", "-n", str(path)])
+            return f"bash -n (syntax check) failed: {problem}" if problem else None
+        if ext == ".zsh":
+            problem = _run(["/bin/zsh", "-n", str(path)])
+            return f"zsh -n (syntax check) failed: {problem}" if problem else None
+        if ext == ".py" and importlib.util.find_spec("pyflakes"):
+            try:
+                p = subprocess.run([sys.executable, "-m", "pyflakes", str(path)], capture_output=True, text=True,
+                                   timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            # Only real errors: undefined names break at run time; unused imports etc. are just noise.
+            bad = [ln for ln in (p.stdout + p.stderr).splitlines() if "undefined name" in ln]
+            return "pyflakes: " + "; ".join(bad[:5]) if bad else None
+    except Exception as exc:  # parse errors from json/yaml/toml
+        return f"{ext[1:]} does not parse: {str(exc)[:400]}"
+    return None
+
+
+# --- Notes files the model sees every turn (like Codex's AGENTS.md / Gemini CLI's GEMINI.md) ---------
+USER_NOTES_PATH = pathlib.Path.home() / ".omlx" / "notes.md"
+NOTES_MAX_CHARS = 4000
+
+
+def notes_system_text(dirs=()):
+    """Standing notes for the model: the user's own ~/.omlx/notes.md (facts about their setup, e.g. where
+    scheduled jobs live) plus a project notes file (.mlxcli-notes.md / AGENTS.md / CLAUDE.md) from each
+    of `dirs`. Read fresh every call so edits take effect immediately. Empty string when there are none."""
+    parts, seen = [], set()
+    try:
+        text = USER_NOTES_PATH.read_text(errors="replace").strip()
+        if text:
+            parts.append(f"User notes (from {USER_NOTES_PATH}; standing facts about this user's setup -- "
+                         f"use them before searching):\n{text[:NOTES_MAX_CHARS]}")
+    except OSError:
+        pass
+    for d in dirs:
+        if not d:
+            continue
+        notes_path, notes_text = find_project_notes(d)
+        if notes_text and notes_path.resolve() not in seen:
+            seen.add(notes_path.resolve())
+            parts.append(f"Project notes from {notes_path}:\n{notes_text[:NOTES_MAX_CHARS]}")
+    return "\n\n".join(parts)
+
+
+# --- Read before overwrite (like Claude Code): an existing file may only be overwritten after the model
+# has seen its current contents. Without this a small model "fixes" a document by rewriting it from
+# memory of what it wrote earlier, quietly undoing other edits or dropping content.
+_KNOWN_FILES = {}
+
+
+def _file_stamp(path):
+    try:
+        st = pathlib.Path(path).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def note_file_known(path):
+    """Record that the model has the current contents of `path` (it just read or wrote it)."""
+    stamp = _file_stamp(path)
+    if stamp:
+        _KNOWN_FILES[str(pathlib.Path(path).expanduser().resolve())] = stamp
+
+
+def overwrite_needs_read(path):
+    """An error message if `path` exists and the model hasn't read it since it last changed, else None."""
+    target = pathlib.Path(path).expanduser().resolve()
+    stamp = _file_stamp(target)
+    if stamp is None or not target.is_file():
+        return None  # new file: nothing to lose
+    known = _KNOWN_FILES.get(str(target))
+    if known == stamp:
+        return None
+    why = "has changed since you last read it" if known else "already exists and you have not read it in this session"
+    return (f"Error: NOT written. {target} {why}. Read it with read_file first, then write your change based on "
+            f"its CURRENT contents (keep everything the user didn't ask to change).")
+
+
+def loaded_file_message(path, label, text, extra=""):
+    """(message content, display label, chars loaded) for a local file the user loaded into the chat.
+
+    Says where the content came from -- a local file on this Mac, its full path and size -- so the model
+    can tell it apart from text pasted from the web or a remote host, and can go back to the file. Used to
+    be a bare text[:8000] with "[truncated to 8000 chars]", so anything past that was simply gone, with no
+    hint that the rest existed or where to find it."""
+    p = pathlib.Path(path).expanduser().resolve()
+    converted = label != p.name   # e.g. "x.docx (converted to markdown)", filtered xlsx rows
+    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    source = f"loaded by the user from the local file {p} on this Mac"
+    if converted:
+        source += f", converted from {p.suffix or 'its original format'} to text"
+    header = f"Contents of {label} ({source}; {len(text):,} chars, {lines:,} lines{extra})"
+    partial = len(text) > MAX_FILE_CHARS
+    if not converted:
+        body = read_text_window(text, {})
+        hint = (f"\n[Only part of the file is loaded. To read more, call read_file with path \"{p}\" and "
+                f"start_line, or tail_lines for the end.]") if partial else ""
+    else:
+        body = text[:MAX_FILE_CHARS]
+        hint = (f"\n[Only the first {MAX_FILE_CHARS:,} of {len(text):,} chars are loaded. read_file can't read "
+                f"the rest of a {p.suffix or 'converted'} file as text: if you need a later part, tell the user "
+                f"which part and ask them to /paste it.]") if partial else ""
+    loaded = min(len(text), MAX_FILE_CHARS)
+    if not converted and not partial and not extra:
+        note_file_known(p)   # the model has seen the whole current file, same as a full read_file
+    display = f"{label} from {p}" + (f" [first {loaded:,} of {len(text):,} chars loaded; the model knows where "
+                                     f"the rest is]" if partial else "")
+    return f"{header}:{hint}\n\n{body}", display, loaded
+
+
+def compact_call_arguments(fn, args_str, note):
+    """Replacement arguments for a compacted tool call that still say WHAT it acted on. Dropping the whole
+    argument string also dropped the file path, so a few turns later the model no longer knew which
+    document it had created and couldn't find it to fix it."""
+    keep = {"__compacted__": True, "fn": fn, "note": note}
+    try:
+        args = json.loads(args_str)
+    except (TypeError, ValueError):
+        args = None
+    if isinstance(args, dict):
+        for key in ("path", "host", "target", "method", "action", "url"):
+            if isinstance(args.get(key), str) and args[key]:
+                keep[key] = args[key][:300]
+        if isinstance(args.get("command"), str):
+            keep["command"] = args["command"][:200]
+    return json.dumps(keep)
+
+
+def python_code_writes_files(code):
+    """Whether python_interpreter code writes to the filesystem (those must go through write_file).
+    Blocks WRITES only: the old check refused any code containing "open(", so reads like
+    json.load(open(p)) were refused too and the model couldn't analyze a data file in Python."""
+    return bool(re.search(r"""\bopen\([^)]*?(?:,\s*|mode\s*=\s*)['"][^'"]*[wax+]""", code or "")
+                or any(term in (code or "") for term in ("write_text(", "write_bytes(", "makedirs(", "mkdir(",
+                                                         "os.remove(", "unlink(", "rmtree(", "shutil.move(",
+                                                         "shutil.copy", "os.rename(")))
+
+
+def clip_output(out, max_chars=None):
+    """Command output that fits the budget, keeping its head AND tail and saying
+    so. Plain out[:8000] silently dropped the end (a long `find`, a log `cat`, a
+    test run's final summary) with no sign anything was missing."""
+    max_chars = max_chars or MAX_FILE_CHARS
+    if len(out) <= max_chars:
+        return out
+    half = max_chars // 2
+    omitted = len(out) - 2 * half
+    return (out[:half] + f"\n[... {omitted:,} chars of output omitted from the middle; narrow the command "
+            f"(grep, head, tail) if you need that part ...]\n" + out[-half:])
+
+
+_HTTP_FAILURE = re.compile(r"(^|\n)(\[source: [^\]]*\]\s*)?http [45]\d\d from ")
 
 
 def tool_result_failed(result):
     lowered = (result or "").lower()
     match = re.search(r"exit_code=(-?\d+)", lowered)
-    return (match and int(match.group(1)) != 0) or any(
+    return bool((match and int(match.group(1)) != 0) or any(
         term in lowered for term in ("error:", "not found", "timed out", "user declined")
-    )
+    ) or _HTTP_FAILURE.search(lowered))
 
 
 def python_syntax_error(source):
@@ -1210,7 +1681,7 @@ def detect_repetition_loop(text):
 
 
 BUILTIN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
-                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "ha_lovelace", "web_search", "ask_user")
+                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "ha_lovelace", "pla_admin", "web_search", "ask_user")
 KNOWN_TOOL_NAMES = BUILTIN_TOOL_NAMES
 
 
@@ -1731,17 +2202,18 @@ def compute_repo_update_status(root, timeout=10):
     try:
         branch_proc = run("rev-parse", "--abbrev-ref", "HEAD")
         branch = branch_proc.stdout.strip()
-        if branch_proc.returncode != 0 or not branch or branch == "HEAD":
+        if branch_proc.returncode != 0 or not branch:
             return None
+        # A detached HEAD (an engine built from a checked-out upstream commit, as in the update worktree) is compared with origin/main.
+        label, track = ("detached HEAD", "main") if branch == "HEAD" else (branch, branch)
         remotes = set(run("remote").stdout.split())
-        result = {"root": str(root), "branch": branch, "remotes": {}}
-        for remote, ref in (("origin", branch), ("upstream", "main")):
+        result = {"root": str(root), "branch": label, "remotes": {}}
+        for remote, ref in (("origin", track), ("upstream", "main")):
             if remote not in remotes:
                 continue
-            if run("fetch", remote, ref, "--quiet").returncode != 0:
-                continue
+            run("fetch", remote, ref, "--quiet")            # offline: fall back to the remote ref as of the last successful fetch
             count = run("rev-list", "--count", f"HEAD..{remote}/{ref}").stdout.strip()
-            if count.isdigit():
+            if count.isdigit() and int(count) > 0:          # silent when up to date
                 result["remotes"][f"{remote}/{ref}"] = int(count)
         return result if result["remotes"] else None
     except Exception:
@@ -2119,3 +2591,286 @@ def drop_orphan_tool_messages(messages):
             resolved.add(tid)
         out.append(m)
     return out
+
+
+# In-turn context compaction (shared by mlxcli and mlxgui). Tool rounds more recent than
+# KEEP_RECENT_TOOL_ROUNDS are never touched; tool-call arguments shorter than
+# COMPACT_MIN_CHARS aren't worth replacing.
+KEEP_RECENT_TOOL_ROUNDS = 4
+COMPACT_MIN_CHARS = 300
+COMPACT_EXCERPT_CHARS = 500
+
+
+def _compacted_result(content):
+    """An older in-turn tool result, shrunk but not erased: its first and last
+    COMPACT_EXCERPT_CHARS chars under a header. Replacing results with a bare
+    "[compacted: N chars omitted -- already applied earlier this turn]" threw away
+    the evidence itself (a log's contents, a listing), so the model either re-ran
+    the same reads over and over or answered from a fuzzy memory of them (seen
+    2026-09-28: repeated ls/find right after each compaction, and invented log
+    timestamps). None when there's nothing worth shrinking."""
+    if len(content) <= 2 * COMPACT_EXCERPT_CHARS + 600:
+        return None
+    omitted = len(content) - 2 * COMPACT_EXCERPT_CHARS
+    return (f"[compacted to save context: this earlier result was {len(content):,} chars; its first and last "
+            f"{COMPACT_EXCERPT_CHARS} are kept below. Re-run the tool only if you need the omitted middle.]\n"
+            + content[:COMPACT_EXCERPT_CHARS] + f"\n[... {omitted:,} chars omitted ...]\n"
+            + content[-COMPACT_EXCERPT_CHARS:])
+
+
+def compact_turn_messages(messages, turn_start_index, keep_recent_rounds=KEEP_RECENT_TOOL_ROUNDS):
+    """FIFO-compress older tool interactions within the CURRENT turn only.
+
+    Never touches messages before turn_start_index (prior-turn history is
+    trim()'s job, between turns). Within this turn, replaces the bulky
+    content of tool calls/results older than the most recent
+    keep_recent_rounds with a short marker, preserving the record that the
+    action happened (so the model doesn't re-do it — the separate
+    seen_tool_calls dedup cache also guards against that independently)
+    without carrying its full payload. Compresses, does not delete: message
+    order and count are unchanged. Returns (messages, chars_saved).
+    """
+    unit_starts = [
+        i for i in range(turn_start_index, len(messages))
+        if messages[i].get("role") == "assistant" and messages[i].get("tool_calls")
+    ]
+    if len(unit_starts) <= keep_recent_rounds:
+        return messages, 0
+
+    to_compact_starts = unit_starts[:-keep_recent_rounds]
+    chars_saved = 0
+    new_messages = list(messages)
+
+    for start in to_compact_starts:
+        assistant_msg = new_messages[start]
+        tool_call_ids = {tc.get("id") for tc in (assistant_msg.get("tool_calls") or [])}
+
+        compacted_calls = []
+        assistant_changed = False
+        for tc in assistant_msg.get("tool_calls") or []:
+            args_str = tc.get("function", {}).get("arguments") or ""
+            if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
+                tc = copy.deepcopy(tc)
+                fn_name = tc.get("function", {}).get("name", "?")
+                tc["function"]["arguments"] = compact_call_arguments(
+                    fn_name, args_str, f"{len(args_str):,} chars omitted — already applied earlier this turn")
+                chars_saved += len(args_str) - len(tc["function"]["arguments"])
+                assistant_changed = True
+            compacted_calls.append(tc)
+        if assistant_changed:
+            assistant_msg = dict(assistant_msg)
+            assistant_msg["tool_calls"] = compacted_calls
+            new_messages[start] = assistant_msg
+
+        for i in range(start + 1, len(new_messages)):
+            m = new_messages[i]
+            if m.get("role") != "tool":
+                break  # end of this unit's tool results
+            if m.get("tool_call_id") not in tool_call_ids:
+                continue
+            content = m.get("content") or ""
+            if not content.startswith("[compacted"):
+                shrunk = _compacted_result(content)
+                if shrunk is not None:
+                    new_m = dict(m)
+                    new_m["content"] = shrunk
+                    new_messages[i] = new_m
+                    chars_saved += len(content) - len(shrunk)
+
+    return new_messages, chars_saved
+
+
+SUPERSEDED_MARKER = "[superseded to save context:"
+
+
+def compact_superseded_results(messages, turn_start_index):
+    """Replace this turn's tool payloads that a LATER one in the same turn made
+    redundant, so no live information is lost -- unlike compact_turn_messages,
+    which shrinks by age. Superseded means:
+      - a read_file result when the same path+range was read again later, or the
+        path was successfully written later (the old contents are stale);
+      - a write_file call's content when the same path was successfully written again;
+      - any tool result byte-identical to a later call of the same tool+args.
+    Run only when compaction is already due: every edit to an earlier message
+    invalidates the server's prompt cache (it only reuses an exact prefix), so
+    freeing extra room in the same pass as the age-based compaction means the next
+    few rounds append without edits and hit the cache. Returns (messages, chars_saved)."""
+    calls = []  # (assistant_index, call_index, fn, args_str, args, result_index, result_content)
+    for i in range(turn_start_index, len(messages)):
+        m = messages[i]
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        for ci, tc in enumerate(m["tool_calls"]):
+            fn = tc.get("function", {}).get("name", "")
+            args_str = tc.get("function", {}).get("arguments") or ""
+            try:
+                args = json.loads(args_str)
+            except (TypeError, ValueError):
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            result_index = next((j for j in range(i + 1, len(messages))
+                                 if messages[j].get("role") == "tool"
+                                 and messages[j].get("tool_call_id") == tc.get("id")), None)
+            result = messages[result_index].get("content") or "" if result_index is not None else ""
+            calls.append((i, ci, fn, args_str, args, result_index, result))
+
+    def read_key(args):
+        return (args.get("path"), args.get("start_line"), args.get("tail_lines"))
+
+    new_messages = list(messages)
+    chars_saved = 0
+    for n, (ai, ci, fn, args_str, args, ri, result) in enumerate(calls):
+        later = calls[n + 1:]
+        path = args.get("path")
+        stale_result = stale_args = None
+        if fn == "read_file" and path:
+            if any(l[2] == "read_file" and read_key(l[4]) == read_key(args) for l in later):
+                stale_result = "the same file was read again later in this turn; use that newer copy"
+            elif any(l[2] == "write_file" and l[4].get("path") == path and not tool_result_failed(l[6])
+                     for l in later):
+                stale_result = "this file was rewritten later in this turn, so these contents are out of date"
+        elif fn == "write_file" and path and not tool_result_failed(result):
+            if any(l[2] == "write_file" and l[4].get("path") == path and not tool_result_failed(l[6])
+                   for l in later):
+                stale_args = "this file was written again later in this turn; that later write is current"
+        if stale_result is None and result and any(l[2] == fn and l[3] == args_str and l[6] == result
+                                                   for l in later):
+            stale_result = "a later identical call in this turn returned this exact same result"
+        if stale_result and ri is not None and len(result) > COMPACT_MIN_CHARS \
+                and not result.startswith(("[compacted", SUPERSEDED_MARKER)):
+            marker = f"{SUPERSEDED_MARKER} {stale_result}.]"
+            new_messages[ri] = dict(new_messages[ri], content=marker)
+            chars_saved += len(result) - len(marker)
+        if stale_args and len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
+            msg = dict(new_messages[ai])
+            msg["tool_calls"] = list(msg["tool_calls"])
+            tc = copy.deepcopy(msg["tool_calls"][ci])
+            tc["function"]["arguments"] = compact_call_arguments(fn, args_str, stale_args)
+            msg["tool_calls"][ci] = tc
+            new_messages[ai] = msg
+            chars_saved += len(args_str) - len(tc["function"]["arguments"])
+    return new_messages, chars_saved
+
+
+def compact_turn_for_context(messages, turn_start_index):
+    """The in-turn compaction pass both apps run once the prompt nears the context
+    limit: age-based shrinking (compact_turn_messages) plus superseded payloads
+    (compact_superseded_results) in ONE pass, so the prompt prefix changes once
+    per batch instead of once per round. Returns (messages, chars_saved)."""
+    messages, saved_by_age = compact_turn_messages(messages, turn_start_index)
+    messages, saved_superseded = compact_superseded_results(messages, turn_start_index)
+    return messages, saved_by_age + saved_superseded
+
+
+# ---------------------------------------------------------------------------
+# Apple Intelligence side chat (on-device Foundation Models via ~/bin/applefm)
+# ---------------------------------------------------------------------------
+APPLEFM_BIN = os.path.expanduser("~/bin/applefm")
+APPLE_REFINER_INSTRUCTIONS = (
+    "You help the user write prompts for another, larger local LLM. Rewrite the user's request as one precise, "
+    "self-contained prompt. Preserve every literal filename, path, number, quoted value and requested output format. "
+    "Do not invent facts or inputs. If the user then asks for changes, apply them and return the full updated prompt. "
+    "If the user asks a question about the prompt instead, answer briefly. "
+    "When you give a prompt, output only the prompt text with no preamble."
+)
+
+
+class AppleChat:
+    """Persistent side-chat session with Apple's on-device model."""
+
+    def __init__(self, instructions=APPLE_REFINER_INSTRUCTIONS):
+        self.instructions = instructions
+        self.proc = None
+        self._lock = threading.Lock()
+
+    def _rpc(self, req, timeout=90):
+        import json as _json
+        with self._lock:
+            if self.proc is None or self.proc.poll() is not None:
+                if not os.access(APPLEFM_BIN, os.X_OK):
+                    raise RuntimeError("applefm helper not installed")
+                self.proc = subprocess.Popen(
+                    [APPLEFM_BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                )
+            self.proc.stdin.write(_json.dumps(req) + "\n")
+            self.proc.stdin.flush()
+            box = {}
+            t = threading.Thread(target=lambda: box.setdefault("line", self.proc.stdout.readline()), daemon=True)
+            t.start()
+            t.join(timeout)
+            if "line" not in box or not box["line"]:
+                self.close()
+                raise RuntimeError("Apple Intelligence did not respond")
+            resp = _json.loads(box["line"])
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("error", "unknown error"))
+        return resp.get("text", "")
+
+    def available(self):
+        try:
+            return self._rpc({"op": "status"}, timeout=15) == "available"
+        except Exception:
+            return False
+
+    def reset(self):
+        self._rpc({"op": "reset", "instructions": self.instructions})
+
+    def ask(self, prompt, first=False):
+        req = {"op": "ask", "prompt": prompt, "instructions": self.instructions}
+        if first:
+            self.reset()
+        return self._rpc(req).strip()
+
+    def close(self):
+        p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def apple_context(messages, extras=None, budget=6000):
+    """Compact view of the mlx session for Apple's ~4K-token window.
+
+    Header (working dir, model, system-prompt opening) + recent turns: the newest turn
+    is kept nearly whole, older turns shrink to a one-line gist, newest first until the budget is spent.
+    """
+    extras = extras or {}
+    head = []
+    for label in ("model", "cwd", "files"):
+        if extras.get(label):
+            head.append(f"{label}: {extras[label]}")
+    if messages and messages[0].get("role") == "system":
+        sysmsg = " ".join((messages[0].get("content") or "").split())[:400]
+        if sysmsg:
+            head.append(f"main model's system prompt (start): {sysmsg}")
+    header = "\n".join(head)
+    room = max(0, budget - len(header) - 200)
+    turns = [m for m in messages if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()]
+    out = []
+    for n, m in enumerate(reversed(turns)):
+        text = " ".join((m["content"]).split()) if n else m["content"].strip()
+        limit = 2200 if n == 0 else (900 if n == 1 else 250)
+        if len(text) > limit:
+            text = text[:limit] + " ..."
+        entry = f"[{m['role']}] {text}"
+        if len(entry) > room:
+            break
+        room -= len(entry) + 1
+        out.append(entry)
+        if len(out) >= 12:
+            break
+    body = "\n".join(reversed(out))
+    return (header + "\n\n" if header else "") + body
+
+
+def apple_refine_first_prompt(raw_request, context=""):
+    """Build the opening message for an Apple refinement chat (context pre-budgeted by apple_context)."""
+    if context:
+        return (f"Session context (oldest first; use it to resolve references like 'these' or 'above' and to give "
+                f"advice that fits what the user is doing):\n{context[-6500:]}\n\n"
+                f"Request to turn into a precise prompt:\n{raw_request}")
+    return f"Request to turn into a precise prompt:\n{raw_request}"
