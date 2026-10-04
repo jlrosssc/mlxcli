@@ -942,11 +942,69 @@ _semif_instance = None
 _semif_load_failed = False
 
 
+# --- Memory awareness (added 2026-10-03) -------------------------------------
+# Found while testing tokenmax: every mlxcli process that routes a request loads the ~4 GB SemIf model and keeps it for the life of the
+# session. Next to a 12-14B main model on a 16 GB Mac that pushed the main model into swap (its server dropped to ~19% CPU and jobs ran
+# 10x slower or timed out). The keyword router is the validated fallback, so when memory is tight SemIf is simply not loaded.
+MEM_WARN_SWAP_GB = float(os.environ.get("MLXCLI_MEM_WARN_GB", "4"))   # swap in use above this = tight
+MEM_WARN_FREE_PCT = 12                                                # or less than this % of RAM free
+_semif_mem_state = {"checked": 0.0, "tight": False, "noted": False}
+
+
+def memory_status():
+    """(swap_used_gb, free_ram_pct); (0.0, 100) when the numbers cannot be read, so a failure never blocks anything."""
+    try:
+        sw = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"used = ([\d.]+)M", sw)
+        used_gb = float(m.group(1)) / 1024 if m else 0.0
+        mp = subprocess.run(["memory_pressure"], capture_output=True, text=True, timeout=10).stdout
+        fm = re.search(r"free percentage:\s*(\d+)%", mp)
+        return used_gb, int(fm.group(1)) if fm else 100
+    except Exception:
+        return 0.0, 100
+
+
+def memory_is_tight():
+    used_gb, free_pct = memory_status()
+    return used_gb >= MEM_WARN_SWAP_GB or free_pct < MEM_WARN_FREE_PCT
+
+
+def memory_advisory():
+    """One short warning when the Mac is short of memory (None when fine), naming the biggest memory users so the person can act."""
+    used_gb, free_pct = memory_status()
+    if used_gb < MEM_WARN_SWAP_GB and free_pct >= MEM_WARN_FREE_PCT:
+        return None
+    try:
+        ps = subprocess.run(["ps", "-axo", "rss=,comm="], capture_output=True, text=True, timeout=10).stdout.splitlines()
+        rows = sorted(((int(l.split(None, 1)[0]), l.split(None, 1)[1]) for l in ps if l.strip()), reverse=True)
+        top = [f"{os.path.basename(n)} {kb / 1048576:.1f} GB" for kb, n in rows[:4]]
+    except Exception:
+        top = []
+    return (f"Memory is tight ({used_gb:.1f} GB of swap in use, {free_pct}% of RAM free), so replies may be slow. "
+            f"Biggest memory users: {', '.join(top) or 'unknown'}. Closing large apps or idle model sessions helps.")
+
+
+def _semif_memory_ok():
+    """False when SemIf should not be loaded right now. The answer is cached for 60 s; MLXCLI_SEMIF_ALWAYS=1 turns the check off."""
+    if os.environ.get("MLXCLI_SEMIF_ALWAYS"):
+        return True
+    st = _semif_mem_state
+    now = time.time()
+    if now - st["checked"] >= 60:
+        st["checked"], st["tight"] = now, memory_is_tight()
+    if st["tight"] and not st["noted"]:
+        st["noted"] = True
+        log_error("semif_classifier", "memory is tight; using the keyword router instead of loading the SemIf model")
+    return not st["tight"]
+
+
 def _get_semif():
     global _semif_instance, _semif_load_failed
     if _semif_load_failed:
         return None
     if _semif_instance is None:
+        if not _semif_memory_ok():
+            return None
         try:
             if _SEMIF_PATH not in sys.path:
                 sys.path.insert(0, _SEMIF_PATH)
@@ -2768,9 +2826,25 @@ def compact_turn_for_context(messages, turn_start_index):
 # ---------------------------------------------------------------------------
 APPLEFM_BIN = os.path.expanduser("~/bin/applefm")
 APPLE_REFINER_INSTRUCTIONS = (
-    "You help the user write prompts for another, larger local LLM. Rewrite the user's request as one precise, "
-    "self-contained prompt. Preserve every literal filename, path, number, quoted value and requested output format. "
-    "Do not invent facts or inputs. If the user then asks for changes, apply them and return the full updated prompt. "
+    "You improve prompts for another, larger local LLM that runs on the user's Mac and can use tools (shell commands, "
+    "file reads). Your goal: make the prompt produce an ACCURATE answer to what the user really wants to know. "
+    "The input may be a short request OR a rambling prose description of a goal, problem or situation; in the latter case "
+    "extract the actual task and write a clear prompt from it (goal, relevant facts given, constraints, desired output format), "
+    "dropping chatter but keeping every fact the user stated. Ask the larger model to list any missing info it needs rather than assume. "
+    "Never just repeat the request; always sharpen it. Do this by: "
+    "(1) working out the user's true intent and naming the exact thing to measure, and warning against look-alike "
+    "answers (e.g. 'last ran' is NOT the file's modified time; 'size' vs 'disk usage'; 'created' vs 'changed'); "
+    "(2) telling the model WHERE the real evidence lives, using the session context when given (launchd jobs and "
+    "'launchctl' output, log files, cron, shell history, process lists, git history) and to check more than one source "
+    "if the first is only indirect; "
+    "(3) asking it to show the command or evidence it used, state anything it could not verify, and say 'not found' "
+    "instead of guessing. "
+    "Name kinds of sources (launchd jobs, log files, cron) but do NOT write exact shell commands, flags or log paths - "
+    "the larger model knows the syntax and must discover real paths itself. "
+    "Preserve every literal filename, path, number and quoted value exactly; do not invent facts, paths or log names "
+    "you were not given - tell the model to discover them. Keep it short (a few sentences). "
+    "If the user asks for changes, apply them and return the full updated prompt, which must differ from your previous one. "
+    "If the user says the answer was wrong, work out why and fix the prompt. "
     "If the user asks a question about the prompt instead, answer briefly. "
     "When you give a prompt, output only the prompt text with no preamble."
 )
@@ -2872,5 +2946,5 @@ def apple_refine_first_prompt(raw_request, context=""):
     if context:
         return (f"Session context (oldest first; use it to resolve references like 'these' or 'above' and to give "
                 f"advice that fits what the user is doing):\n{context[-6500:]}\n\n"
-                f"Request to turn into a precise prompt:\n{raw_request}")
-    return f"Request to turn into a precise prompt:\n{raw_request}"
+                f"User's request or description - turn it into a prompt that gets an accurate, evidence-backed answer:\n{raw_request}")
+    return f"User's request or description - turn it into a prompt that gets an accurate, evidence-backed answer:\n{raw_request}"

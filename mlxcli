@@ -124,6 +124,7 @@ try:
 except ImportError:
     formatted_markdown_to_docx = None
 from mlxlib import (
+    memory_advisory,
     compute_repo_update_status, compute_model_update_status,
     load_default_dir, save_default_dir, DEFAULT_DIR_CONFIG_PATH,
     MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
@@ -420,8 +421,8 @@ HELP = """Commands:
   /mem            show RAM status, Metal cap, and top memory users
   /where          show current model, modes, and remote context
   /verbs          show natural-language input/output verbs the router recognizes
-  ? [request]     refine a request in a side chat with Apple Intelligence (Enter accepts and sends,
-                  type to ask for changes, /cancel aborts); falls back to the oMLX decoder if Apple is
+  ? [request]     refine a request in a side chat with Apple Intelligence (Enter accepts and puts it on
+                  your input line to edit/send, type to ask for changes, /cancel discards); falls back to the oMLX decoder if Apple is
                   unavailable or MLXCLI_NO_APPLE=1
   /tokens         show running token totals for this mlxcli session
   /hosts          list saved host aliases (names only — never shows credentials)
@@ -5093,8 +5094,14 @@ def apple_refinement_chat(raw_request, messages, model=""):
         chat.close()
         return None
     try:
-        print("\n\033[36m[Apple Intelligence]\033[0m refining... (Enter = accept, type to ask for changes, /cancel = back to your original prompt)")
+        print("\n\033[36m[Apple Intelligence]\033[0m refining... (Enter = accept and put it on your input line, type to ask for changes, /cancel = discard)")
         reply = chat.ask(_ml.apple_refine_first_prompt(raw_request, _ml.apple_context(messages, {"model": model, "cwd": os.getcwd()})), first=True)
+        if " ".join(reply.split()).lower() == " ".join(raw_request.split()).lower():
+            try:
+                reply = chat.ask("That is identical to the original. Improve it: name exactly what to measure, where the "
+                                 "evidence lives, and require the model to show its evidence. Output only the new prompt.")
+            except Exception:
+                pass
         while True:
             print(f"\n\033[36mApple:\033[0m {reply}")
             try:
@@ -5107,7 +5114,7 @@ def apple_refinement_chat(raw_request, messages, model=""):
             if follow == "" or follow in ("/done", "/accept"):
                 return reply
             try:
-                reply = chat.ask(follow)
+                reply = chat.ask(f"{follow}\n\n(Apply this to the prompt and output the full revised prompt only.)")
             except Exception as e:
                 print(f"[Apple error] {e}")
     except Exception as e:
@@ -5129,8 +5136,7 @@ def request_refinement(url, key, model, backend, inline_request, last_user_reque
     apple = apple_refinement_chat(raw_request, messages, model)
     if apple is not None:
         if apple:
-            print("\nRefined request (sending to the model):")
-            print(apple)
+            print("\nRefined prompt placed on your input line (edit it, or press Enter to send).")
         else:
             print("(Apple refinement cancelled; nothing sent)")
         return apple
@@ -5170,10 +5176,21 @@ def normalize_pasted_command(lines):
     return "\n".join(raw)
 
 
+PROMPT_PREFILL = ""
+
+
 def read_user_command():
+    global PROMPT_PREFILL
+    prefill, PROMPT_PREFILL = PROMPT_PREFILL, ""
     try:
         status = f"remote:{REMOTE_MODE_HOST}" if REMOTE_MODE_HOST else "ready"
-        first = input(f"\n({status}) > ")
+        if prefill and readline is not None and sys.stdin.isatty():
+            readline.set_startup_hook(lambda: readline.insert_text(prefill))
+        try:
+            first = input(f"\n({status}) > ")
+        finally:
+            if readline is not None:
+                readline.set_startup_hook()
     except (EOFError, KeyboardInterrupt):
         raise
     lines = [first]
@@ -5815,6 +5832,7 @@ def _run_tokenmax_job(rest, backend, model=None):
 
 
 def main():
+    global PROMPT_PREFILL
     configure_readline()
     prune_orphan_sandboxes_in_background()
     backend, url, key = load_cfg()
@@ -5895,6 +5913,9 @@ def main():
     # request_messages_for_mode, so they always name the current file. Looked up here only
     # for the startup banner and /notes.
     notes_path, notes_text = find_project_notes()
+    _mem_note = memory_advisory()   # one line, to stderr so scripted --run output stays clean
+    if _mem_note:
+        print(f"({_mem_note})", file=sys.stderr)
 
     if run_task:
         # Headless one-shot mode: run a single task non-interactively and exit —
@@ -6001,6 +6022,8 @@ def main():
                 continue
             if not user:
                 continue
+            PROMPT_PREFILL = " ".join(user.split())
+            continue
         if user in ("/exit", "/quit"):
             break
         import mlxlib as _ml
