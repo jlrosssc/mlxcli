@@ -2275,7 +2275,7 @@ class MlxGui(tk.Tk):
             try:
                 chat = _ml.AppleChat()
                 if chat.available():
-                    first = chat.ask(_ml.apple_refine_first_prompt(raw_request, _ml.apple_context(messages or [], {"model": model, "cwd": os.getcwd()})), first=True)
+                    first = _ml.apple_refine_first(chat, raw_request, _ml.apple_context(messages or [], {"model": model, "cwd": os.getcwd()}))
                     self.after(0, lambda: self.open_apple_chat(chat, raw_request, first))
                     return
             except Exception as exc:

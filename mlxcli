@@ -5155,11 +5155,14 @@ def apple_refinement_chat(raw_request, messages, model=""):
         return None
     try:
         print("\n\033[36m[Apple Intelligence]\033[0m refining... (Enter = accept and put it on your input line, type to ask for changes, /cancel = discard)")
-        reply = chat.ask(_ml.apple_refine_first_prompt(raw_request, _ml.apple_context(messages, {"model": model, "cwd": os.getcwd()})), first=True)
+        reply = _ml.apple_refine_first(chat, raw_request, _ml.apple_context(messages, {"model": model, "cwd": os.getcwd()}))
         if " ".join(reply.split()).lower() == " ".join(raw_request.split()).lower():
             try:
-                reply = chat.ask("That is identical to the original. Improve it: name exactly what to measure, where the "
-                                 "evidence lives, and require the model to show its evidence. Output only the new prompt.")
+                reply = chat.ask("That is identical to the original. Sharpen it: state exactly what answer format is wanted and "
+                                 "ask the model to say plainly when it is unsure. Do not add tools, sources or local-system "
+                                 "details the user did not mention. Output only the new prompt.")
+                if _ml.apple_refinement_leaks(raw_request, reply):
+                    reply = raw_request
             except Exception:
                 pass
         while True:

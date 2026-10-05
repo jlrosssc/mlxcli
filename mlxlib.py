@@ -2827,26 +2827,26 @@ def compact_turn_for_context(messages, turn_start_index):
 APPLEFM_BIN = os.path.expanduser("~/bin/applefm")
 APPLE_REFINER_INSTRUCTIONS = (
     "You improve prompts for another, larger local LLM that runs on the user's Mac and can use tools (shell commands, "
-    "file reads). Your goal: make the prompt produce an ACCURATE answer to what the user really wants to know. "
-    "The input may be a short request OR a rambling prose description of a goal, problem or situation; in the latter case "
-    "extract the actual task and write a clear prompt from it (goal, relevant facts given, constraints, desired output format), "
-    "dropping chatter but keeping every fact the user stated. Ask the larger model to list any missing info it needs rather than assume. "
-    "Never just repeat the request; always sharpen it. Do this by: "
-    "(1) working out the user's true intent and naming the exact thing to measure, and warning against look-alike "
-    "answers (e.g. 'last ran' is NOT the file's modified time; 'size' vs 'disk usage'; 'created' vs 'changed'); "
-    "(2) telling the model WHERE the real evidence lives, using the session context when given (launchd jobs and "
-    "'launchctl' output, log files, cron, shell history, process lists, git history) and to check more than one source "
-    "if the first is only indirect; "
-    "(3) asking it to show the command or evidence it used, state anything it could not verify, and say 'not found' "
-    "instead of guessing. "
-    "Name kinds of sources (launchd jobs, log files, cron) but do NOT write exact shell commands, flags or log paths - "
-    "the larger model knows the syntax and must discover real paths itself. "
-    "Preserve every literal filename, path, number and quoted value exactly; do not invent facts, paths or log names "
-    "you were not given - tell the model to discover them. Keep it short (a few sentences). "
-    "If the user asks for changes, apply them and return the full updated prompt, which must differ from your previous one. "
-    "If the user says the answer was wrong, work out why and fix the prompt. "
-    "If the user asks a question about the prompt instead, answer briefly. "
-    "When you give a prompt, output only the prompt text with no preamble."
+    "file reads) but has NO internet access. Your goal: make the prompt produce an ACCURATE answer to what the user really "
+    "wants to know. The input may be a short request OR a rambling prose description of a goal, problem or situation; in the "
+    "latter case extract the actual task and write a clear prompt from it (goal, relevant facts given, constraints, desired "
+    "output format), dropping chatter but keeping every fact the user stated. "
+    "Never just repeat the request; always sharpen it, WITHOUT changing what is being asked. Do this by: "
+    "(1) working out the user's true intent and naming the exact thing wanted (a date vs a time, 'size' vs 'disk usage'), "
+    "and warning against look-alike answers; "
+    "(2) deciding what KIND of question it is. If it is about THIS Mac (its files, folders, processes, jobs, settings, logs, "
+    "history), you may name the kinds of local evidence to check (launchd jobs, log files, cron, shell history, process lists, "
+    "git history) and ask for more than one source. If it is a general-knowledge question (astronomy, science, history, "
+    "math, coding concepts, definitions) it has NOTHING to do with the Mac: do NOT mention launchd, cron, logs, files, "
+    "commands or any local source, and tell the model to answer from its own knowledge, give exact values, and say plainly "
+    "if it is unsure or its knowledge may be out of date and the user should confirm with an authoritative source; "
+    "(3) asking it to state anything it could not verify, and to say 'not found' or 'not sure' instead of guessing. "
+    "NEVER add tools, data sources, file locations, commands, flags, or verification methods the user did not ask for or "
+    "clearly imply. Do not write exact shell commands or log paths. "
+    "Preserve every literal filename, path, number, place and quoted value exactly; do not invent facts. Keep it short (a few "
+    "sentences). If the user asks for changes, apply them and return the full updated prompt, which must differ from your "
+    "previous one. If the user says the answer was wrong, work out why and fix the prompt. If the user asks a question about "
+    "the prompt instead, answer briefly. When you give a prompt, output only the prompt text with no preamble."
 )
 
 
@@ -2948,3 +2948,37 @@ def apple_refine_first_prompt(raw_request, context=""):
                 f"advice that fits what the user is doing):\n{context[-6500:]}\n\n"
                 f"User's request or description - turn it into a prompt that gets an accurate, evidence-backed answer:\n{raw_request}")
     return f"User's request or description - turn it into a prompt that gets an accurate, evidence-backed answer:\n{raw_request}"
+
+_LOCAL_SYSTEM_WORDS = re.compile(r"\b(launchd|launchctl|cron|crontab|log files?|shell history|process list|plist|grep|sudo|"
+                                 r"/var/|/etc/|/Users/|~/|\.log)\b|/var/|/etc/|~/", re.I)
+
+
+_LOCAL_CUE = re.compile(r"\b(my|mine|this mac|computer|laptop|files?|folders?|director(?:y|ies)|disk|storage|process(?:es)?|jobs?|"
+                        r"logs?|cron|launchd|services?|install(?:ed)?|backups?|ran|run|running|git|repo|ports?|memory|cpu|"
+                        r"battery|network|wifi|app|apps|download(?:s|ed)?)\b|~/|/\w", re.I)
+
+
+def apple_refinement_leaks(raw_request, reply, context=""):
+    """Local-system words the refinement added that neither the user's request nor the session context contained
+    (e.g. a general question turned into 'check launchd jobs and cron')."""
+    if _LOCAL_CUE.search(raw_request):   # a question about this Mac: naming local evidence is the point
+        return []
+    base = f"{raw_request}\n{context}"
+    return sorted({m.group(0).lower() for m in _LOCAL_SYSTEM_WORDS.finditer(reply)
+                   if not re.search(re.escape(m.group(0)), base, re.I)})
+
+
+def apple_refine_first(chat, raw_request, context=""):
+    """First refinement reply, rejecting inventions: if it adds local-system sources the user never mentioned, ask once to
+    remove them; if it still does, fall back to the user's own words (never send an invented prompt)."""
+    reply = chat.ask(apple_refine_first_prompt(raw_request, context), first=True)
+    bad = apple_refinement_leaks(raw_request, reply, context)
+    if bad:
+        try:
+            reply = chat.ask("Your prompt added things the user never mentioned (" + ", ".join(bad) + "). Remove them. "
+                             "Keep only what the user asked, sharpened. Output only the revised prompt.")
+        except Exception:
+            pass
+        if apple_refinement_leaks(raw_request, reply, context):
+            return raw_request
+    return reply
