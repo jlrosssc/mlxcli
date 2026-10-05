@@ -66,6 +66,7 @@ Usage:
                              for summarization, where that heuristic false-positives on
                              ordinary words in the pasted text and wrongly grants tool
                              access the task never needed.
+  mlxcli --man               print the full manual (all options, commands, features, environment variables) and exit.
   mlxcli --run "task" --max-steps N
                              override the default MAX_TOOL_STEPS (mlxlib.py) for this
                              run — for a task known up front to need a lot of
@@ -465,7 +466,66 @@ HELP = """Commands:
   /clear          wipe conversation history
   /commands       list slash commands only
   /help           this text
+  /man            full manual: every option, command and feature (also: mlxcli --man)
   /exit           quit"""
+
+MAN_EXTRA = """
+ROUTING AND SPECIAL REQUEST FORMS (type these as ordinary requests; no slash needed)
+  using tokenmax, ...      Hand THIS request to tokenmax (Claude (Haiku) plans, the local model does the small
+  tokenmax: ...            checkable work). Private by default; see /tokenmax for --share / --local-only / --claude / --dry-run.
+  tokenlocal, ...          Force the full local agent (tools, files, hosts); nothing is sent to Claude. See /tokenlocal.
+  ? [request]              Prompt help: Apple Intelligence side chat that tightens your request. Enter accepts it onto
+                           your input line, type to ask for changes, /cancel discards. Falls back to the oMLX decoder.
+  clarify / ask me if unsure / check with me first / ask before
+                           anywhere in a request: the model pauses and asks you a direct question on ambiguous or
+                           high-stakes decisions (see CLARIFY MODE above).
+  Natural-language input/output verbs (read, summarize, save as docx ...) are recognised automatically; /verbs lists them.
+
+FILE FORMATS
+  Read (loaded into context with /read, /paste, /review, or by naming the file in a request): text, md, csv, tsv, json,
+  yaml, plus docx, pdf, pptx, doc and xlsx, which are converted to markdown first (needs the markitdown tool). For xlsx,
+  a request that names two or more long ID numbers loads only the matching rows instead of the whole sheet.
+  Write: /export or "save it as FILE.docx|md|txt|csv|xlsx" saves the latest reply. xlsx export takes the FIRST markdown
+  table in the reply and writes it as plain text cells (no formulas, number types or formatting). Models can also create
+  files through their write_file/python_interpreter tools inside the sandbox.
+
+SAFETY
+  Default: tool calls are pre-approved and every one runs sandboxed (macOS Seatbelt: reads anywhere, writes only in the
+  working folder; commands that change Mac settings or launchd jobs are refused). --ask prompts before each call instead
+  and runs them directly on the host. /agentic off disables model tool use entirely.
+
+ENVIRONMENT VARIABLES
+  MLXCLI_BACKEND        Start on this backend (omlx, turbofieldfare-qwen, turbofieldfare-ornith, turbofieldfare-katcoder).
+  MLXCLI_SANDBOX        "container" forces the Apple `container` sandbox instead of Seatbelt.
+  MLXCLI_COEXIST        "1" leaves the other model engines running instead of stopping them when you switch.
+  MLXCLI_TINYTITAN_BIN  Path to an alternative TinyTitanServer binary.
+  MLXCLI_NO_APPLE       Set to disable the Apple Intelligence "?" helper (the oMLX decoder is used instead).
+  MLXCLI_MEM_WARN_GB    Swap (GB) above which the Mac counts as memory-tight (default 4). Tight memory prints a startup
+                        advisory and skips loading the optional SemIf router model.
+  MLXCLI_SEMIF_ALWAYS   Set to load SemIf even when memory is tight.
+  MLXCLI_CHAT_ONLY      "1" (GUI) skips the backend picker and goes straight to chat.
+
+FILES
+  ~/.omlx/mlxcli_history   your typed-prompt history (up-arrow; manage with /history)
+  ~/.omlx/default_dir.txt  the default directory for saving and searching (/defaultdir)
+  ~/.omlx/error.log        chat-turn errors (/errorlog)
+  .mlxcli-notes.md, AGENTS.md or CLAUDE.md
+                           project notes loaded from the directory mlxcli was launched in (/notes)
+
+SEE ALSO
+  mlxcli --help (usage only), /help and /commands inside the chat, mlxgui (the same engine in a window; Help > Manual).
+"""
+
+
+def man_text():
+    """Full manual: usage and options (this file's docstring, minus its short command list), every slash command (HELP),
+    the special request forms, safety, environment variables and files."""
+    usage = (__doc__ or "").split("\nCommands:")[0].strip("\n")
+    return ("MLXCLI(1) -- manual\n\nUSAGE AND OPTIONS\n" + usage.replace("Usage:\n", "", 1)
+            + "\n\n  Inside the chat the same manual is /man; mlxcli -h | --help prints the usage and options only.\n\n"
+            + "SLASH COMMANDS (inside the interactive chat)\n" + HELP.replace("Commands:\n", "", 1)
+            + "\n" + MAN_EXTRA)
+
 
 RAG_REMOTE_SYSTEM = (
     "You have been given excerpts retrieved from the user's remote RAG repository. "
@@ -5554,6 +5614,9 @@ def parse_args(argv):
         elif argv[i] in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
+        elif argv[i] == "--man":
+            print(man_text())
+            sys.exit(0)
         else:
             model = argv[i]
             i += 1
@@ -6050,6 +6113,9 @@ def main():
             continue
         if user == "/help":
             print(HELP)
+            continue
+        if user == "/man":
+            print(man_text())
             continue
         if user == "/remote":
             print(f"(remote mode: {REMOTE_MODE_HOST or 'off (running locally)'})")

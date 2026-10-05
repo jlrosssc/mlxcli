@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -2040,6 +2041,9 @@ class MlxGui(tk.Tk):
         defaults.add_command(label="Settings...", command=self.open_settings)
         defaults.add_command(label="Restore Built-in Dialogue Defaults", command=self.restore_builtin_dialogue_defaults)
         menu.add_cascade(label="Defaults", menu=defaults)
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="mlxcli Manual (all options and features)", command=self.open_manual)
+        menu.add_cascade(label="Help", menu=help_menu)
         self.config(menu=menu)
         self.bind_all("<Command-c>", lambda _event: self.menu_copy())
         self.bind_all("<Command-C>", lambda _event: self.menu_copy())
@@ -2054,6 +2058,32 @@ class MlxGui(tk.Tk):
         self.text_menu.add_command(label="Copy", command=self.context_copy)
         self.text_menu.add_command(label="Paste", command=self.context_paste)
         self.text_menu.add_command(label="Select All", command=self.context_select_all)
+
+    def open_manual(self):
+        """Help > manual: shows the output of `mlxcli --man` (the same text the terminal prints)."""
+        if getattr(self, "manual_win", None) is not None and self.manual_win.winfo_exists():
+            self.manual_win.lift()
+            return
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlxcli")
+            r = subprocess.run([sys.executable, script, "--man"], capture_output=True, text=True, timeout=30)
+            text = r.stdout if r.returncode == 0 and r.stdout.strip() else f"Could not load the manual.\n{r.stderr[-500:]}"
+        except Exception as e:
+            text = f"Could not load the manual: {e}\nIn Terminal, run: mlxcli --man"
+        win = tk.Toplevel(self)
+        self.manual_win = win
+        win.title("mlxcli Manual")
+        win.geometry("900x700")
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True)
+        box = tk.Text(frame, wrap="word", font=("Menlo", 12))
+        bar = ttk.Scrollbar(frame, command=box.yview)
+        box.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        box.bind("<Command-c>", lambda _e: (self.clipboard_clear(), self.clipboard_append(box.get("sel.first", "sel.last")) if box.tag_ranges("sel") else None))
 
     def bind_text_context_menu(self, widget):
         widget.bind("<Button-2>", self.show_text_context_menu)
