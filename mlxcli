@@ -25,6 +25,13 @@ Usage:
                              vice versa; the two are tied together deliberately.
   mlxcli --run "task"        headless one-shot mode: run a single task, print the
                              result, and exit (no REPL).
+  mlxcli --artcraft "task"   like --run, plus PdfCraft's PDF tools (ArtCraft app suite,
+                             via its MCP server; files under ~/pdfcraft-trial). e.g.
+                             mlxcli --artcraft "Using PDFCraft combine a.pdf and b.pdf"
+  mlxcli --rea "task"        like --run, plus REA's read-only reverse-engineering tools
+                             (MCP; static analysis of apps/binaries/JS/APKs, nothing is
+                             executed; install: ~/LocalAI/rea). e.g.
+                             mlxcli --rea "List the network endpoints in /path/App.app"
   mlxcli --run "task" --verify "shell command"
                              after the model claims completion, run this command as
                              a correctness check (cwd: the default directory). Exit
@@ -38,6 +45,12 @@ Usage:
                              gets caught here. On a full pass, if --verify was a plain
                              "runner script" form (e.g. "bash check.sh"), that script is
                              archived into DIR so it joins the suite for the next step.
+  .mlxcli-check              accuracy guard for a project folder: put a file named .mlxcli-check in the project; its first non-comment line is
+                             the project's own correctness command (compile + tests). After the model writes files there, mlxcli runs it and shows
+                             the REAL result to the model, and will not accept "done" while it fails (3 reminders, then a loud NOT DONE notice).
+                             Other built-in guards: crashed commands are labelled as crashes, unknown commands/APIs must be looked up with --help
+                             before guessing again, scanned PDFs with OCR text are flagged as unreliable for numbers, and "Now let me ..." turns
+                             that stop without a tool call are nudged to continue.
   mlxcli --transcript URL   fetch a YouTube video's transcript and summarize it into key
                              bullet points, then exit (no REPL). Thin wrapper around
                              yt_summarize.py in the default directory — delegates to it
@@ -137,7 +150,7 @@ from mlxlib import (
     is_destructive_command, has_override_intent, has_clarify_intent, apply_clarify_mode,
     repair_truncated_json, read_text_window, clip_output,
     compact_turn_messages, compact_turn_for_context, python_code_writes_files,
-    seatbelt_available, seatbelt_profile, mac_state_change, SANDBOX_EXEC, validate_written_file, notes_system_text,
+    seatbelt_available, seatbelt_profile, seatbelt_swiftpm_cmd, mac_state_change, SANDBOX_EXEC, validate_written_file, notes_system_text,
     note_file_known, overwrite_needs_read, compact_call_arguments, loaded_file_message,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
@@ -152,8 +165,11 @@ from mlxlib import (
     rag_remote_config, rag_remote_request, rag_remote_search, rag_remote_list,
     rag_remote_upload, rag_remote_update, rag_remote_delete, rag_remote_collections,
     rag_remote_get_document, esv_passage, web_search,
+    rag_requested, rag_search_for_request, rag_excerpts_block, rag_merge_results, rag_set_sticky,
+    rag_collection_in_text as _rag_collection_in_text,
     load_host_aliases, keychain_get, request, api, HOST_ALIASES_PATH,
 )
+from mlxlib import (crash_note, api_guard_note, announced_not_done, pdf_scan_note, find_check_file, read_check_command)
 
 SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
 SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
@@ -268,15 +284,12 @@ DEFAULT_SYSTEM = (
     "run_command/python_interpreter) and every kind of request, not only host-specific facts. Only give an estimate, "
     "guess, or general-knowledge answer in place of a real result when the user's own request explicitly asks you to "
     "speculate, guess, or estimate -- and say plainly that it is one when you do.\n"
+    "For ANY arithmetic -- adding a list of numbers, totals, averages, percentages, conversions -- call the calculator tool with the full expression instead of computing in your head, and report its result verbatim. Never add more than two numbers mentally, and never re-add a previous total by hand: pass the earlier figures to calculator again. To total, average, or otherwise compute from the rows of a table on a web page or file, call table_calc with the URL (or path), the column heading (or a per-row expression) and the operation instead of retyping the numbers into calculator; it returns the row count and every row it read, so quote those. If table_calc reports that the values look like running totals that reset, you MUST give both figures it shows and say which you used and that the source does not define the column; never call a method 'standard' and never name a station or place the tool did not return. If a day is not over, say it is partial and give the latest time. A total must come from a tool call in this turn, never from memory or an earlier turn.\n"
     "To read or change a Home Assistant DASHBOARD (a Lovelace view, its cards or layout) use ha_lovelace: action=get with "
     "the view's path, edit the JSON, then action=set_view with the COMPLETE modified view. Never edit /config/.storage/lovelace* "
     "files by hand or with sed/awk/jq/python, and never write scripts against localhost:8123 - Home Assistant holds dashboards "
     "in memory and overwrites hand edits, while ha_lovelace backs up the dashboard, saves through the supported API and verifies it.\n"
-    "web_search reaches the open internet, unlike every other tool here, and always requires the user to approve "
-    "it live, every call. Only use it when the user's own request actually needs current, external, or "
-    "general-internet information that no local tool or your own knowledge can answer -- never call it by "
-    "default, proactively, or to double-check a routine question. Do not use it as a substitute for actually "
-    "calling ssh_run/ha_api/etc. when the request is about the user's own hosts.\n"
+    "web_search reaches the open internet, unlike every other tool here; the harness asks the user to approve it, so the approval step is NOT a reason to refuse or to skip it -- just call it. USE it whenever the answer depends on today's date or on facts that change or may be newer than your training: the next/latest/upcoming anything (eclipses, events, releases, schedules), current prices, news, weather, laws, versions. Never answer those from memory and never say you cannot find them without trying web_search first. Do not use it for routine questions you can answer reliably, or for the user's own machines/hosts. A search snippet is NOT enough to answer from: after web_search, call web_fetch on the best one or two results, read the page, then quote the exact line you relied on and give its URL (if web_fetch says the page has no text, try browser_action or another result). If you could not verify a time-sensitive fact, say so plainly instead of giving a date from memory.\n"
     "After writing files, use a tool to check the exact paths and report only the paths, sizes, and results returned by tools. "
     "If a required tool action is unavailable or declined, state that the task was not completed.\n"
     "Ground-truth check: for any task involving calculation, physical/scientific data, or a numeric result that "
@@ -432,6 +445,10 @@ HELP = """Commands:
   /defaultdir     show the default directory used for saving and searching
   /defaultdir PATH
                   change the default directory (persists; created if missing)
+  RAG in a message: any message that mentions RAG ("using the RAG documents for ...", "from rag COLLECTION ...") searches
+                  the remote repository; its words are searched one at a time and merged, capped per document. With
+                  /tokenmax the excerpts are attached to the request. No matches = it says so and stops (/rag strict off
+                  lets the model answer from general knowledge instead). Messages that don't mention RAG never search.
   /rag status      show configured remote RAG server and collection
   /rag collections list every collection on the server, with document counts
   /rag collection  show which collection chat messages are auto-searched against
@@ -525,6 +542,12 @@ def man_text():
             + "\n\n  Inside the chat the same manual is /man; mlxcli -h | --help prints the usage and options only.\n\n"
             + "SLASH COMMANDS (inside the interactive chat)\n" + HELP.replace("Commands:\n", "", 1)
             + "\n" + MAN_EXTRA)
+
+
+# Excerpts retrieved earlier in this chat stay available to every later turn (until /clear): one bounded section in the
+# system message (rag_set_sticky), rebuilt from this list each time RAG is asked for again.
+_RAG_STICKY = []
+_RAG_ACTIVE = [False]
 
 
 RAG_REMOTE_SYSTEM = (
@@ -650,7 +673,8 @@ _INSTRUCTION_FILLER_RE = re.compile(
 # (e.g. "convert this to a spreadsheet") still paid for a RAG lookup and, if
 # the RAG server happened to be unreachable, could fail/slow down a turn
 # that never needed retrieval in the first place.
-_EXPLICIT_RAG_TRIGGER_RE = re.compile(r"^\s*from\s+rag\b", re.IGNORECASE)
+# Any mention of RAG counts as asking for it ("from rag X ...", "using the RAG documents ...") -- see mlxlib.rag_requested.
+_EXPLICIT_RAG_TRIGGER_RE = re.compile(r"\brag\b|knowledge\s+base", re.IGNORECASE)
 
 
 def detect_natural_language_collection(text, url, key):
@@ -837,10 +861,10 @@ def load_system_prompt():
     try:
         saved = SYSTEM_PROMPT_PATH.read_text().strip()
         if saved:
-            return saved
+            return saved + "\n" + __import__("mlxlib").current_date_line()
     except Exception:
         pass
-    return DEFAULT_SYSTEM
+    return DEFAULT_SYSTEM + "\n" + __import__("mlxlib").current_date_line()
 
 
 # is_code_request, should_auto_enable_agentic, requires_agentic_execution,
@@ -1711,6 +1735,13 @@ def _ha_lovelace_tool(args):
         return f"Error running ha_lovelace on {target}: {type(exc).__name__}: {exc}"
 
 
+def _cmd_result(cmd, returncode, location, out):
+    """run_command result text: output plus plain notes for crashes, invented commands/APIs and scanned PDFs (accuracy helpers)."""
+    body = clip_output(out) if out else "(no output)"
+    body += crash_note(returncode) + api_guard_note(out) + pdf_scan_note(cmd)
+    return f"exit_code={returncode}{location}\n{body}"
+
+
 def exec_tool(name, args, current_user_text=None):
     # Some local backends qualify function names as shell:run_command or shell.run_command.
     # Normalize those names before dispatching so valid tool calls are not silently lost.
@@ -1767,11 +1798,11 @@ def exec_tool(name, args, current_user_text=None):
                             f"sandbox does not allow, so nothing on the Mac changed. Do not report it as done; tell "
                             f"the user plainly and give them the exact command to run in Terminal themselves.")
                 cwd = infer_command_cwd(cmd)
-                p = seatbelt_run(["/bin/sh", "-c", cmd], cwd=cwd)
+                p = seatbelt_run(["/bin/sh", "-c", seatbelt_swiftpm_cmd(cmd)], cwd=cwd)
                 out = (p.stdout + p.stderr).strip()
                 location = (f"\nworking_directory={cwd or load_default_dir().resolve()} (sandboxed: can read "
                             f"anywhere, can write only in {load_default_dir().resolve()})" + seatbelt_notes(cmd, out))
-                return f"exit_code={p.returncode}{location}\n{clip_output(out) if out else '(no output)'}"
+                return _cmd_result(cmd, p.returncode, location, out)
             if SANDBOX_MODE:
                 ensure_sandbox_container()
             if SANDBOX_MODE and _sandbox_started:
@@ -1791,7 +1822,7 @@ def exec_tool(name, args, current_user_text=None):
                                    text=True, timeout=180, cwd=cwd)
                 location = f"\nworking_directory={cwd}" if cwd else ""
             out = (p.stdout + p.stderr).strip()
-            return f"exit_code={p.returncode}{location}\n{clip_output(out) if out else '(no output)'}"
+            return _cmd_result(cmd, p.returncode, location, out)
         except subprocess.TimeoutExpired:
             return "Command timed out."
     if name == "python_interpreter":
@@ -1820,7 +1851,7 @@ def exec_tool(name, args, current_user_text=None):
                                    text=True, timeout=180)
                 note = ""
             out = (p.stdout + p.stderr).strip()
-            return f"exit_code={p.returncode}{note}\n{clip_output(out) if out else '(no output)'}"
+            return _cmd_result("", p.returncode, note, out)
         except subprocess.TimeoutExpired:
             return "Python execution timed out."
     if name == "ssh_run":
@@ -2001,6 +2032,58 @@ def exec_tool(name, args, current_user_text=None):
             lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
         text = "\n".join(lines)
         return text[:MAX_FILE_CHARS]
+    if name == "calculator":
+        expr = str(args.get("expression", "")).strip()
+        if not expr:
+            return "Error: calculator needs an 'expression'."
+        try:
+            import ast as _ast, mlxlib as _mlc
+            try:
+                _nodes = [n for n in _ast.walk(_ast.parse(expr.replace(",", "") if "[" not in expr and "(" not in expr else expr, mode="eval"))
+                          if isinstance(n, _ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool)]
+                nums = [n.value for n in sorted(_nodes, key=lambda n: (n.lineno, n.col_offset))]  # source order, not walk order
+            except Exception:
+                nums = []
+            result = _mlc.calculator(expr)
+            # Itemized echo: the full term list and a count, never a truncated expression, so a dropped or invented reading is visible
+            # to the model and to the user (a short 'expr[:200]' echo hid exactly that).
+            if len(nums) >= 5:
+                print(f"  tool: calculator ({len(nums)} numbers added: {', '.join(str(x) for x in nums)}) = {result}")
+                return (f"{len(nums)} numbers added: {', '.join(str(x) for x in nums)}\n"
+                        f"Result = {result}\n"
+                        f"Check: {len(nums)} must equal the number of readings in the source; if it does not, list the readings and call calculator again.")
+            print(f"  tool: calculator ({expr[:200]!r})")
+            return f"{expr[:200]} = {result}"
+        except Exception as exc:
+            print(f"  tool: calculator ({expr[:200]!r})")
+            return f"Error running calculator: {exc}"
+    if name == "table_calc":
+        src = str(args.get("source", "")).strip()
+        col = str(args.get("column", "") or "").strip()
+        expr_t = str(args.get("expression", "") or "").strip()
+        op = str(args.get("operation", "") or "sum").strip()
+        if not src or not (col or expr_t):
+            return "Error: table_calc needs 'source' (URL or file path) and a 'column' or an 'expression'."
+        print(f"  tool: table_calc ({src!r}, {op} of {expr_t or col!r})")
+        if src.lower().startswith(("http://", "https://")) and not approve(f"table_calc (fetches a web page): {src}", category="web_fetch"):
+            return "table_calc was declined by the user."
+        try:
+            import mlxlib as _mlt
+            return _mlt.table_calc(src, col or None, op, expr_t or None)
+        except Exception as exc:
+            return f"Error running table_calc: {exc}"
+    if name == "web_fetch":
+        url = str(args.get("url", "")).strip()
+        if not url:
+            return "Error: web_fetch needs a 'url'."
+        print(f"  tool: web_fetch ({url!r})")
+        if not approve(f"web_fetch: {url}", category="web_fetch"):
+            return "User declined."
+        try:
+            import mlxlib as _mlf
+            return _mlf.web_fetch(url, args.get("max_chars", 12000))[:MAX_FILE_CHARS]
+        except Exception as exc:
+            return f"Error running web_fetch: {exc}"
     if name == "ask_user":
         question = _arg_str(args.get("question")).strip()
         options = args.get("options") or []
@@ -2590,7 +2673,9 @@ def do_transcript(arg):
     if not url:
         print("(usage: /transcript <youtube-url>)")
         return
-    script = load_default_dir() / "yt_summarize.py"
+    script = load_default_dir() / "scripts" / "yt_summarize.py"
+    if not script.exists():
+        script = load_default_dir() / "yt_summarize.py"
     if not script.exists():
         print(f"(no yt_summarize.py found in {load_default_dir()} -- nothing to delegate /transcript to)")
         return
@@ -3340,7 +3425,7 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
     collection = configured_collection if collection_override is None else collection_override
     if not url:
         return None, []
-    if not _EXPLICIT_RAG_TRIGGER_RE.match(user_text):
+    if not rag_requested(user_text, _RAG_ACTIVE[0]):
         return None, []
     # A leading "from COLLECTION, ..." phrase names its target explicitly and
     # wins over any session default — fuzzy-matched against the real,
@@ -3352,6 +3437,11 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
     if natural_collection:
         collection, search_text = natural_collection
         print(f"(interpreting as: collection={collection!r} query={search_text!r})")
+    elif not collection:
+        named = _rag_collection_in_text(user_text, url, key)   # a collection named anywhere in the message scopes the search
+        if named:
+            collection = named
+            print(f"(interpreting as: collection={collection!r})")
     # If the message embeds a recognizable Bible reference (e.g. "show me
     # commentary on John 3:16"), search for just that reference under all its
     # known forms instead of the whole sentence — filler words like "show me
@@ -3361,13 +3451,19 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
     seen_keys = set()
     results = []
     try:
-        for query in (reference_variants or [search_text]):
-            data = rag_remote_search(query, url, key, collection, limit=limit)
-            for result in data.get("results") or []:
-                dedupe_key = (result.get("id"), result.get("chunk_index"))
-                if dedupe_key not in seen_keys:
-                    seen_keys.add(dedupe_key)
-                    results.append(result)
+        if reference_variants:
+            for query in reference_variants:
+                data = rag_remote_search(query, url, key, collection, limit=limit)
+                for result in data.get("results") or []:
+                    dedupe_key = (result.get("id"), result.get("chunk_index"))
+                    if dedupe_key not in seen_keys:
+                        seen_keys.add(dedupe_key)
+                        results.append(result)
+        else:
+            # The server needs ALL words of a query in one chunk, so a whole sentence finds nothing: search the
+            # request's content words one at a time and merge, capped per document (mlxlib.rag_search_for_request).
+            results = rag_search_for_request(search_text, url, key, collection)
+            limit = max(limit, len(results))
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         # A RAG lookup happens implicitly on every plain chat message (both
         # interactive and headless --run) -- this used to be completely
@@ -3377,7 +3473,8 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
         # retrieval for this turn. Degrade gracefully instead.
         print(f"(remote RAG unavailable: {e} — continuing without retrieval for this turn)")
         return False, []
-    results.sort(key=lambda r: r.get("score", 0), reverse=True)
+    if reference_variants:
+        results.sort(key=lambda r: r.get("score", 0), reverse=True)
     results = results[:limit]
     # The RAG server's score isn't a normalized similarity — it's small and
     # corpus/query-length dependent (an exact, distinctive quote can score
@@ -3410,12 +3507,14 @@ def remote_rag_context(messages, user_text, limit=4, collection_override=None, n
         f"Remote RAG collection: {collection or '(all collections)'}",
         "Relevant source excerpts:",
     ]
-    labels = []
-    for result in results:
-        label = f"{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}"
-        labels.append(label)
-        lines.append(f"\n[{label}]\n{result.get('content', '')}")
-    _append_system_content(messages, RAG_REMOTE_SYSTEM + "\n" + "\n".join(lines))
+    labels = [f"{r.get('title') or r.get('filename')} chunk {r.get('chunk_index', 0)}" for r in results]
+    merged = rag_merge_results(results, _RAG_STICKY)   # this turn's excerpts first, then the ones kept from earlier
+    _RAG_STICKY[:] = merged
+    _RAG_ACTIVE[0] = True
+    for result in merged:
+        lines.append(f"\n[{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}]\n"
+                     f"{result.get('content', '')}")
+    rag_set_sticky(messages, RAG_REMOTE_SYSTEM + "\n" + "\n".join(lines))
     numbered = "; ".join(f"[{i}] {label}" for i, label in enumerate(labels, start=1))
     print(f"(remote RAG: used {len(results)} excerpt(s) — {numbered})")
     print(f"(type a number 1-{len(results)} to see that excerpt's full, untruncated text — "
@@ -4603,6 +4702,45 @@ def _warn_sandbox_blocked(blocked):
         print(f"   - ... and {len(blocked) - 8} more")
 
 
+def _run_project_check(cf, check_state, n_writes=None):
+    """Run a project's .mlxcli-check command through the normal run_command path (same sandbox/approval as any command).
+    A check that PASSED is not re-run until more files were written (n_writes grows)."""
+    prev = check_state.get(str(cf))
+    if prev and prev["passed"] and n_writes is not None and prev.get("n_writes") == n_writes:
+        return prev
+    cmd = read_check_command(cf)
+    if not cmd:
+        return None
+    result = exec_tool("run_command", {"command": f"cd {shlex.quote(str(cf.parent))} && {cmd}"})
+    m_ = re.match(r"exit_code=(-?\d+)", result or "")
+    st = {"cmd": cmd, "passed": bool(m_) and m_.group(1) == "0", "text": result or "", "n_writes": n_writes}
+    check_state[str(cf)] = st
+    return st
+
+
+def _check_tail(text):
+    return text if len(text) <= 1800 else text[:600] + "\n...\n" + text[-1200:]
+
+
+def _auto_check_after_writes(paths, check_state, messages, n_writes=None):
+    """Accuracy: after file writes, run the project's own check (.mlxcli-check) and put the REAL result in front of the model."""
+    seen = set()
+    for p_ in paths:
+        cf = find_check_file(p_)
+        if not cf or str(cf) in seen:
+            continue
+        seen.add(str(cf))
+        st = _run_project_check(cf, check_state, n_writes=n_writes)
+        if not st:
+            continue
+        note = (f"\n\n[mlxcli auto-check] After your file write(s) the project check `{st['cmd']}` was run:\n{_check_tail(st['text'])}\n"
+                + ("It PASSED." if st["passed"] else
+                   "It FAILED. Fix the FIRST problem it shows before doing anything else; do not claim the work is done."))
+        if messages and messages[-1].get("role") == "tool":
+            messages[-1]["content"] += note
+        print("  (auto-check: " + ("passed" if st["passed"] else "FAILED") + f" -- {st['cmd'][:70]})")
+
+
 def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None,
               auto_clarify=False):
     # Guard the whole turn (all agentic tool-call retries included, not just
@@ -4653,6 +4791,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     turn_in = 0
     turn_out = 0
     retried_empty = False
+    retried_overflow = False
     repetition_streak = 0
     tool_state = {"write": False, "run": False, "verify": False}
     contract = contract or {}
@@ -4695,6 +4834,9 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     stuck_repeat_streak = 0
     sandbox_blocked = []
     sandbox_nudged = False
+    check_state = {}          # .mlxcli-check path -> last result {cmd, passed, text}
+    check_gate_nudges = 0
+    announce_nudges = 0
     effective_agentic_mode = agentic_mode
     retried_with_tools = False
     for _ in range(MAX_TOOL_STEPS):
@@ -4744,14 +4886,59 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                     print("(empty model response; retrying once)")
                     continue
                 if last_tool_results:
-                    print("(model continuation failed; preserving tool results)")
+                    if not retried_overflow:
+                        # Found 2026-10-06: a 5-hour SwiftCalc session ended right after a tool result with NO model reply
+                        # (context full), and nothing told the user. Trim this turn's big tool outputs hard and ask once more.
+                        retried_overflow = True
+                        trimmed = 0
+                        for i_ in range(turn_start_index, len(messages)):
+                            m_ = messages[i_]
+                            if m_.get("role") == "tool" and len(m_.get("content") or "") > 1200:
+                                trimmed += len(m_["content"]) - 1200
+                                m_["content"] = m_["content"][:1200] + "\n...[output trimmed by mlxcli to fit the context]"
+                        print(f"(the model gave no reply after the last tool results -- the context was probably full; "
+                              f"trimmed {trimmed:,} chars of tool output and asking once more)")
+                        continue
+                    print("(TURN ENDED WITH NO MODEL REPLY: the model never answered after its last tool results, even after "
+                          "trimming. The session context is probably full. Send 'continue' to try again, or /clear / restart "
+                          "mlxcli and re-send the task; saved files and progress notes on disk are not lost. Last tool results:)")
                     for result in last_tool_results:
-                        print(result)
+                        print(result if len(result) <= 600 else result[:600] + " ...[trimmed]")
                 else:
                     msg_chars = sum(len(m.get("content") or "") for m in messages)
                     log_error("chat_turn", f"turn failed: server returned no output and no token usage (backend={backend}, model={model}, agentic={effective_agentic_mode}, execution_required={execution_required}, messages={len(messages)}, msg_chars={msg_chars}, step={_})")
                     print("(turn failed: server returned no output and no token usage; reduce loaded context or retry)")
                 return 0, 0
+            if written_paths:
+                # Accuracy gate: a project with a .mlxcli-check must pass it before a "done" is accepted. Re-run it fresh every time.
+                failing = None
+                for p_ in written_paths:
+                    cf_ = find_check_file(p_)
+                    if cf_:
+                        st_ = _run_project_check(cf_, check_state, n_writes=len(written_paths))
+                        if st_ and not st_["passed"]:
+                            failing = st_
+                            break
+                if failing and check_gate_nudges < 3:
+                    check_gate_nudges += 1
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": (
+                        f"Do NOT finish yet. The project's own check `{failing['cmd']}` is failing:\n{_check_tail(failing['text'])}\n"
+                        "Fix the first problem it shows (read the relevant file first); the check is re-run automatically after your writes. "
+                        "Only when it passes may you report the work as done.")})
+                    print(f"(project check still failing: not accepting 'done' yet, attempt {check_gate_nudges}/3)")
+                    continue
+                if failing:
+                    print(f"(harness: NOT DONE -- the project check `{failing['cmd']}` is still failing after 3 reminders; the work is incomplete. "
+                          f"Last output:\n{_check_tail(failing['text'])})")
+            if effective_agentic_mode and last_tool_results and announce_nudges < 3 and announced_not_done(content):
+                announce_nudges += 1
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": (
+                    "You said you would do the next step but did not call a tool, so nothing happened. Do it now with a tool call. "
+                    "If you are actually finished, reply starting with 'Finished:' and summarize only what you verified.")})
+                print(f"(the model announced a next step but made no tool call; asking it to continue, {announce_nudges}/3)")
+                continue
             if execution_required and _ == 0:
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": (
@@ -4834,11 +5021,19 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                     "the logic produces the correct result for each one, showing the walkthrough. "
                     "If you find a problem, fix it now with write_file and explain what changed. "
                     "If you find nothing wrong, say so briefly — do not rewrite files that are already correct."
+                    + ((" These commands did NOT run, so nothing depends on them is verified: "
+                        + "; ".join(sandbox_blocked[:4]) + ". Reading code is not a test: do not use check marks "
+                        "or the words verified/correct/works for anything they would have shown, and label it "
+                        "UNVERIFIED.") if sandbox_blocked else "")
                 )})
                 print("(reviewing written file(s) before finishing...)" if not confirming
                       else "(confirming the fix before finishing...)")
                 continue
             offer_smoke_test(written_py_paths)
+            if sandbox_blocked and re.search(r"[\u2713\u2705]|\bverified\b|\bworks\b|\bis now correct\b",
+                                             content or "", re.I):
+                print("(harness: UNVERIFIED -- the check marks / 'verified' above are the model's own reading of "
+                      "the code. The commands listed below never ran, so no build or test result backs them.)")
             _warn_sandbox_blocked(sandbox_blocked)
             messages.append({"role": "assistant", "content": content})
             totals["in"] += turn_in
@@ -4851,6 +5046,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
             print(f"  [thinking] {content}")
         repeated_failure = False
         this_step_results = []
+        step_written_start = len(written_paths)
         for call in tool_calls:
             fn = normalize_tool_name(call["function"]["name"])
             call["function"]["name"] = fn
@@ -4959,6 +5155,8 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
             last_tool_results.append(result)
             messages.append({"role": "tool", "tool_call_id": call["id"],
                              "content": result})
+        if len(written_paths) > step_written_start:
+            _auto_check_after_writes(written_paths[step_written_start:], check_state, messages, n_writes=len(written_paths))
         if repeated_failure:
             log_error("chat_turn", f"stopped: repeated already-failed tool call (backend={backend}, model={model})")
             print("(stopped: the model repeated an already-failed tool call instead of adapting)")
@@ -5542,7 +5740,11 @@ def auto_export_latest(messages, raw_path):
 
 # ---------- main ----------
 
+ARTCRAFT_SERVERS = []   # set by --artcraft (PdfCraft) / --rea (REA): MCP tool servers from mlx_artcraft.py loaded for this run
+
+
 def parse_args(argv):
+    global ARTCRAFT_SERVERS
     model = None
     system = load_system_prompt()
     run_task = None
@@ -5566,6 +5768,14 @@ def parse_args(argv):
             system = argv[i + 1]
             i += 2
         elif argv[i] in ("-r", "--run") and i + 1 < len(argv):
+            run_task = argv[i + 1]
+            i += 2
+        elif argv[i] in ("--artcraft", "--rea") and i + 1 < len(argv):
+            # Headless one-shot like --run, plus the named MCP tool server: --artcraft = PdfCraft (ArtCraft apps),
+            # --rea = REA reverse engineering. Both flags may be given; the last task string wins.
+            server = "pdfcraft" if argv[i] == "--artcraft" else "rea"
+            if server not in ARTCRAFT_SERVERS:
+                ARTCRAFT_SERVERS.append(server)
             run_task = argv[i + 1]
             i += 2
         elif argv[i] == "--transcript" and i + 1 < len(argv):
@@ -5879,22 +6089,64 @@ def print_model_update_notice_if_any(repo_id, cache_path, label):
     )
 
 
-def _run_tokenmax_job(rest, backend, model=None):
-    """Hand ONE request to tokenmax with the terminal attached (interactive session or --run)."""
+def _tokenmax_answer(captured_text):
+    """The final answer printed between tokenmax's ANSWER banners, or "" if none."""
+    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", captured_text.replace("\r", ""))
+    m = re.search(r"={3,}\s*ANSWER\s*={3,}\n(.*?)\n={10,}\s*\n", clean, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _run_tokenmax_job(rest, backend, model=None, messages=None):
+    """Hand ONE request to tokenmax with the terminal attached (interactive session or --run).
+    With `messages` (the interactive chat), the request, its answer and any RAG excerpts it was given are added to
+    the conversation so the user's next plain message can continue it."""
     import mlxlib as _ml
+    original = rest
+    if rest and _ml.rag_requested(rest, _RAG_ACTIVE[0]):
+        # tokenmax (and Claude behind it) has no RAG tool: fetch the excerpts here and attach them to the request.
+        block, note, merged = _ml.rag_excerpts_block(rest, prior=_RAG_STICKY)
+        print(note)
+        if block is None:
+            print("(RAG was requested but nothing was retrieved, so nothing was sent to tokenmax -- "
+                  "check the document is uploaded (/rag collections) or rephrase)")
+            return 0
+        _RAG_STICKY[:] = merged
+        _RAG_ACTIVE[0] = True
+        if messages is not None:
+            _ml.rag_set_sticky(messages, RAG_REMOTE_SYSTEM + "\n" + block)
+        rest = rest + "\n\n" + block
     argv = _ml.tokenmax_argv(rest, backend, model)
     if argv is None:
         print(_ml.TOKENMAX_USAGE)
         return 2
     print(f"(handing this one request to tokenmax: {' '.join(argv[1:-1]) or 'private mode'})")
+    captured = bytearray()
     try:
-        return subprocess.run(argv).returncode
+        if messages is not None and sys.stdin.isatty() and sys.stdout.isatty():
+            import pty
+
+            def _tee(fd):
+                data = os.read(fd, 4096)
+                captured.extend(data)
+                return data
+
+            rc = os.waitstatus_to_exitcode(pty.spawn(argv, _tee))   # a pty keeps tokenmax's terminal behaviour intact
+        else:
+            rc = subprocess.run(argv).returncode
     except KeyboardInterrupt:
         print("\n(tokenmax interrupted)")
         return 130
     except Exception as e:
         print(f"(could not run tokenmax: {e})")
         return 1
+    if messages is not None:
+        answer = _tokenmax_answer(captured.decode("utf-8", "replace"))
+        if answer:
+            clean_request = re.sub(r"^(--[a-z-]+\s+\S+\s+)+", "", original).strip()
+            messages.append({"role": "user", "content": clean_request})
+            messages.append({"role": "assistant", "content": answer})
+            print("(this exchange was added to the chat, so your next message continues it)")
+    return rc
 
 
 def main():
@@ -5929,7 +6181,9 @@ def main():
         # is the actual maintained implementation, this is just a convenience
         # entry point so a transcript summary doesn't need a separate `cd` +
         # python3 invocation.
-        script = load_default_dir() / "yt_summarize.py"
+        script = load_default_dir() / "scripts" / "yt_summarize.py"
+        if not script.exists():
+            script = load_default_dir() / "yt_summarize.py"
         if not script.exists():
             print(f"(no yt_summarize.py found in {load_default_dir()} -- nothing to delegate --transcript to)")
             sys.exit(1)
@@ -5951,6 +6205,19 @@ def main():
             print("  (note: tool calls are auto-approved by default, but no sandbox (sandbox-exec or Apple's "
                   "`container`) was found — tool calls will run unsandboxed directly on this machine; pass --ask to review "
                   "each call instead)")
+    if ARTCRAFT_SERVERS:
+        import mlxlib as _ml
+        import mlx_artcraft
+        try:
+            added = mlx_artcraft.register(_ml.plugin_tools(), ARTCRAFT_SERVERS)
+        except Exception as exc:
+            print(f"[mcp] could not start {'/'.join(ARTCRAFT_SERVERS)}: {exc}")
+            sys.exit(1)
+        _ml.KNOWN_TOOL_NAMES = _ml.BUILTIN_TOOL_NAMES + tuple(_ml.plugin_tools().keys())
+        if auto_yes:
+            ALWAYS_APPROVED.update(mlx_artcraft.CATEGORIES)
+        print(f"  (mcp: {len(added)} tools from {', '.join(ARTCRAFT_SERVERS)})")
+        run_task = f"{run_task}\n\n{mlx_artcraft.task_note(ARTCRAFT_SERVERS)}"
     if run_task:
         import mlxlib as _ml
         _tm = _ml.tokenmax_request(run_task)
@@ -6061,7 +6328,7 @@ def main():
     convert_mode = "auto"
     agentic_mode = False
     rag_collection_override = None  # None = defer to RAG_COLLECTION env var
-    rag_strict_mode = False  # when on: a RAG search with zero matches skips the model turn entirely
+    rag_strict_mode = True  # on by default: a RAG request with zero matches says so and stops (no model turn); /rag strict off to allow general-knowledge answers
     state = {"last_paths": [], "current_remote": None, "current_remote_dir": None, "last_remote_path": None, "context_loaded": False, "last_rag_results": []}
     while True:
         try:
@@ -6095,7 +6362,7 @@ def main():
         import mlxlib as _ml
         _tm = _ml.tokenmax_request(user)
         if _tm is not None:
-            _run_tokenmax_job(_tm, backend, model)
+            _run_tokenmax_job(_tm, backend, model, messages)
             continue
         force_agent = False
         _tl = _ml.tokenlocal_request(user)
@@ -6174,6 +6441,8 @@ def main():
             state["last_remote_path"] = None
             state["context_loaded"] = False
             state["last_rag_results"] = []
+            _RAG_STICKY.clear()
+            _RAG_ACTIVE[0] = False
             print("(history cleared)")
             continue
         if user == "/system":

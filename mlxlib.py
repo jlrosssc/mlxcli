@@ -17,6 +17,7 @@ import copy
 import fcntl
 import hashlib
 import importlib.util
+from html.parser import HTMLParser
 import json
 import logging
 import os
@@ -284,6 +285,370 @@ def web_search(query, max_results=5):
     return results
 
 
+class _TextExtractor(HTMLParser):
+    """HTML -> readable text. Drops scripts/styles and page chrome (nav, header, footer, sidebars, forms); keeps headings,
+    paragraphs, list items and table cells on their own lines. Text inside <main>/<article> is also collected separately so
+    the body of the page can be preferred over menus."""
+    _SKIP = {"script", "style", "noscript", "svg", "head", "template", "iframe", "nav", "header", "footer", "aside", "form",
+             "button", "select", "dialog"}
+    _BREAK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "table", "ul", "ol", "dd",
+              "dt", "pre", "main"}
+    _MAIN = {"main", "article"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.main_parts, self._skip, self._main = [], [], 0, 0
+
+    def _add(self, text):
+        self.parts.append(text)
+        if self._main:
+            self.main_parts.append(text)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip += 1
+            return
+        if tag in self._MAIN:
+            self._main += 1
+        if tag in self._BREAK:
+            self._add("\n")
+        elif tag in ("td", "th"):
+            self._add(" | ")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP:
+            if self._skip:
+                self._skip -= 1
+            return
+        if tag in self._MAIN and self._main:
+            self._main -= 1
+        if tag in self._BREAK:
+            self._add("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._add(data)
+
+
+def _clean_lines(text):
+    out, prev = [], None
+    for ln in text.splitlines():
+        ln = re.sub(r"[ \t\u00a0]+", " ", ln).strip(" |")
+        if not ln or (ln == prev and len(ln) > 30):  # short repeats are real table cells (e.g. dew point == temperature), not boilerplate
+            continue
+        out.append(ln)
+        prev = ln
+    return "\n".join(out)
+
+
+def _host_is_public(host):
+    """False for localhost, private, link-local and loopback addresses: web_fetch is for the open internet only."""
+    import ipaddress, socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+def calculator(expression):
+    """Safely evaluate an arithmetic expression with exact decimal math (no eval of arbitrary code)."""
+    import ast, math, operator
+    from decimal import Decimal, getcontext
+    getcontext().prec = 50
+    expr = str(expression).strip().replace(",", "") if "[" not in str(expression) and "(" not in str(expression) else str(expression).strip()
+    expr = expr.replace("^", "**").replace("\u00d7", "*").replace("\u00f7", "/")
+    if not expr:
+        raise ValueError("calculator needs a non-empty expression")
+    bin_ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+               ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow}
+    funcs = {"abs": abs, "min": min, "max": max, "sum": lambda *a: sum(a[0]) if len(a) == 1 else sum(a),
+             "round": lambda x, n=0: round(x, int(n)) if n else Decimal(round(x)),
+             "sqrt": lambda x: Decimal(x).sqrt(), "floor": lambda x: Decimal(math.floor(x)),
+             "ceil": lambda x: Decimal(math.ceil(x)), "log": lambda x, b=None: Decimal(math.log(x) if b is None else math.log(x, b))}
+    consts = {"pi": Decimal(str(math.pi)), "e": Decimal(str(math.e))}
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            return Decimal(str(n.value))
+        if isinstance(n, ast.Name) and n.id in consts:
+            return consts[n.id]
+        if isinstance(n, (ast.List, ast.Tuple)):
+            return [ev(x) for x in n.elts]
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+            v = ev(n.operand)
+            return -v if isinstance(n.op, ast.USub) else v
+        if isinstance(n, ast.BinOp) and type(n.op) in bin_ops:
+            l, r = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and abs(r) > 1000:
+                raise ValueError("exponent too large")
+            return bin_ops[type(n.op)](l, r)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in funcs and not n.keywords:
+            return funcs[n.func.id](*[ev(a) for a in n.args])
+        raise ValueError("unsupported expression element: " + ast.dump(n)[:60])
+
+    val = ev(ast.parse(expr, mode="eval"))
+    if isinstance(val, list):
+        raise ValueError("expression must produce a single number")
+    val = Decimal(val)
+    if val == val.to_integral_value():
+        out = str(int(val))
+    else:
+        out = format(val.normalize(), "f")
+        if "." in out and len(out.split(".")[1]) > 12:
+            out = format(round(val, 12).normalize(), "f")
+    return out
+
+
+class _TableParser(HTMLParser):
+    """Collects every <table> in a page as a list of rows of cell texts, keeping empty and repeated cells (unlike the readable-text
+    extractor, which drops repeated lines). Nested tables are flattened into their own entries."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables, self._stack, self._cell = [], [], None
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._stack.append([])
+        elif tag == "tr" and self._stack:
+            self._stack[-1].append([])
+        elif tag in ("td", "th") and self._stack and self._stack[-1]:
+            self._cell = []
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None and self._stack and self._stack[-1]:
+            self._stack[-1][-1].append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+            self._cell = None
+        elif tag == "table" and self._stack:
+            t = [r for r in self._stack.pop() if r]
+            if t:
+                self.tables.append(t)
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def table_calc(source, column=None, operation="sum", expression=None, max_chars=30000):
+    """Do arithmetic on the numbers in a table found in a web page (URL) or a local text file, without the caller retyping any number.
+    operation: sum, average (mean), min, max, count, product, median, range (max-min), first, last, difference (last-first).
+    column: the heading to use. expression: instead of one column, a per-row formula that names columns in braces, e.g.
+    '{Temperature} - {Dew Point}' or '{Precip.} * 25.4'; each row is evaluated exactly, then `operation` combines the rows.
+    Handles tables whose rows are on one line (pipe/tab separated) and web_fetch-style tables where each cell sits on its own line
+    under a 'A | B | C' header. Returns the row count, every row used as 'label: value', and the result; adds a note when the values
+    look like running totals that reset (rise within each hour, then fall back), because then a plain sum double-counts."""
+    import re, statistics
+    from decimal import Decimal
+    ops = {"sum", "average", "mean", "min", "max", "count", "product", "median", "range", "first", "last", "difference"}
+    operation = str(operation or "sum").strip().lower()
+    if operation not in ops:
+        raise ValueError(f"table_calc: operation must be one of {sorted(ops)}")
+    src = str(source).strip()
+    html_tables = []
+    if src.lower().startswith(("http://", "https://")):
+        _final, _ctype, _body = _download_page(src)
+        if _ctype in ("text/html", "application/xhtml+xml", ""):
+            tp = _TableParser()
+            tp.feed(_body)
+            html_tables = tp.tables
+            text = ""
+        else:
+            text = _body
+    else:
+        path = pathlib.Path(src).expanduser()
+        if not path.is_file():
+            raise ValueError(f"table_calc: {src!r} is not a URL or a readable file")
+        text = path.read_text(errors="replace")[:2_000_000]
+    expression = str(expression).strip() if expression else ""
+    needed = re.findall(r"\{([^{}]+)\}", expression) if expression else ([str(column).strip()] if column else [])
+    if not needed:
+        raise ValueError("table_calc needs a 'column' (or an 'expression' that names columns in braces)")
+    lines = [l.rstrip() for l in text.splitlines()]
+    header_i = delim = names = None
+    rows = []
+    for tb in html_tables:   # real <table> markup: exact cells, no guessing
+        for hi, hrow in enumerate(tb[:3]):
+            if len(hrow) >= 2 and all(any(c.lower() == n.lower() or c.lower().startswith(n.lower()) for c in hrow) for n in needed):
+                names, rows = hrow, [r for r in tb[hi + 1:] if len(r) == len(hrow)]
+                break
+        if names:
+            break
+    if html_tables and not names:
+        raise ValueError(f"table_calc: none of the {len(html_tables)} tables on the page has the column(s) {needed}")
+    for i, l in enumerate(lines if not names else []):
+        for d in (" | ", "\t", "|"):
+            if d in l:
+                cells = [c.strip() for c in l.split(d.strip() if d == "|" else d)]
+                if len(cells) >= 2 and all(any(c.lower() == n.lower() or c.lower().startswith(n.lower()) for c in cells) for n in needed):
+                    header_i, delim, names = i, d, cells
+                    break
+        if header_i is not None:
+            break
+    if header_i is None and not names:
+        raise ValueError(f"table_calc: no table header containing the column(s) {needed} was found")
+    def col_index(n):
+        hits = [k for k, c in enumerate(names) if c.lower() == n.lower()] or [k for k, c in enumerate(names) if c.lower().startswith(n.lower())]
+        if len(hits) != 1:
+            raise ValueError(f"table_calc: column {n!r} matches {len(hits)} of {names}; use a more exact name")
+        return hits[0]
+    idx = {n: col_index(n) for n in needed}
+    ncols = len(names)
+    body = lines[header_i + 1:] if header_i is not None else []
+    d_split = (lambda l: [c.strip() for c in l.split(delim.strip() if delim == "|" else delim)]) if delim else None
+    sameline = [l for l in body[:5] if l.strip() and len(d_split(l)) == ncols] if delim else []
+    if rows:
+        pass
+    elif sameline:
+        for l in body:
+            if not l.strip():
+                continue
+            cells = d_split(l)
+            if len(cells) != ncols:
+                break
+            rows.append(cells)
+    else:
+        cells_v = [l.strip() for l in body if l.strip()]
+        shape = lambda t: re.sub(r"[A-Za-z]", "a", re.sub(r"\d", "9", t))
+        first_shape = shape(cells_v[0]) if cells_v else None
+        for k in range(0, len(cells_v) - ncols + 1, ncols):
+            blk = cells_v[k:k + ncols]
+            if shape(blk[0]) != first_shape:
+                break
+            rows.append(blk)
+    if not rows:
+        raise ValueError("table_calc: found the header but no data rows under it")
+    num = re.compile(r"-?\d+(?:\.\d+)?")
+    items, skipped = [], []
+    for r in rows:
+        vals = {}
+        for n, k in idx.items():
+            m = num.search(r[k].replace(",", ""))
+            if m:
+                vals[n] = m.group(0)
+        if len(vals) != len(idx):
+            skipped.append(r[0])
+            continue
+        if expression:
+            ex = expression
+            for n, v in vals.items():
+                ex = ex.replace("{" + n + "}", "(" + v + ")")
+            items.append((r[0], Decimal(calculator(ex))))
+        else:
+            items.append((r[0], Decimal(next(iter(vals.values())))))
+    if not items:
+        raise ValueError("table_calc: no row had a number in the requested column(s)")
+    def fmt(x):
+        return format(Decimal(x).normalize(), "f") if Decimal(x) != Decimal(x).to_integral_value() else str(int(Decimal(x)))
+    vs = [v for _, v in items]
+    if operation == "sum":
+        res = sum(vs, Decimal(0))
+    elif operation in ("average", "mean"):
+        res = (sum(vs, Decimal(0)) / len(vs)).quantize(Decimal("0.000001"))
+    elif operation == "min":
+        res = min(vs)
+    elif operation == "max":
+        res = max(vs)
+    elif operation == "count":
+        res = Decimal(len(vs))
+    elif operation == "product":
+        res = Decimal(1)
+        for v in vs:
+            res *= v
+    elif operation == "median":
+        res = Decimal(str(statistics.median([float(v) for v in vs])))
+    elif operation == "range":
+        res = max(vs) - min(vs)
+    elif operation == "first":
+        res = vs[0]
+    elif operation == "last":
+        res = vs[-1]
+    else:  # difference
+        res = vs[-1] - vs[0]
+    what = expression if expression else names[next(iter(idx.values()))]
+    out = [f"{what!r}: {len(rows)} rows read, {len(items)} used, {len(skipped)} skipped (no number)."]
+    out.append("Rows used (label: value), in the order shown on the page: " + "; ".join(f"{a}: {fmt(b)}" for a, b in items))
+    out.append(f"Rows span: first row on page = {items[0][0]!r}, last row on page = {items[-1][0]!r}. If the page's latest time is before the end of the day it covers, say the day is partial and give the latest time.")
+    label = {"mean": "average"}.get(operation, operation)
+    extra = ""
+    if operation in ("min", "max"):
+        extra = " at " + next(a for a, b in items if b == res)
+    out.append(f"{label} = {fmt(res)}{extra}")
+    if not expression and operation in ("sum", "average", "mean"):
+        groups = {}
+        for lab, v in items:
+            m = re.match(r"\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])?", lab)
+            if m:
+                h = (int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)) if m.group(3) else int(m.group(1))
+                groups.setdefault(h, []).append((int(m.group(2)), v))
+        multi = {h: sorted(g) for h, g in groups.items() if len(g) >= 2}
+        if len(multi) >= 3:
+            nondec = sum(1 for g in multi.values() if all(x[1] <= y[1] for x, y in zip(g, g[1:])))
+            if nondec >= 0.8 * len(multi) and any(g[0][1] != g[-1][1] for g in multi.values()):
+                per_hour = sum((max(v for _, v in g) for g in groups.values()), Decimal(0))
+                out.append(f"NOTE: within most hours the values only rise from one reading to the next, which is how a running total that "
+                           f"resets each hour behaves, so adding every row would count the same amount several times. The sum of each "
+                           f"hour's largest value is {fmt(per_hour)} over {len(groups)} hours.")
+                out.append(f"REPORT BOTH in your answer: (1) sum of every row = {fmt(res)} over {len(items)} rows, and (2) sum of each hour's "
+                           f"largest value = {fmt(per_hour)} over {len(groups)} hours. State plainly that the page does not define the column, "
+                           f"so which one is right is an inference; do not call either one 'standard'. Name only what the tool returned "
+                           f"(no station or place names of your own).")
+    return "\n".join(out)
+
+
+def _download_page(url):
+    """Download one public web page and return (final_url, content_type, decoded body). Read-only; http/https only; refuses private
+    addresses; reads at most 2 MB; text-like content types only. Pages that need JavaScript to show their content come back mostly
+    empty -- the caller is told so. Raises on network failure."""
+    parsed = urllib.parse.urlparse(str(url).strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("web_fetch needs a full http:// or https:// URL")
+    if not _host_is_public(parsed.hostname):
+        raise ValueError("web_fetch only reads public internet pages (not localhost or private-network addresses)")
+    req = urllib.request.Request(parsed.geturl(), headers={
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9"})
+    try:
+        resp_cm = urllib.request.urlopen(req, timeout=25)
+    except urllib.error.HTTPError as exc:
+        hint = (" The site blocks automated readers; try a different search result or browser_action." if exc.code in (401, 403, 429)
+                else "")
+        raise RuntimeError(f"HTTP {exc.code} {exc.reason} from {parsed.hostname}.{hint}") from None
+    with resp_cm as resp:
+        final = resp.geturl()
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and not (ctype.startswith("text/") or ctype in ("application/json", "application/xml", "application/xhtml+xml", "application/ld+json")):
+            raise ValueError(f"not a text page (content type {ctype}); web_fetch reads HTML, text and JSON only")
+        raw = resp.read(2_000_000)
+        charset = resp.headers.get_content_charset() or "utf-8"
+    body = raw.decode(charset, errors="replace")
+    return final, ctype, body
+
+
+def web_fetch(url, max_chars=12000):
+    """Download one public web page and return its readable text (plain-library only). Read-only; http/https only; refuses private
+    addresses; reads at most 2 MB; text-like content types only. Pages that need JavaScript to show their content come back mostly
+    empty -- the caller is told so. Raises on network failure."""
+    max_chars = max(1000, min(int(max_chars or 12000), 30000))
+    final, ctype, body = _download_page(url)
+    if ctype in ("text/html", "application/xhtml+xml", ""):
+        ex = _TextExtractor()
+        ex.feed(body)
+        main = _clean_lines("".join(ex.main_parts))
+        text = main if len(main) >= 500 else _clean_lines("".join(ex.parts))
+    else:
+        text = _clean_lines(body)
+    note = ""
+    if len(text) < 60:
+        note = ("\n[note: almost no text came back. The page probably builds its content with JavaScript; "
+                "try browser_action to open it, or fetch a different result.]")
+    clipped = len(text) > max_chars
+    return f"[web_fetch: {final}]\n" + text[:max_chars] + ("\n[...page text cut at %d characters]" % max_chars if clipped else "") + note
+
+
 def rag_remote_collections(url=None, key=None):
     """List every collection on the RAG server, with each one's document count."""
     configured_url, configured_key, _ = rag_remote_config()
@@ -305,6 +670,182 @@ def _multipart_upload(path, title, metadata):
     parts.append(payload)
     parts.append(f"\r\n--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+# ---- RAG on request ----------------------------------------------------------------------------
+# RAG runs only when the user's message asks for it ("RAG", "from rag X", "using the RAG documents", "knowledge
+# base"). The server matches ALL query words in a chunk, so a whole sentence returns nothing; a request is
+# therefore searched as several short single-word queries whose results are merged (chunks matching more of the
+# request's words rank higher) and capped per document so one big manual can't crowd out the others.
+_RAG_TRIGGER_RE = re.compile(r"\brag\b|knowledge\s+base", re.IGNORECASE)
+_RAG_STOPWORDS = frozenset((
+    "the a an and or but of to in on at by for from with without into onto over under about as is are was were be been "
+    "being it its it's this that these those there here then than so such not no nor if when while where which who whom "
+    "what how why all any each every both either neither some more most other another same own just only also very can "
+    "could should would will shall may might must do does did done doing have has had having get got give gave make made "
+    "using use used uses please show list find search tell write create sample example examples program programs "
+    "platform platforms native following first second third last next come comes came goes go going between among "
+    "document documents doc docs rag knowledge base me my our your their his her them they you we us i using per "
+    "does need needs want wants like see look looks provide provided based via within across after before during "
+    "again once one two three four five six seven eight nine ten time times thing things way ways lot lots many much "
+    "set sets stage stages step steps give gives given take takes took put puts").split())
+
+
+_RAG_FOLLOWUP_RE = re.compile(r"\b(manuals?|documents?|docs?|handbooks?|guides?)\b", re.IGNORECASE)
+
+
+def rag_requested(text, active=False):
+    """True when the message explicitly asks for RAG. Once RAG is already active in a chat (active=True), a follow-up
+    that talks about "the manual" / "the documents" also counts, so it re-searches without repeating the word RAG."""
+    t = text or ""
+    return bool(_RAG_TRIGGER_RE.search(t)) or bool(active and _RAG_FOLLOWUP_RE.search(t))
+
+
+def rag_query_terms(text, max_terms=16):
+    """Distinctive single-word search terms from a request (no domain-specific knowledge; just content words)."""
+    terms = []
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9+\-]{2,}", text or ""):
+        w = word.lower().strip("-")
+        if len(w) < 3 or w in _RAG_STOPWORDS:
+            continue
+        for form in ((w, w[:-1]) if len(w) > 4 and w.endswith("s") and not w.endswith("ss") else (w,)):
+            if form not in terms:   # plural and singular both tried: the server doesn't stem, and proper nouns end in s
+                terms.append(form)
+    return terms[:max_terms]
+
+
+_RAG_COLLECTIONS_CACHE = {"at": 0.0, "names": []}
+
+
+def rag_collection_in_text(text, url=None, key=None):
+    """The one real collection whose name appears anywhere in the message (case, '-', '_' and spaces ignored), else None."""
+    configured_url, configured_key, _ = rag_remote_config()
+    url, key = (url or configured_url), (key if key is not None else configured_key)
+    if not url:
+        return None
+    now = time.time()
+    if now - _RAG_COLLECTIONS_CACHE["at"] > 300 or not _RAG_COLLECTIONS_CACHE["names"]:
+        try:
+            names = [c.get("collection") for c in rag_remote_collections(url, key).get("collections", []) if c.get("collection")]
+        except Exception:
+            return None
+        _RAG_COLLECTIONS_CACHE.update(at=now, names=names)
+    norm = lambda x: re.sub(r"[\s_\-]+", " ", (x or "").lower())
+    haystack = " " + norm(text) + " "
+    hits = [n for n in _RAG_COLLECTIONS_CACHE["names"] if " " + norm(n) + " " in haystack]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _strip_collection_name(text, collection):
+    if not collection:
+        return text
+    pattern = r"[\s_\-]+".join(re.escape(part) for part in re.split(r"[\s_\-]+", collection))
+    return re.sub(pattern, " ", text or "", flags=re.IGNORECASE)
+
+
+def rag_search_for_request(text, url=None, key=None, collection=None, per_doc=4, max_total=12):
+    """Merged multi-query search for a request. Returns a list of result dicts (best first)."""
+    queries = rag_query_terms(_strip_collection_name(text, collection)) or [(text or "").strip()[:80]]
+    merged = {}
+    first_error = None
+    for q in queries:
+        if not q:
+            continue
+        try:
+            data = rag_remote_search(q, url, key, collection, limit=50)
+        except urllib.error.HTTPError as exc:   # a bad single query shouldn't sink the others
+            first_error = first_error or exc
+            continue
+        for r in data.get("results") or []:
+            k = (r.get("id"), r.get("chunk_index"))
+            if k in merged:
+                merged[k]["_hits"] += 1
+                merged[k]["score"] = merged[k].get("score", 0) + r.get("score", 0)
+            else:
+                merged[k] = dict(r, _hits=1)
+    if not merged and first_error and len(queries) == 1:
+        raise first_error
+    ranked = sorted(merged.values(), key=lambda r: (r["_hits"], r.get("score", 0)), reverse=True)
+    out, per = [], {}
+    for r in ranked:
+        title = r.get("title") or r.get("filename") or ""
+        if per.get(title, 0) >= per_doc:
+            continue
+        per[title] = per.get(title, 0) + 1
+        out.append(r)
+        if len(out) >= max_total:
+            break
+    return out
+
+
+def rag_merge_results(new, prior, cap=16):
+    """New results first, then earlier ones not already present (by document + chunk); bounded."""
+    out, seen = [], set()
+    for r in list(new or []) + list(prior or []):
+        k = (r.get("id"), r.get("chunk_index"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+        if len(out) >= cap:
+            break
+    return out
+
+
+_RAG_STICKY_BEGIN = "\n\n[[RAG CONTEXT BEGIN]]\n"
+_RAG_STICKY_END = "\n[[RAG CONTEXT END]]"
+
+
+def rag_set_sticky(messages, text):
+    """Keep ONE retrieved-excerpts section in the leading system message, replacing the previous one, so the
+    excerpts stay available to every later turn of the chat without piling up with each retrieval."""
+    if not messages or messages[0].get("role") != "system":
+        return
+    content = messages[0].get("content") or ""
+    i = content.find(_RAG_STICKY_BEGIN)
+    if i >= 0:
+        j = content.find(_RAG_STICKY_END, i)
+        content = content[:i] + (content[j + len(_RAG_STICKY_END):] if j >= 0 else "")
+    messages[0]["content"] = content + (_RAG_STICKY_BEGIN + text + _RAG_STICKY_END if text else "")
+
+
+def rag_format_block(results, where, max_chars=14000):
+    parts, labels, total = [], [], 0
+    for r in results:
+        label = f"{r.get('title') or r.get('filename')} chunk {r.get('chunk_index', 0)}"
+        body = (r.get("content") or "").strip()
+        if parts and total + len(body) > max_chars:
+            break
+        parts.append(f"[{label}]\n{body}")
+        labels.append(label)
+        total += len(body)
+    block = ("Excerpts retrieved from the user's RAG repository (" + where + "). Use them as the source for this request "
+             "and cite the document names; do not invent content the excerpts do not support.\n\n" + "\n\n".join(parts))
+    return block, labels
+
+
+def rag_excerpts_block(text, collection=None, max_chars=14000, prior=None):
+    """For a request that asked for RAG: (block_or_None, status_line, merged_results). block is ready to append to a
+    request so a model with no RAG tool of its own (tokenmax / Claude) sees the real excerpts; `prior` = results kept
+    from earlier in the chat, merged in so follow-ups don't lose the documents."""
+    url, key, configured = rag_remote_config()
+    if not url:
+        return None, "(RAG was requested but no RAG server is configured)", list(prior or [])
+    collection = configured if collection is None else collection
+    collection = collection or rag_collection_in_text(text, url, key) or ""   # a collection named in the message scopes the search
+    try:
+        results = rag_search_for_request(text, url, key, collection)
+    except Exception as exc:
+        return None, f"(remote RAG unavailable: {exc})", list(prior or [])
+    where = collection or "all collections"
+    merged = rag_merge_results(results, prior)
+    if not merged:
+        return None, f"(remote RAG: no matches in {where})", []
+    block, labels = rag_format_block(merged, where, max_chars)
+    docs = len({lb.rsplit(" chunk", 1)[0] for lb in labels})
+    note = f"(remote RAG: attached {len(labels)} excerpt(s) from {docs} document(s) in {where}"
+    note += f"; {len(results)} new)" if prior else ")"
+    return block, note, merged
 
 
 def rag_remote_upload(path, url=None, key=None, collection=None, title=None):
@@ -677,6 +1218,42 @@ TOOLS = [
             "query": {"type": "string", "description": "the search query"},
             "max_results": {"type": "integer", "description": "how many results to return (default 5, max 10)"}},
             "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "web_fetch",
+        "description": "Download ONE public web page (a URL you got from web_search or from the user) and return its readable text, "
+                        "so you can read the real content instead of guessing from a search snippet. Read-only; leaves the local "
+                        "machine, so it needs the user's approval like web_search. After web_search, call this on the best one or "
+                        "two results before answering, then quote the exact line you relied on and give the URL.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "full http(s) URL of the page to read"},
+            "max_chars": {"type": "integer", "description": "how much page text to return (default 12000, max 30000)"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "calculator",
+        "description": "Exact arithmetic. ALWAYS use this for any sum, total, average, percentage, unit conversion or other "
+                        "math instead of adding numbers in your head -- mental addition of long lists is unreliable. Pass a "
+                        "math expression, e.g. '0.23+0.08+0.03' or 'sum([1.5, 2.25, 3])' or 'round(3.29+1.45, 2)'. Supports "
+                        "+ - * / // % **, parentheses, and abs, round, min, max, sum, sqrt, floor, ceil, log, pi, e. Decimal "
+                        "numbers are added exactly (0.1+0.2 = 0.3). Local and safe; no approval needed.",
+        "parameters": {"type": "object", "properties": {
+            "expression": {"type": "string", "description": "the math expression to evaluate"}},
+            "required": ["expression"]}}},
+    {"type": "function", "function": {
+        "name": "table_calc",
+        "description": "Do arithmetic on the numbers in a TABLE on a web page or in a local file WITHOUT retyping them (retyping dozens "
+                        "of readings is slow and drops rows). Give the page URL (or file path) and either a column heading or a per-row "
+                        "expression, plus an operation: sum, average, min, max, count, product, median, range, first, last, difference. "
+                        "Examples: source='https://...' column='Precip.' operation='sum'; column='Temperature' operation='max'; "
+                        "expression='{Temperature} - {Dew Point}' operation='average'. It reads the table itself and returns the row "
+                        "count, every row it used as 'label: value', and the result; if the values look like running totals that "
+                        "reset it also says so and gives the alternative figure, so report both. One call per page/file. For numbers "
+                        "you already have in hand use calculator instead. A URL needs the user's approval like web_fetch.",
+        "parameters": {"type": "object", "properties": {
+            "source": {"type": "string", "description": "full http(s) URL of the page, or a local file path"},
+            "column": {"type": "string", "description": "the column heading to use, e.g. 'Precip.' (omit when using expression)"},
+            "operation": {"type": "string", "description": "sum (default), average, min, max, count, product, median, range, first, last, difference"},
+            "expression": {"type": "string", "description": "optional per-row formula naming columns in braces, e.g. '{Precip.} * 25.4'"}},
+            "required": ["source"]}}},
     # ask_user is a deliberately separate concern from the approve()/
     # request_tool_approval() gate that already sits in front of every other
     # tool call (run_command, write_file, ssh_*, ...): that gate is
@@ -1245,9 +1822,17 @@ def seatbelt_available():
 def seatbelt_profile(workdir):
     home = pathlib.Path.home()
     writable = [pathlib.Path(workdir).resolve(), pathlib.Path("/private/tmp"), pathlib.Path("/private/var/folders"),
-                pathlib.Path("/dev"), home / ".cache"]
+                pathlib.Path("/dev"), home / ".cache", home / "Library/Caches", home / "Library/org.swift.swiftpm"]
     paths = " ".join('(subpath "%s")' % str(p).replace("\\", "\\\\").replace('"', '\\"') for p in writable)
     return f"(version 1)(allow default)(deny file-write* (require-not (require-any {paths})))"
+
+
+def seatbelt_swiftpm_cmd(cmd):
+    """SwiftPM wraps manifest evaluation in its own sandbox-exec, which macOS refuses to nest inside our
+    Seatbelt ("sandbox_apply: Operation not permitted", so `swift build` never reached the compiler -- found
+    2026-10-05 on the SwiftCalc task). Our Seatbelt already confines writes, so turn SwiftPM's off."""
+    return re.sub(r"\bswift\s+(build|run|test|package)\b(?![^;&|]*--disable-sandbox)", r"swift \1 --disable-sandbox",
+                  cmd or "")
 
 
 # Commands that change the Mac's state WITHOUT writing a file, so Seatbelt's write rule can't stop them
@@ -1481,6 +2066,97 @@ def clip_output(out, max_chars=None):
 
 _HTTP_FAILURE = re.compile(r"(^|\n)(\[source: [^\]]*\]\s*)?http [45]\d\d from ")
 
+
+# --- Accuracy helpers (2026-10-06, from the SwiftCalc runs) -------------------------------------------------------------------------
+import signal as _signal
+
+def crash_note(returncode):
+    """A command that dies by signal (shell exit 128+N, or a negative returncode) printed little or nothing useful and the model
+    never noticed (a test program trapped with exit_code=133 and the run just ended). Say so plainly."""
+    if returncode is None: return ""
+    sig = -returncode if returncode < 0 else (returncode - 128 if 129 <= returncode <= 160 else 0)
+    if sig <= 0: return ""
+    try: name = _signal.Signals(sig).name
+    except Exception: name = f"signal {sig}"
+    return (f"\n[harness note: this command did not finish normally -- it was killed by {name} (exit {returncode}). The program CRASHED or was aborted. "
+            "Only what it printed BEFORE the crash is shown above; any test or step after that point never ran. Find the crash cause first "
+            "(a fatal-error line, an out-of-range index, a force unwrap, a divide by zero) before changing anything else.]")
+
+_API_GUARD_RE = re.compile(
+    r"(?i)unknown (?:sub)?command|unknown option|unrecognized (?:option|command|argument)|invalid option|no such (?:sub)?command|"
+    r"has no member|no member named|command not found|is not a (?:valid|known|recognized)|did you mean|"
+    r"cannot find '[^']+' in scope|use of unresolved identifier|extra argument|missing argument label|unknown plugin name")
+
+def api_guard_note(text):
+    """The model invents commands, flags and API members (swift package generate-xcodeproj, Color.darkGray, dropLast(while:)) and then
+    guesses another name. Make it look the real thing up instead of guessing again."""
+    if not text or not _API_GUARD_RE.search(text): return ""
+    return ("\n[harness note: the error above says a command, option or API name does not exist or is used wrongly. Do NOT guess another spelling. "
+            "First look up the real one: run the tool's own help (for example `<tool> --help`, `<tool> <subcommand> --help`, or `man <tool>`), or read the "
+            "real source/header, then retry with a name you have seen. If you cannot find a real way, tell the user plainly.]")
+
+_ANNOUNCE_RE = re.compile(
+    r"(?is)(?:^|[.!?:\n]\s*)(?:now,?\s+|next,?\s+|then,?\s+)?(?:let me|let's|i(?:'ll| will| am going to|'m going to)|"
+    r"i need to|we need to)\s+(?:now\s+|also\s+|first\s+)?(?:create|write|build|add|implement|update|fix|run|re-?run|check|read|look|make|generate|"
+    r"start|continue|move on|proceed|do|try|test|verify|edit|modify|change|replace|remove|delete|open|find|search|install)\b[^.!?]{0,200}[:.]?\s*$")
+
+def announced_not_done(content):
+    """True when a turn ENDS on a sentence announcing the next step ("Now let me create the HP 17B keyboard and update the view:") with no
+    tool call -- the model stopped mid-job. Short closing remarks such as 'let me know if ...' do not count."""
+    if not content: return False
+    tail = content.strip()[-400:]
+    if re.search(r"(?i)let me know|let us know|feel free|if you (?:want|would|need|like)|would you like", tail): return False
+    return bool(_ANNOUNCE_RE.search(tail))
+
+_pdf_scan_cache = {}
+_pdf_scan_noted = set()
+
+def pdf_scan_note(command):
+    """A scanned PDF (OCR text layer: font 'GlyphLessFont') gives readable prose but WRONG numbers (the HP 42S manual showed 'y: . 1105, DO0D'
+    for 105.0000). Warn once per file when a command reads one, so expected values are not copied from it."""
+    out = []
+    for m in re.finditer(r'"([^"]+\.pdf)"|\'([^\']+\.pdf)\'|(\S+\.pdf)', command or "", re.I):
+        path = os.path.expanduser(m.group(1) or m.group(2) or m.group(3))
+        if path in _pdf_scan_noted or not os.path.isfile(path): continue
+        if path not in _pdf_scan_cache:
+            try:
+                r = subprocess.run(["pdffonts", "-l", "3", path], capture_output=True, text=True, timeout=20)
+                _pdf_scan_cache[path] = ("GlyphLessFont" in r.stdout) or ("GlyphLess" in r.stdout)
+            except Exception:
+                _pdf_scan_cache[path] = False
+        if _pdf_scan_cache[path]:
+            _pdf_scan_noted.add(path)
+            out.append(os.path.basename(path))
+    if not out: return ""
+    return ("\n[harness note: " + ", ".join(out) + " is a SCANNED PDF; its text is OCR output. Prose is mostly readable but NUMBERS, units, symbols and "
+            "displayed values are often WRONG (letters inside numbers, dropped decimals, upside-down pages). Do NOT copy expected results, key sequences or "
+            "formulas from this text as facts. Use a verified spec/notes file in the project if one exists, otherwise tell the user which values need checking "
+            "against the page images.]")
+
+_CHECK_FILENAME = ".mlxcli-check"
+
+def find_check_file(path):
+    """Nearest .mlxcli-check at or above a written file, searching no higher than the default working folder. Its first non-comment line is the
+    project's own correctness command (compile + tests); mlxcli runs it after file writes and refuses a 'done' while it fails."""
+    try:
+        root = load_default_dir().resolve()
+        p = pathlib.Path(path).expanduser().resolve()
+        for d in [p.parent, *p.parent.parents]:
+            f = d / _CHECK_FILENAME
+            if f.is_file(): return f
+            if d == root or d == d.parent: break
+    except Exception:
+        pass
+    return None
+
+def read_check_command(check_file):
+    try:
+        for line in pathlib.Path(check_file).read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"): return line
+    except Exception:
+        pass
+    return None
 
 def tool_result_failed(result):
     lowered = (result or "").lower()
@@ -1739,7 +2415,7 @@ def detect_repetition_loop(text):
 
 
 BUILTIN_TOOL_NAMES = ("run_command", "read_file", "write_file", "python_interpreter",
-                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "ha_lovelace", "pla_admin", "web_search", "ask_user")
+                       "ssh_run", "ssh_read", "ssh_write", "ha_api", "ha_lovelace", "pla_admin", "web_search", "web_fetch", "calculator", "table_calc", "ask_user")
 KNOWN_TOOL_NAMES = BUILTIN_TOOL_NAMES
 
 
@@ -2951,6 +3627,13 @@ def apple_refine_first_prompt(raw_request, context=""):
 
 _LOCAL_SYSTEM_WORDS = re.compile(r"\b(launchd|launchctl|cron|crontab|log files?|shell history|process list|plist|grep|sudo|"
                                  r"/var/|/etc/|/Users/|~/|\.log)\b|/var/|/etc/|~/", re.I)
+
+
+def current_date_line():
+    """One line giving the model today's date (it has no clock). Added once per session so the prompt prefix stays stable."""
+    import datetime as _dt
+    d = _dt.date.today()
+    return f"Today's date is {d.strftime('%A, %B')} {d.day}, {d.year} ({d.isoformat()}). Your training data may be older than this."
 
 
 _LOCAL_CUE = re.compile(r"\b(my|mine|this mac|computer|laptop|files?|folders?|director(?:y|ies)|disk|storage|process(?:es)?|jobs?|"

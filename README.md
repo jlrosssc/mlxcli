@@ -47,6 +47,20 @@ mlxcli <model> -p "custom system prompt"
 If the oMLX server is not running, `mlxcli` opens the oMLX app and waits for the
 server to come up. It does not launch the companion dashboard viewer.
 
+## MCP tool servers (`--artcraft`, `--rea`)
+
+Headless one-shot flags, like `--run`, that also load an MCP tool server for that run only
+(`mlx_artcraft.py` is a small stdlib MCP stdio client with a curated tool allow-list per server):
+
+```
+mlxcli --artcraft "Using PdfCraft, combine a.pdf and b.pdf into ab.pdf"   # PdfCraft (ArtCraft apps): needs pdfcraft-cli
+mlxcli --rea "List the network endpoints in /path/App.app"                # REA reverse engineering (read-only static analysis)
+```
+
+Env: `PDFCRAFT_CLI`, `PDFCRAFT_ROOT` (PDF files must live under this folder), `REA_JS`, `REA_TOOLS`.
+Install `rea-agents` with `npm install --ignore-scripts` in its own folder; do not run its `setup` command, which
+rewrites agent config files.
+
 ## Commands
 
 ```text
